@@ -1,0 +1,50 @@
+{
+  "name": "boxsh.js",
+  "version": "0.1.0",
+  "description": "Node.js SDK for boxsh — sandboxed shell execution with overlay copy-on-write and JSON-line RPC",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.mjs"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/all.test.mjs"
+  },
+  "keywords": [
+    "boxsh",
+    "sandbox",
+    "shell",
+    "overlayfs",
+    "namespace",
+    "rpc",
+    "linux",
+    "isolation"
+  ],
+  "license": "MIT",
+  "author": "xicilion",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/xicilion/boxsh.git",
+    "directory": "sdk/js"
+  },
+  "bugs": {
+    "url": "https://github.com/xicilion/boxsh/issues"
+  },
+  "homepage": "https://github.com/xicilion/boxsh#readme",
+  "os": [
+    "linux"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "src/"
+  ]
+}

@@ -1,0 +1,52 @@
+# 1 "builtins.def.in"
+# 1 "/home/lion/works/boxsh/vendor/dash-0.5.12/src//"
+# 1 "<built-in>"
+# 1 "<command-line>"
+# 1 "/usr/include/stdc-predef.h" 1 3 4
+# 1 "<command-line>" 2
+# 1 "./../config.h" 1
+# 1 "<command-line>" 2
+# 1 "builtins.def.in"
+# 53 "builtins.def.in"
+bgcmd -u bg
+fgcmd -u fg
+
+
+
+
+
+
+breakcmd -s break -s continue
+cdcmd -u cd chdir
+commandcmd -u command
+dotcmd -s .
+echocmd echo
+evalcmd -ns eval
+execcmd -s exec
+exitcmd -s exit
+exportcmd -as export -as readonly
+falsecmd -u false
+getoptscmd -u getopts
+hashcmd -u hash
+jobscmd -u jobs
+localcmd -as local
+printfcmd printf
+pwdcmd -u pwd
+readcmd -u read
+returncmd -s return
+setcmd -s set
+shiftcmd -s shift
+timescmd -s times
+trapcmd -s trap
+truecmd -s : -u true
+typecmd -u type
+umaskcmd -u umask
+unaliascmd -u unalias
+unsetcmd -s unset
+waitcmd -u wait
+aliascmd -au alias
+
+ulimitcmd -u ulimit
+
+testcmd test [
+killcmd -u kill

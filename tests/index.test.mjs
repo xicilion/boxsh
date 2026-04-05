@@ -1,0 +1,8 @@
+import './shell-mode.test.mjs';
+import './rpc-basics.test.mjs';
+import './rpc-shell-features.test.mjs';
+import './worker-pool.test.mjs';
+import './timeout.test.mjs';
+import './concurrent.test.mjs';
+import './overlay.test.mjs';
+import './tools.test.mjs';
