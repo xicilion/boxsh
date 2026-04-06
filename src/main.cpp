@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <signal.h>
+#include <cerrno>
+#include <sys/stat.h>
 
 // Bring in dash's main() under a renamed symbol so we can call it directly
 // when running in normal (non-RPC) mode.
@@ -47,12 +49,20 @@ void print_usage(const char *prog) {
         "  --proc DST           Mount procfs at DST inside the sandbox.\n"
         "  --tmpfs DST[:OPTS]   Mount an empty tmpfs at DST (OPTS: e.g. size=128m).\n"
         "  --ro-root      Remount / as read-only after pivot_root.\n"
+        "\n"
+        "Quick-try mode:\n"
+        "  --try          Launch a sandboxed shell on the current directory.\n"
+        "                 Mounts the current directory as a copy-on-write overlay so all\n"
+        "                 writes are captured in a temporary upper layer.  When the shell\n"
+        "                 exits the temp dir path is printed to stderr — inspect upper/\n"
+        "                 to see what changed, then discard when done.\n"
         "\n",
         prog);
 }
 
 struct Cli {
     bool rpc_mode      = false;
+    bool try_mode      = false;  // --try: ephemeral COW shell on CWD
     int  num_workers   = 4;
     std::string shell_path = "/bin/sh";
 
@@ -133,6 +143,7 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
         {"proc",        required_argument, nullptr, 'F'},
         {"tmpfs",       required_argument, nullptr, 'T'},
         {"ro-root",     no_argument,       nullptr, 'O'},
+        {"try",         no_argument,       nullptr, 'y'},
         {"help",        no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -181,6 +192,7 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
         case 'T':
             cli.sandbox.tmpfs_mounts.push_back(parse_tmpfs(optarg));
             break;
+        case 'y': cli.try_mode = true; break;
         case 'h':
             print_usage(argv[0]);
             std::exit(0);
@@ -206,6 +218,48 @@ int main(int argc, char **argv) {
     char **shell_argv = nullptr;
 
     boxsh::Cli cli = boxsh::parse_cli(argc, argv, shell_argc, shell_argv);
+
+    // --try: auto-configure sandbox + COW overlay on CWD, then fall through
+    // to the normal shell or RPC path unchanged.
+    std::string try_cwd;
+    if (cli.try_mode) {
+        char *cwd_buf = getcwd(nullptr, 0);
+        if (!cwd_buf) {
+            std::fprintf(stderr, "boxsh: --try: cannot get cwd: %s\n",
+                         strerror(errno));
+            return 1;
+        }
+        try_cwd = cwd_buf;
+        free(cwd_buf);
+
+        char tmpl[] = "/tmp/boxsh-try-XXXXXX";
+        if (!mkdtemp(tmpl)) {
+            std::fprintf(stderr, "boxsh: --try: mkdtemp failed: %s\n",
+                         strerror(errno));
+            return 1;
+        }
+        std::string try_tmpdir(tmpl);
+        std::string upper = try_tmpdir + "/upper";
+        std::string work  = try_tmpdir + "/work";
+        if (mkdir(upper.c_str(), 0700) != 0 ||
+            mkdir(work.c_str(),  0700) != 0) {
+            std::fprintf(stderr, "boxsh: --try: failed to create temp dirs: %s\n",
+                         strerror(errno));
+            rmdir(try_tmpdir.c_str());
+            return 1;
+        }
+
+        std::fprintf(stderr, "boxsh: changes will be saved in %s/upper\n",
+                     try_tmpdir.c_str());
+
+        cli.sandbox.enabled = true;
+        boxsh::OverlayMount om;
+        om.lowerdir       = try_cwd;
+        om.upperdir       = upper;
+        om.workdir        = work;
+        om.container_path = try_cwd;
+        cli.sandbox.overlay_mounts.push_back(std::move(om));
+    }
 
     if (!cli.rpc_mode) {
         // Normal shell mode: apply sandbox (if requested) then run dash.

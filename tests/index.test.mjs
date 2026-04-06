@@ -5,4 +5,5 @@ import './worker-pool.test.mjs';
 import './timeout.test.mjs';
 import './concurrent.test.mjs';
 import './overlay.test.mjs';
+import './try.test.mjs';
 import './tools.test.mjs';

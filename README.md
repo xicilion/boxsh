@@ -33,10 +33,11 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 
 ## Overview
 
-boxsh has two modes:
+boxsh has two modes, plus a one-command sandbox shortcut:
 
 | Mode | How to start | What it does |
 |---|---|---|
+| **Quick-try shell** | `boxsh --try` | Drop into a sandboxed root shell on your CWD; writes go to a temp upper layer — original directory untouched |
 | **Shell mode** | `boxsh` (default) | Drop-in `dash` replacement — interactive shell, `-c`, script files |
 | **RPC mode** | `boxsh --rpc` | Reads JSON requests from stdin, executes shell commands concurrently via a pre-forked worker pool, writes JSON responses to stdout |
 
@@ -53,6 +54,33 @@ cmake -B build
 cmake --build build
 # binary: build/boxsh
 ```
+
+---
+
+## Quick try
+
+The fastest way to get started:
+
+```sh
+cd my-project
+boxsh --try
+```
+
+This drops you into a **root shell inside a copy-on-write sandbox** over your current directory. Writes go to a temporary upper layer; your real directory is never modified.
+
+```
+$ boxsh --try
+boxsh: changes will be saved in /tmp/boxsh-try-abc123/upper
+# <sandboxed root shell — experiment freely>
+$ rm important-file.txt
+$ exit
+$ ls important-file.txt   # still here on the host
+important-file.txt
+$ ls /tmp/boxsh-try-abc123/upper/
+.wh.important-file.txt   # the whiteout lives here, not in your directory
+```
+
+The temp directory persists after exit so you can inspect or archive exactly what changed. `--try` is shorthand for `--sandbox --overlay CWD:upper:work:CWD` with auto-managed directories. See [Quick-try Mode](docs/usage.md#quick-try-mode) for the full reference.
 
 ---
 

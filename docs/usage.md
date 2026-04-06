@@ -24,6 +24,7 @@ This guide walks through the core scenarios boxsh is built for, with concrete ex
 - [Reference](#reference)
   - [Installation](#installation)
   - [Shell Mode](#shell-mode)
+  - [Quick-try Mode](#quick-try-mode)
   - [RPC Mode](#rpc-mode)
   - [Sandbox Flags](#sandbox-flags)
   - [Node.js SDK](#nodejs-sdk)
@@ -777,6 +778,34 @@ echo 'ls -la' | boxsh
 ```
 
 All dash features work: pipelines, redirections, variables, arithmetic, heredocs, etc.
+
+### Quick-try Mode
+
+`--try` launches an ephemeral sandboxed shell on the current directory in one command. No directories to prepare, no flags to remember:
+
+```sh
+boxsh --try
+```
+
+What it does:
+
+1. Mounts the current directory as a copy-on-write overlay — you see all your files, but every write goes to a temporary upper layer.
+2. Enters an isolated namespace (private mount table, appears as root inside).
+3. When you exit the shell, the temporary layer is kept and its path is printed to stderr — inspect `upper/` to see exactly what changed, then discard when done.
+
+This is equivalent to the manual form:
+
+```sh
+mkdir -p /tmp/box/upper /tmp/box/work
+boxsh --sandbox \
+  --overlay "$PWD:/tmp/box/upper:/tmp/box/work:$PWD"
+# ... exit shell ...
+rm -rf /tmp/box
+```
+
+but reduced to a single flag.
+
+**Use cases:** installing packages to evaluate them, running untrusted scripts, experimenting with config changes, anything where you want a "what if" shell without consequences. The `upper/` directory left behind acts as a diff — you can review or replay the changes selectively.
 
 ### RPC Mode
 

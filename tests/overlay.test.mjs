@@ -179,6 +179,86 @@ describe('sandbox — overlay mounts', () => {
 });
 
 // ---------------------------------------------------------------------------
+// CWD inside the overlay mount point
+//
+// When the overlay mount point equals or contains the process CWD, the
+// kernel's stored (dentry, vfsmount) pair for CWD still points at the lower
+// layer after mount().  sandbox_apply() refreshes CWD via chdir() so that
+// relative-path writes go through the overlay instead of bypassing it.
+// ---------------------------------------------------------------------------
+
+describe('sandbox — overlay CWD refresh', () => {
+  test('relative write captured in upper when CWD == mount point', () => {
+    // Set up: lower has one existing file; we write a new file via relative path.
+    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+    try {
+      // dst is the overlay mount point.  Run boxsh with dst as CWD so that
+      // the relative path 'touch newfile' exercises the CWD == mount case.
+      const r = spawnSync(
+        BOXSH,
+        ['--sandbox', '--overlay', `${lower}:${upper}:${work}:${dst}`, '-c', 'touch newfile'],
+        { encoding: 'utf8', cwd: dst, timeout: 5000 },
+      );
+      assert.equal(r.status, 0, `boxsh failed: ${r.stderr}`);
+      // Write must appear in upper, not bypass to lower.
+      assert.ok(fs.existsSync(path.join(upper, 'newfile')),
+        'expected newfile in upper layer');
+      assert.ok(!fs.existsSync(path.join(lower, 'newfile')),
+        'newfile must not appear in lower layer');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('relative write captured in upper when CWD is subdirectory of mount point', () => {
+    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+    try {
+      // Create a subdirectory in lower so the overlay exposes it under dst.
+      fs.mkdirSync(path.join(lower, 'subdir'));
+      // Launch boxsh with dst as CWD; let the shell cd into the subdir so
+      // that the relative write happens with CWD = dst/subdir (inside the
+      // overlay mount tree).
+      const r = spawnSync(
+        BOXSH,
+        ['--sandbox', '--overlay', `${lower}:${upper}:${work}:${dst}`,
+         '-c', `cd ${dst}/subdir && touch canary`],
+        { encoding: 'utf8', cwd: dst, timeout: 5000 },
+      );
+      assert.equal(r.status, 0, `boxsh failed: ${r.stderr}`);
+      // The file should be captured in upper/subdir, not escape to lower/subdir.
+      assert.ok(fs.existsSync(path.join(upper, 'subdir', 'canary')),
+        'expected canary in upper/subdir');
+      assert.ok(!fs.existsSync(path.join(lower, 'subdir', 'canary')),
+        'canary must not appear in lower/subdir');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('CWD outside mount point is unaffected', () => {
+    // Sanity check: when CWD is not under the overlay, normal writes still work.
+    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-outside-'));
+    try {
+      const r = spawnSync(
+        BOXSH,
+        ['--sandbox', '--overlay', `${lower}:${upper}:${work}:${dst}`, '-c', 'touch outside-file'],
+        { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
+      );
+      assert.equal(r.status, 0, `boxsh failed: ${r.stderr}`);
+      // File written relative to outsideDir is visible there (not via overlay).
+      assert.ok(fs.existsSync(path.join(outsideDir, 'outside-file')),
+        'expected outside-file to exist in outsideDir');
+      // upper must remain empty (no write went through overlay).
+      assert.deepEqual(fs.readdirSync(upper), []);
+    } finally {
+      cleanup();
+      spawnSync('rm', ['-rf', outsideDir]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Multi-layer lower (session branching)
 //
 // overlayfs supports multiple lower directories separated by colons.
