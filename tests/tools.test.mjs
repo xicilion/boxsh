@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { rpc } from './helpers.mjs';
+import { rpc, rpcSandboxed } from './helpers.mjs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -208,5 +208,54 @@ describe('tool — protocol errors', () => {
   test('write tool missing content returns parse error', () => {
     const resp = rpc({ id: '1', tool: 'write', path: '/tmp/x' });
     assert.ok(resp.error, 'expected error for missing content');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sandbox isolation (--sandbox mode)
+//
+// In sandbox mode the tool child applies sandbox_apply() before executing.
+// /tmp inside the sandbox is a fresh tmpfs, so writes there MUST NOT affect
+// the host /tmp.
+// ---------------------------------------------------------------------------
+
+describe('tool — sandbox isolation', () => {
+  test('write tool in sandbox does not modify host /tmp', () => {
+    // Create a sentinel file on the host /tmp.
+    const sentinel = path.join(os.tmpdir(),
+      `boxsh-sandbox-sentinel-${process.pid}-${Math.random().toString(36).slice(2)}.txt`);
+    const original = 'HOST_ORIGINAL\n';
+    fs.writeFileSync(sentinel, original, 'utf8');
+    try {
+      // In sandboxed mode, /tmp is a fresh tmpfs — the sentinel path does not
+      // exist there.  The write will either fail (path not found) or succeed
+      // but write into the sandbox tmpfs, leaving the host file untouched.
+      rpcSandboxed({ id: '1', tool: 'write', path: sentinel, content: 'SANDBOXED\n' });
+      // Either way: host file must still contain the original content.
+      assert.equal(fs.readFileSync(sentinel, 'utf8'), original,
+        'host file was modified — tool ran outside the sandbox!');
+    } finally {
+      fs.rmSync(sentinel, { force: true });
+    }
+  });
+
+  test('read tool in sandbox cannot read host-only files', () => {
+    // Write a secret to a path the sandbox exposes only as an isolated /tmp.
+    const secret = path.join(os.tmpdir(),
+      `boxsh-sandbox-secret-${process.pid}-${Math.random().toString(36).slice(2)}.txt`);
+    fs.writeFileSync(secret, 'TOP_SECRET\n', 'utf8');
+    try {
+      // The sandbox /tmp is a fresh empty tmpfs, so this path should not exist.
+      const resp = rpcSandboxed({ id: '1', tool: 'read', path: secret });
+      // If it returned content it must NOT be the secret.
+      if (!resp.error) {
+        const content = resp.content?.[0]?.text ?? '';
+        assert.notEqual(content, 'TOP_SECRET\n',
+          'sandboxed tool read the host secret file!');
+      }
+      // An error response (file not found) is the expected happy path.
+    } finally {
+      fs.rmSync(secret, { force: true });
+    }
   });
 });

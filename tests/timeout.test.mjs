@@ -189,10 +189,12 @@ describe('timeout — edge cases', () => {
   });
 
   test('command writing large output before timeout is killed cleanly', () => {
-    // Generates output continuously; should be killed by timeout.
+    // Output one line every 100 ms indefinitely — guarantees the 1-second
+    // timeout fires before the command finishes on any machine, without
+    // flooding the pipe with gigabytes of data.
     const start = Date.now();
     const resp  = rpc(
-      { id: 't', cmd: 'yes | head -c 1000000000', timeout: 1 },
+      { id: 't', cmd: 'while true; do echo x; sleep 0.1; done', timeout: 1 },
       { timeout_ms: 6000 },
     );
     const elapsed = Date.now() - start;

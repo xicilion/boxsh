@@ -56,6 +56,10 @@ export function run(args, input = '', timeout_ms = 5000) {
     input,
     timeout: timeout_ms,
     encoding: 'utf8',
+    // MAX_OUTPUT_BYTES in worker_pool.cpp caps each stream at 10 MiB; the
+    // serialized JSON response can therefore reach ~25 MiB.  Raise maxBuffer
+    // well above that so spawnSync never kills boxsh due to buffer overflow.
+    maxBuffer: 64 * 1024 * 1024,
   });
 }
 
@@ -69,6 +73,21 @@ export function run(args, input = '', timeout_ms = 5000) {
 export function rpc(req, { workers = 2, timeout_ms = 5000 } = {}) {
   const line = JSON.stringify(req) + '\n';
   const r = run(['--rpc', '--workers', String(workers)], line, timeout_ms);
+  assert.equal(r.signal, null, `boxsh killed by signal ${r.signal}`);
+  const trimmed = r.stdout.trim();
+  assert.ok(trimmed.length > 0, 'boxsh produced no stdout');
+  return JSON.parse(trimmed);
+}
+
+/**
+ * Like rpc() but runs with --sandbox so tool child processes apply the sandbox.
+ * @param {object} req
+ * @param {{ workers?: number, timeout_ms?: number }} [opts]
+ * @returns {object} parsed JSON response
+ */
+export function rpcSandboxed(req, { workers = 2, timeout_ms = 8000 } = {}) {
+  const line = JSON.stringify(req) + '\n';
+  const r = run(['--rpc', '--sandbox', '--workers', String(workers)], line, timeout_ms);
   assert.equal(r.signal, null, `boxsh killed by signal ${r.signal}`);
   const trimmed = r.stdout.trim();
   assert.ok(trimmed.length > 0, 'boxsh produced no stdout');

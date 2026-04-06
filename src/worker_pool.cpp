@@ -7,6 +7,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <climits>
+#include <ctime>
 #include <algorithm>
 #include <chrono>
 
@@ -15,7 +17,6 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
-#include <sys/time.h>
 #include <poll.h>
 #include <fcntl.h>
 
@@ -98,6 +99,14 @@ static void run_shell_command(const std::string &shell_path,
 
     if (child == 0) {
         // Grandchild: run command via the embedded dash.
+        //
+        // Put this child in its own process group so that kill(-pgid, SIGKILL)
+        // from the parent on timeout also reaps any sub-children spawned by
+        // the shell command (e.g. the two sides of a pipe like `yes | head`).
+        // Without this, orphaned sub-children keep the pipe write-end open and
+        // the parent's drain loop never sees EOF.
+        setpgid(0, 0);
+
         dup2(pfd_out[1], STDOUT_FILENO);
         dup2(pfd_err[1], STDERR_FILENO);
         // Close all pipe fds (marked O_CLOEXEC handles exec, but dup2
@@ -135,17 +144,30 @@ static void run_shell_command(const std::string &shell_path,
     close(pfd_out[1]);
     close(pfd_err[1]);
 
-    // Set up timeout alarm.  Install a no-op handler so that SIGALRM
-    // interrupts poll() with EINTR instead of terminating the worker process
-    // (the kernel's default disposition for SIGALRM is process termination).
-    if (timeout_sec > 0) {
-        struct sigaction sa = {};
-        sa.sa_handler = [](int) {}; // no-op: allow poll() to return EINTR
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0; // no SA_RESTART: we need EINTR
-        sigaction(SIGALRM, &sa, nullptr);
-        alarm((unsigned)timeout_sec);
+    // Compute an absolute deadline using the monotonic clock.
+    // poll() is called with the remaining milliseconds on each iteration so
+    // that the timeout fires reliably regardless of when signal delivery occurs
+    // — avoiding the race where alarm() fires before poll() is entered.
+    struct timespec deadline = {};
+    const bool has_timeout = (timeout_sec > 0);
+    if (has_timeout) {
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += timeout_sec;
     }
+
+    // Helper: kill the child and set the timeout response fields.
+    // Kill the entire process group (negative pgid) so that any sub-children
+    // the shell spawned (e.g. both sides of a pipeline) are also killed.
+    // This ensures every process holding the pipe write-end is gone before we
+    // return, so the parent's drain loop would see EOF — but we skip the drain
+    // entirely on timeout and close the fds here.
+    auto handle_timeout = [&]() {
+        kill(-child, SIGKILL);  // kill the whole process group
+        exit_code  = -1;
+        stderr_out = "timeout";
+        close(pfd_out[0]); close(pfd_err[0]);
+        waitpid(child, nullptr, 0);
+    };
 
     // Read stdout and stderr with poll to avoid deadlock.
     // Cap each stream to MAX_OUTPUT_BYTES to prevent OOM and slow serialization.
@@ -156,23 +178,25 @@ static void run_shell_command(const std::string &shell_path,
     bool out_done = false, err_done = false;
 
     while (!out_done || !err_done) {
+        int poll_ms = -1; // infinite when there is no timeout
+        if (has_timeout) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long ms = (deadline.tv_sec  - now.tv_sec)  * 1000L
+                    + (deadline.tv_nsec - now.tv_nsec) / 1000000L;
+            if (ms <= 0) { handle_timeout(); return; }
+            poll_ms = (int)std::min<long>(ms, (long)INT_MAX);
+        }
+
         struct pollfd pfds[2];
         int nfds = 0;
         if (!out_done) { pfds[nfds] = {pfd_out[0], POLLIN, 0}; nfds++; }
         if (!err_done)  { pfds[nfds] = {pfd_err[0], POLLIN, 0}; nfds++; }
 
-        int r = poll(pfds, nfds, -1);
+        int r = poll(pfds, nfds, poll_ms);
+        if (r == 0) { handle_timeout(); return; } // deadline reached
         if (r < 0) {
-            if (errno == EINTR) {
-                // Alarm fired: kill child.
-                kill(child, SIGKILL);
-                exit_code = -1;
-                stderr_out = "timeout";
-                close(pfd_out[0]); close(pfd_err[0]);
-                waitpid(child, nullptr, 0);
-                alarm(0);
-                return;
-            }
+            if (errno == EINTR) continue;
             break;
         }
 
@@ -181,16 +205,7 @@ static void run_shell_command(const std::string &shell_path,
             char tmp[4096];
             ssize_t n = read(pfds[i].fd, tmp, sizeof(tmp));
             if (n < 0) {
-                if (errno == EINTR) {
-                    // SIGALRM arrived during read(); treat same as EINTR in poll().
-                    kill(child, SIGKILL);
-                    exit_code = -1;
-                    stderr_out = "timeout";
-                    close(pfd_out[0]); close(pfd_err[0]);
-                    waitpid(child, nullptr, 0);
-                    alarm(0);
-                    return;
-                }
+                if (errno == EINTR) continue; // retry via outer while
                 // Other read error: treat as EOF on this fd.
                 if (pfds[i].fd == pfd_out[0]) out_done = true;
                 else                           err_done = true;
@@ -210,7 +225,6 @@ static void run_shell_command(const std::string &shell_path,
         }
     }
 
-    alarm(0);
     close(pfd_out[0]);
     close(pfd_err[0]);
 
@@ -343,19 +357,8 @@ void WorkerPool::spawn_worker(Worker &w) {
         // Worker child.
         close(sv[0]); // close coordinator side
 
-        // Apply global sandbox inside the worker child.
-        if (cfg_.global_sandbox.enabled) {
-            SandboxResult sr = sandbox_apply(cfg_.global_sandbox);
-            if (!sr.ok) {
-                std::fprintf(stderr, "boxsh: sandbox_apply failed: %s\n",
-                             sr.error.c_str());
-                _exit(1);
-            }
-
-            worker_loop(sv[1], cfg_.shell_path);
-            _exit(0);
-        }
-
+        // The coordinator has already applied the sandbox before forking, so
+        // no sandbox_apply() call is needed here.
         worker_loop(sv[1], cfg_.shell_path);
         _exit(0);
     }

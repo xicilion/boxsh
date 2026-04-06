@@ -63,8 +63,15 @@ static int do_pivot_root(const char *new_root, const char *put_old) {
 // overlayfs can represent internally, causing copy-up to fail.  Pre-populating
 // upper with an empty directory skeleton avoids the copy-up entirely.
 static bool lower_needs_mirror_dirs(const std::string &lowerdir) {
+    // lowerdir may be a colon-separated list for multi-layer overlayfs.
+    // Copy-up originates from the topmost (first listed) lower layer.
+    std::string top = lowerdir;
+    size_t colon = lowerdir.find(':');
+    if (colon != std::string::npos)
+        top = lowerdir.substr(0, colon);
+
     struct statfs sfs;
-    if (statfs(lowerdir.c_str(), &sfs) != 0)
+    if (statfs(top.c_str(), &sfs) != 0)
         return true; // fail-safe: mirror anyway
     return sfs.f_type == XFS_SUPER_MAGIC;
 }
@@ -101,8 +108,16 @@ static bool mount_overlay_at(const std::string &lowerdir,
     // lower filesystem (XFS) cannot complete directory copy-up in a user
     // namespace.  On other filesystems (tmpfs, ext4, …) copy-up works fine
     // and we skip the potentially expensive pre-mirror step.
-    if (lower_needs_mirror_dirs(lowerdir))
-        mirror_dirs(lowerdir, upper);
+    //
+    // For multi-layer lowerdirs (colon-separated) we mirror the topmost layer:
+    // that is the layer overlayfs uses as the source for directory copy-up.
+    if (lower_needs_mirror_dirs(lowerdir)) {
+        std::string top_lower = lowerdir;
+        size_t colon = lowerdir.find(':');
+        if (colon != std::string::npos)
+            top_lower = lowerdir.substr(0, colon);
+        mirror_dirs(top_lower, upper);
+    }
     // xino=off: disable cross-inode-number encoding between lower and upper
     // layers.  Without this, overlayfs copy-up fails with EOVERFLOW when the
     // lower filesystem (e.g. ext4) has inode numbers that exceed the range
@@ -127,11 +142,57 @@ static bool mount_overlay_at(const std::string &lowerdir,
 //     fails with EPERM/EINVAL.
 //   - When running as real root (--no-user-ns), standard kernel overlayfs
 //     (CONFIG_OVERLAY_FS=y/m) is sufficient.
+// Return the parent directory of an absolute path (empty string for root).
+static std::string path_parent(const std::string &p) {
+    size_t pos = p.rfind('/');
+    if (pos == std::string::npos || pos == 0) return "/";
+    return p.substr(0, pos);
+}
+
 static bool apply_overlay_mounts(const std::vector<OverlayMount> &overlays,
                                   const std::string &dest_prefix,
                                   std::string &err) {
     for (const auto &ov : overlays) {
         std::string dest = dest_prefix + ov.container_path;
+
+        // Hide overlay internals (lower/upper/work) from inside the sandbox.
+        // If upper and work share a common parent directory that happens to be
+        // accessible in the sandbox (e.g. via the CWD auto-bind), mount a fresh
+        // empty tmpfs on that parent BEFORE mounting the overlay.  This makes
+        // lower/upper/work truly non-existent (ENOENT) inside the sandbox rather
+        // than merely empty directories, which is the correct security boundary.
+        // We do this *before* mount_overlay_at so the overlay mount point (dst)
+        // can be created inside the fresh tmpfs when it falls under that parent.
+        //
+        // Note: the kernel's overlayfs module holds its own internal references
+        // to lowerdir/upperdir/workdir obtained at mount time via the host-path
+        // options string; shadowing those paths in userspace does not affect the
+        // overlay's operation.
+        {
+            std::string p_upper = path_parent(ov.upperdir);
+            std::string p_work  = path_parent(ov.workdir);
+            // Only apply when upper and work share a common, non-root parent that
+            // is distinct from the container_path itself.
+            if (p_upper == p_work && p_upper != "/" &&
+                p_upper != ov.container_path) {
+                std::string base_in_root = dest_prefix + p_upper;
+                struct stat st;
+                if (stat(base_in_root.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                    if (mount("tmpfs", base_in_root.c_str(), "tmpfs",
+                              MS_NOSUID | MS_NODEV, "mode=0755") == 0) {
+                        // If dst is a child of this base, create its directory
+                        // inside the fresh tmpfs so mount_overlay_at has a target.
+                        if (ov.container_path.size() > p_upper.size() + 1 &&
+                            ov.container_path.compare(0, p_upper.size() + 1,
+                                                      p_upper + "/") == 0) {
+                            std::string dst_err;
+                            mkdir_p(dest, 0755, dst_err);
+                        }
+                    }
+                }
+            }
+        }
+
         if (!mount_overlay_at(ov.lowerdir, dest, ov.upperdir, ov.workdir, err))
             return false;
     }

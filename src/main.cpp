@@ -330,6 +330,18 @@ int main(int argc, char **argv) {
     // instead of killing the coordinator process.
     signal(SIGPIPE, SIG_IGN);
 
+    // Apply the sandbox once in the coordinator process.  All subsequently
+    // forked workers inherit the restricted namespace, and tool threads share
+    // it automatically (threads share the same mount/pid/user namespace).
+    if (cli.sandbox.enabled) {
+        boxsh::SandboxResult sr = boxsh::sandbox_apply(cli.sandbox);
+        if (!sr.ok) {
+            std::fprintf(stderr, "boxsh: sandbox_apply failed: %s\n",
+                         sr.error.c_str());
+            return 1;
+        }
+    }
+
     boxsh::WorkerPool pool(std::move(pool_cfg));
     std::string err;
     if (!pool.init(err)) {

@@ -378,9 +378,10 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
     LineReader reader(fd_in);
     size_t in_flight = 0;
 
-    // Each in-flight tool request gets its own socketpair.  The worker thread
-    // writes a 4-byte LE length + serialized response to the write end; the
-    // event loop polls the read end alongside worker sockets.
+    // Each in-flight tool request gets its own socketpair.  A detached thread
+    // runs the handler inside the coordinator's sandbox namespace and writes a
+    // 4-byte LE length + serialized response; the event loop polls the read end
+    // alongside worker sockets.
     struct ToolEntry { int fd; };
     std::vector<ToolEntry> pending_tools;
 
@@ -388,12 +389,12 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
     // one and stop reading stdin until a worker becomes available.
     std::optional<RpcRequest> buffered_cmd;
 
-    // Dispatch a built-in tool on a background thread.  The result is sent
-    // back through a socketpair so the event loop is never blocked.
+    // Dispatch a built-in tool on a detached background thread.  The coordinator
+    // already lives inside the sandbox, so no sandbox_apply() is needed here.
     auto dispatch_tool_async = [&](const RpcRequest &req) {
         int sv[2];
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
-            // Extremely unlikely (fd exhaustion). Fall back to synchronous.
+            // Extremely unlikely (fd exhaustion). Fall back to synchronous execution.
             RpcResponse resp;
             switch (req.tool) {
                 case ToolKind::Read:  resp = tool_read(req);  break;
@@ -404,24 +405,25 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
             write_resp(resp);
             return;
         }
-        pending_tools.push_back({sv[0]});
-        in_flight++;
-        int wfd = sv[1];
-        RpcRequest req_copy = req;
-        std::thread([req_copy, wfd]() {
+
+        int write_fd = sv[1];
+        std::thread([req, write_fd]() {
             RpcResponse resp;
-            switch (req_copy.tool) {
-                case ToolKind::Read:  resp = tool_read(req_copy);  break;
-                case ToolKind::Write: resp = tool_write(req_copy); break;
-                case ToolKind::Edit:  resp = tool_edit(req_copy);  break;
+            switch (req.tool) {
+                case ToolKind::Read:  resp = tool_read(req);  break;
+                case ToolKind::Write: resp = tool_write(req); break;
+                case ToolKind::Edit:  resp = tool_edit(req);  break;
                 default: break;
             }
             std::string payload = rpc_serialize_response(resp) + '\n';
             uint32_t len = (uint32_t)payload.size();
-            (void)write(wfd, &len, 4);
-            (void)write(wfd, payload.c_str(), len);
-            close(wfd);
+            (void)write(write_fd, &len, 4);
+            (void)write(write_fd, payload.c_str(), len);
+            close(write_fd);
         }).detach();
+
+        pending_tools.push_back({sv[0]});
+        in_flight++;
     };
 
     while (true) {

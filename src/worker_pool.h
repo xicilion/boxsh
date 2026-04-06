@@ -54,6 +54,10 @@ public:
     // Terminate all workers and reap their PIDs.
     void shutdown();
 
+    // Expose the sandbox configuration, used by the RPC event loop to apply
+    // the same sandbox to tool child processes as to exec workers.
+    const SandboxConfig &sandbox_cfg() const { return cfg_.global_sandbox; }
+
 private:
     struct Worker {
         pid_t       pid         = -1;
