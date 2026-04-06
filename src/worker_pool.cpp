@@ -135,12 +135,23 @@ static void run_shell_command(const std::string &shell_path,
     close(pfd_out[1]);
     close(pfd_err[1]);
 
-    // Set up timeout alarm.
+    // Set up timeout alarm.  Install a no-op handler so that SIGALRM
+    // interrupts poll() with EINTR instead of terminating the worker process
+    // (the kernel's default disposition for SIGALRM is process termination).
     if (timeout_sec > 0) {
+        struct sigaction sa = {};
+        sa.sa_handler = [](int) {}; // no-op: allow poll() to return EINTR
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0; // no SA_RESTART: we need EINTR
+        sigaction(SIGALRM, &sa, nullptr);
         alarm((unsigned)timeout_sec);
     }
 
     // Read stdout and stderr with poll to avoid deadlock.
+    // Cap each stream to MAX_OUTPUT_BYTES to prevent OOM and slow serialization.
+    // Data beyond the limit is still drained from the pipe so the child process
+    // does not block on a full pipe buffer.
+    static constexpr size_t MAX_OUTPUT_BYTES = 10u * 1024u * 1024u; // 10 MiB
     std::string out_buf, err_buf;
     bool out_done = false, err_done = false;
 
@@ -169,12 +180,32 @@ static void run_shell_command(const std::string &shell_path,
             if (!(pfds[i].revents & (POLLIN | POLLHUP))) continue;
             char tmp[4096];
             ssize_t n = read(pfds[i].fd, tmp, sizeof(tmp));
-            if (n <= 0) {
+            if (n < 0) {
+                if (errno == EINTR) {
+                    // SIGALRM arrived during read(); treat same as EINTR in poll().
+                    kill(child, SIGKILL);
+                    exit_code = -1;
+                    stderr_out = "timeout";
+                    close(pfd_out[0]); close(pfd_err[0]);
+                    waitpid(child, nullptr, 0);
+                    alarm(0);
+                    return;
+                }
+                // Other read error: treat as EOF on this fd.
+                if (pfds[i].fd == pfd_out[0]) out_done = true;
+                else                           err_done = true;
+            } else if (n == 0) {
                 if (pfds[i].fd == pfd_out[0]) out_done = true;
                 else                           err_done = true;
             } else {
-                if (pfds[i].fd == pfd_out[0]) out_buf.append(tmp, n);
-                else                           err_buf.append(tmp, n);
+                if (pfds[i].fd == pfd_out[0]) {
+                    if (out_buf.size() < MAX_OUTPUT_BYTES)
+                        out_buf.append(tmp, n);
+                    // else: discard — keep draining so child is not blocked
+                } else {
+                    if (err_buf.size() < MAX_OUTPUT_BYTES)
+                        err_buf.append(tmp, n);
+                }
             }
         }
     }

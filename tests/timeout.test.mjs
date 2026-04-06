@@ -138,6 +138,41 @@ describe('timeout — recovery', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Clean timeout path (worker must survive SIGALRM, grandchild must be killed)
+// ---------------------------------------------------------------------------
+
+describe('timeout — clean kill path', () => {
+  test('timeout response has stderr=timeout and no crash error', () => {
+    // When SIGALRM fires the poll() loop must catch EINTR and kill the
+    // grandchild cleanly.  The worker process must NOT be killed by SIGALRM
+    // (i.e. there should be no "worker crash" error in the response).
+    const resp = rpc(
+      { id: 't', cmd: 'sleep 30', timeout: 1 },
+      { timeout_ms: 6000 },
+    );
+    assert.equal(resp.stderr, 'timeout', 'expected clean timeout stderr marker');
+    assert.equal(resp.exit_code, -1, 'expected exit_code -1 for timeout');
+    assert.ok(!resp.error, `expected no crash error, got: ${resp.error}`);
+  });
+
+  test('worker is still alive after timeout (no respawn)', () => {
+    // After a clean timeout the worker should be ready for the next request
+    // immediately (same worker, no crash/respawn round-trip).
+    const resps = rpcMany(
+      [
+        { id: 'to',    cmd: 'sleep 30', timeout: 1 },
+        { id: 'after', cmd: 'echo alive' },
+      ],
+      { workers: 1, timeout_ms: 8000 },
+    );
+    const m = byId(resps);
+    assert.equal(m['to'].stderr, 'timeout');
+    assert.ok(!m['to'].error, `worker should not have crashed: ${m['to'].error}`);
+    assert.equal(m['after'].stdout, 'alive\n');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Edge cases
 // ---------------------------------------------------------------------------
 
