@@ -116,6 +116,10 @@ histedit(void)
 				if (hist)
 					el_set(el, EL_HIST, history, hist);
 				el_set(el, EL_PROMPT, getprompt);
+				/* Register the completion function (binding set later,
+				 * after EL_EDITOR, so it is not overwritten). */
+				el_set(el, EL_ADDFN, "ed-complete",
+				    "Complete argument", _el_fn_complete);
 			} else {
 bad:
 				out2str("sh: can't initialize editing\n");
@@ -133,6 +137,9 @@ bad:
 			else if (Eflag)
 				el_set(el, EL_EDITOR, "emacs");
 			el_source(el, NULL);
+			/* Bind Tab after editor mode and el_source so that
+			 * neither EL_EDITOR nor .editrc overwrite our binding. */
+			el_set(el, EL_BIND, "\t", "ed-complete", NULL);
 		}
 	} else {
 		INTOFF;
