@@ -13,48 +13,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
 endif()
 
-# ---------------------------------------------------------------------------
-# libedit (built from vendored source via autotools)
-# ---------------------------------------------------------------------------
-include(ExternalProject)
 
-set(LIBEDIT_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libedit-20230828-3.1)
-set(LIBEDIT_PREFIX  ${CMAKE_CURRENT_BINARY_DIR}/libedit-prefix)
-
-# Propagate CMAKE_OSX_ARCHITECTURES to autotools-based libedit build
-if(CMAKE_OSX_ARCHITECTURES)
-    set(LIBEDIT_CONFIGURE_ENV ${CMAKE_COMMAND} -E env
-        "CFLAGS=-arch ${CMAKE_OSX_ARCHITECTURES}"
-        "LDFLAGS=-arch ${CMAKE_OSX_ARCHITECTURES}")
-else()
-    set(LIBEDIT_CONFIGURE_ENV)
-endif()
-
-ExternalProject_Add(libedit_ext
-    SOURCE_DIR      ${LIBEDIT_SRC_DIR}
-    BINARY_DIR      ${CMAKE_CURRENT_BINARY_DIR}/libedit-build
-    PREFIX          ${LIBEDIT_PREFIX}
-    CONFIGURE_COMMAND
-        ${LIBEDIT_CONFIGURE_ENV}
-        ${LIBEDIT_SRC_DIR}/configure
-            --prefix=${LIBEDIT_PREFIX}
-            --enable-static
-            --disable-shared
-            --with-pic
-    BUILD_COMMAND   $(MAKE)
-    INSTALL_COMMAND $(MAKE) install
-    BUILD_BYPRODUCTS ${LIBEDIT_PREFIX}/lib/libedit.a
-)
-
-# Pre-create the install include dir so CMake accepts it as an INTERFACE path
-file(MAKE_DIRECTORY ${LIBEDIT_PREFIX}/include)
-
-add_library(libedit_vendored STATIC IMPORTED GLOBAL)
-add_dependencies(libedit_vendored libedit_ext)
-set_target_properties(libedit_vendored PROPERTIES
-    IMPORTED_LOCATION             ${LIBEDIT_PREFIX}/lib/libedit.a
-    INTERFACE_INCLUDE_DIRECTORIES ${LIBEDIT_PREFIX}/include
-)
 
 # ---------------------------------------------------------------------------
 # Dash static library
@@ -113,7 +72,6 @@ target_include_directories(dash_static
     PUBLIC
         ${DASH_SRC_DIR}
         ${DASH_ROOT}       # for config.h
-        ${LIBEDIT_SRC_DIR}/src
 )
 
 target_compile_definitions(dash_static
@@ -148,6 +106,64 @@ target_include_directories(nlohmann_json INTERFACE
 )
 
 # ---------------------------------------------------------------------------
+# libedit (built from vendored source via autotools)
+# ---------------------------------------------------------------------------
+include(ExternalProject)
+
+set(LIBEDIT_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libedit-20230828-3.1)
+set(LIBEDIT_BUILD_DIR ${CMAKE_BINARY_DIR}/libedit-build)
+set(LIBEDIT_INSTALL_DIR ${CMAKE_BINARY_DIR}/libedit-prefix)
+
+# Find the ncurses include directory (may be in a subdirectory like ncurses/)
+find_path(NCURSES_INCLUDE_DIR ncurses.h PATH_SUFFIXES ncurses)
+set(LIBEDIT_CFLAGS "${CMAKE_C_FLAGS}")
+if(NCURSES_INCLUDE_DIR)
+    set(LIBEDIT_CFLAGS "${LIBEDIT_CFLAGS} -I${NCURSES_INCLUDE_DIR}")
+endif()
+
+# Build the autotools --host flag and CFLAGS/LDFLAGS for libedit.
+# On macOS cross-compile (e.g. x86_64 on arm64), pass -arch; on Linux
+# cross-compile, CMAKE_C_COMPILER_TARGET is set by the toolchain.
+set(LIBEDIT_HOST_FLAG "")
+set(LIBEDIT_EXTRA_CFLAGS "")
+set(LIBEDIT_EXTRA_LDFLAGS "")
+if(CMAKE_C_COMPILER_TARGET)
+    set(LIBEDIT_HOST_FLAG --host=${CMAKE_C_COMPILER_TARGET})
+endif()
+if(CMAKE_OSX_ARCHITECTURES)
+    set(LIBEDIT_EXTRA_CFLAGS "-arch ${CMAKE_OSX_ARCHITECTURES}")
+    set(LIBEDIT_EXTRA_LDFLAGS "-arch ${CMAKE_OSX_ARCHITECTURES}")
+    if(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+        set(LIBEDIT_HOST_FLAG --host=x86_64-apple-darwin)
+    elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+        set(LIBEDIT_HOST_FLAG --host=aarch64-apple-darwin)
+    endif()
+endif()
+
+ExternalProject_Add(libedit_vendored
+    SOURCE_DIR ${LIBEDIT_SRC_DIR}
+    # Touch autotools-generated files so make does not try to regenerate
+    # them (aclocal-1.16 etc. are not available on CI).
+    PATCH_COMMAND
+        find ${LIBEDIT_SRC_DIR} -name aclocal.m4 -exec touch {} + &&
+        find ${LIBEDIT_SRC_DIR} -name configure -exec touch {} + &&
+        find ${LIBEDIT_SRC_DIR} -name config.h.in -exec touch {} + &&
+        find ${LIBEDIT_SRC_DIR} -name Makefile.in -exec touch {} +
+    CONFIGURE_COMMAND ${LIBEDIT_SRC_DIR}/configure
+        --prefix=${LIBEDIT_INSTALL_DIR}
+        --enable-static --disable-shared
+        ${LIBEDIT_HOST_FLAG}
+        "CC=${CMAKE_C_COMPILER}"
+        "CFLAGS=${CMAKE_C_FLAGS} ${LIBEDIT_EXTRA_CFLAGS} ${LIBEDIT_CFLAGS}"
+        "LDFLAGS=${CMAKE_EXE_LINKER_FLAGS} ${LIBEDIT_EXTRA_LDFLAGS}"
+    BUILD_COMMAND make -j4
+    INSTALL_COMMAND make install
+    BUILD_IN_SOURCE 0
+    BINARY_DIR ${LIBEDIT_BUILD_DIR}
+    BUILD_BYPRODUCTS ${LIBEDIT_INSTALL_DIR}/lib/libedit.a
+)
+
+# ---------------------------------------------------------------------------
 # boxsh executable
 # ---------------------------------------------------------------------------
 
@@ -170,6 +186,7 @@ target_include_directories(boxsh
         ${DASH_SRC_DIR}
         ${DASH_ROOT}
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        ${LIBEDIT_INSTALL_DIR}/include
 )
 
 target_compile_definitions(boxsh
@@ -184,21 +201,16 @@ target_compile_options(boxsh
         -Wno-unused-parameter
 )
 
-# tinfo is a Linux ncurses sub-library; macOS uses ncurses directly.
-if(APPLE)
-    set(BOXSH_TERM_LIB ncurses)
-else()
-    set(BOXSH_TERM_LIB tinfo)
-endif()
-
 target_link_libraries(boxsh
     PRIVATE
         dash_static
         nlohmann_json
-        libedit_vendored
-        ${BOXSH_TERM_LIB}
+        ${LIBEDIT_INSTALL_DIR}/lib/libedit.a
+        ncurses
         pthread
 )
+
+add_dependencies(boxsh libedit_vendored)
 
 # ---------------------------------------------------------------------------
 # Copy binary to SDK after build

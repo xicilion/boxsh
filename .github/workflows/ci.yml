@@ -3,17 +3,39 @@ name: CI
 on:
   push:
     branches: ["master"]
+    tags:
+      - v*.*.*
   pull_request:
     branches: ["master"]
 
 jobs:
-  build-and-test:
+  build:
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Linux cross-compilation via Docker
           - os: ubuntu-22.04
+            arch: x64
+          - os: ubuntu-22.04
+            arch: ia32
+          - os: ubuntu-22.04
+            arch: arm64
+          - os: ubuntu-22.04
+            arch: arm
+          - os: ubuntu-22.04
+            arch: mips64
+          - os: ubuntu-22.04
+            arch: ppc64
+          - os: ubuntu-22.04
+            arch: riscv64
+          - os: ubuntu-22.04
+            arch: loong64
+          - os: ubuntu-22.04
+            arch: loong64ow
+          # macOS
           - os: macos-latest
+            arch: arm64
           - os: macos-latest
             arch: x86_64
 
@@ -22,21 +44,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies (Linux)
+      - name: Setup the environment (Linux)
         if: runner.os == 'Linux'
         run: |
+          sudo dpkg --add-architecture i386
           sudo apt-get update -qq
-          sudo apt-get install -y cmake g++ libtinfo-dev
-
-      - name: Install build dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: brew install cmake
-
-      - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.arch && format('-DCMAKE_OSX_ARCHITECTURES={0}', matrix.arch) || '' }}
+          sudo apt-get install -y qemu-user-static libncurses6 libtinfo6 libncurses6:i386 libtinfo6:i386
+          sudo update-binfmts --enable
 
       - name: Build
-        run: cmake --build build --parallel $(nproc 2>/dev/null || sysctl -n hw.logicalcpu)
+        shell: bash
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
+          BUILD_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: bash .github/workflows/build.sh
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -44,9 +65,21 @@ jobs:
           node-version: "22"
 
       - name: Run tests
+        if: matrix.arch == 'x64' || matrix.arch == 'ia32' || runner.os == 'macOS'
         run: |
           mkdir -p temp
           node --test tests/index.test.mjs
 
       - name: Run SDK tests
+        if: matrix.arch == 'x64' || matrix.arch == 'ia32' || runner.os == 'macOS'
         run: node --test sdk/js/test/all.test.mjs
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: release/*
+          file_glob: true
+          tag: ${{ github.ref }}
+          overwrite: true
