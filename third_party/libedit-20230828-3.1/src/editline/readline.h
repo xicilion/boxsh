@@ -1,4 +1,4 @@
-/*	$NetBSD: readline.h,v 1.46 2019/06/07 15:19:29 christos Exp $	*/
+/*	$NetBSD: readline.h,v 1.55 2023/04/25 17:51:32 christos Exp $	*/
 
 /*-
  * Copyright (c) 1997 The NetBSD Foundation, Inc.
@@ -37,14 +37,16 @@
 /* list of readline stuff supported by editline library's readline wrapper */
 
 /* typedefs */
-typedef int	  Function(const char *, int);
-typedef char     *CPFunction(const char *, int);
-typedef void	  VFunction(void);
+typedef int	  rl_linebuf_func_t(const char *, int);
+typedef void	  rl_voidfunc_t(void);
+typedef void	  rl_vintfunc_t(int);
 typedef void	  rl_vcpfunc_t(char *);
 typedef char	**rl_completion_func_t(const char *, int, int);
 typedef char     *rl_compentry_func_t(const char *, int);
+typedef void	  rl_compdisp_func_t(char **, int, int);
 typedef int	  rl_command_func_t(int, int);
 typedef int	  rl_hook_func_t(void);
+typedef int       rl_icppfunc_t(char **);
 
 /* only supports length */
 typedef struct {
@@ -63,7 +65,7 @@ typedef struct _keymap_entry {
 #define ISFUNC	0
 #define ISKMAP	1
 #define ISMACR	2
-	Function *function;
+	rl_linebuf_func_t *function;
 } KEYMAP_ENTRY;
 
 #define KEYMAP_SIZE	256
@@ -93,6 +95,13 @@ typedef KEYMAP_ENTRY *Keymap;
 #define RL_PROMPT_START_IGNORE	'\1'
 #define RL_PROMPT_END_IGNORE	'\2'
 
+#define RL_STATE_NONE		0x000000
+#define RL_STATE_DONE		0x000001
+
+#define RL_SETSTATE(x)		(rl_readline_state |= ((unsigned long) x))
+#define RL_UNSETSTATE(x)	(rl_readline_state &= ~((unsigned long) x))
+#define RL_ISSTATE(x)		(rl_readline_state & ((unsigned long) x))
+
 /* global variables used by readline enabled applications */
 #ifdef __cplusplus
 extern "C" {
@@ -103,9 +112,8 @@ extern const char	*rl_readline_name;
 extern FILE		*rl_instream;
 extern FILE		*rl_outstream;
 extern char		*rl_line_buffer;
-extern int		 rl_point, rl_end;
-extern int		 history_base, history_length;
-extern int		 max_input_history;
+extern int		rl_point, rl_end;
+extern const char	*rl_basic_quote_characters;
 extern const char	*rl_basic_word_break_characters;
 extern char		*rl_completer_word_break_characters;
 extern const char	*rl_completer_quote_characters;
@@ -118,15 +126,27 @@ extern int		rl_completion_query_items;
 extern const char	*rl_special_prefixes;
 extern int		rl_completion_append_character;
 extern int		rl_inhibit_completion;
-extern Function		*rl_pre_input_hook;
-extern Function		*rl_startup_hook;
+extern rl_hook_func_t	*rl_pre_input_hook;
+extern rl_hook_func_t	*rl_startup_hook;
 extern char		*rl_terminal_name;
 extern int		rl_already_prompted;
 extern char		*rl_prompt;
 extern int		rl_done;
+extern rl_vcpfunc_t	*rl_linefunc;
+extern rl_hook_func_t   *rl_startup1_hook;
+extern char             *rl_prompt_saved;
+extern int		history_base, history_length;
+extern int		history_offset;
+extern char		history_expansion_char;
+extern char		history_subst_char;
+extern char		*history_no_expand_chars;
+extern rl_linebuf_func_t *history_inhibit_expansion_function;
+extern int		max_input_history;
+
 /*
  * The following is not implemented
  */
+extern unsigned long	rl_readline_state;
 extern int		rl_catch_signals;
 extern int		rl_catch_sigwinch;
 extern KEYMAP_ENTRY_ARRAY emacs_standard_keymap,
@@ -135,13 +155,22 @@ extern KEYMAP_ENTRY_ARRAY emacs_standard_keymap,
 extern int		rl_filename_completion_desired;
 extern int		rl_ignore_completion_duplicates;
 extern int		(*rl_getc_function)(FILE *);
-extern VFunction	*rl_redisplay_function;
-extern VFunction	*rl_completion_display_matches_hook;
-extern VFunction	*rl_prep_term_function;
-extern VFunction	*rl_deprep_term_function;
+extern rl_voidfunc_t	*rl_redisplay_function;
+extern rl_compdisp_func_t *rl_completion_display_matches_hook;
+extern rl_vintfunc_t	*rl_prep_term_function;
+extern rl_voidfunc_t	*rl_deprep_term_function;
 extern rl_hook_func_t	*rl_event_hook;
 extern int		readline_echoing_p;
 extern int		_rl_print_completions_horizontally;
+extern int		_rl_complete_mark_directories;
+extern rl_icppfunc_t	*rl_directory_completion_hook;
+extern int		rl_completion_suppress_append;
+extern int		rl_sort_completion_matches;
+extern int		_rl_completion_prefix_display_length;
+extern int		_rl_echoing_p;
+extern int		history_max_entries;
+extern char		*rl_display_prompt;
+extern int		rl_erase_empty_line;
 
 /* supported functions */
 char		*readline(const char *);
@@ -169,7 +198,7 @@ int		 history_search_prefix(const char *, int);
 int		 history_search_pos(const char *, int, int);
 int		 read_history(const char *);
 int		 write_history(const char *);
-int		 history_truncate_file (const char *, int);
+int		 history_truncate_file(const char *, int);
 int		 history_expand(char *, char **);
 char	       **history_tokenize(const char *);
 const char	*get_history_event(const char *, int *, int);
@@ -204,7 +233,7 @@ int		 rl_add_defun(const char *, rl_command_func_t *, int);
 HISTORY_STATE	*history_get_history_state(void);
 void		 rl_get_screen_size(int *, int *);
 void		 rl_set_screen_size(int, int);
-char		*rl_filename_completion_function (const char *, int);
+char		*rl_filename_completion_function(const char *, int);
 int		 _rl_abort_internal(void);
 int		 _rl_qsort_string_compare(char **, char **);
 char	       **rl_completion_matches(const char *, rl_compentry_func_t *);
@@ -213,6 +242,15 @@ int		 rl_set_prompt(const char *);
 int		 rl_on_new_line(void);
 void		 rl_reset_after_signal(void);
 void		 rl_echo_signal_char(int);
+int		 rl_crlf(void);
+int		 rl_ding(void);
+char 		*rl_copy_text(int, int);
+void		 rl_replace_line(const char *, int);
+int		 rl_delete_text(int, int);
+void 		 rl_message(const char *format, ...)
+    __attribute__((__format__(__printf__, 1, 2)));
+void		 rl_save_prompt(void);
+void		 rl_restore_prompt(void);
 
 /*
  * The following are not implemented
@@ -223,9 +261,14 @@ void		 rl_set_keymap(Keymap);
 Keymap		 rl_make_bare_keymap(void);
 int		 rl_generic_bind(int, const char *, const char *, Keymap);
 int		 rl_bind_key_in_map(int, rl_command_func_t *, Keymap);
+int		 rl_set_key(const char *, rl_command_func_t *, Keymap);
 void		 rl_cleanup_after_signal(void);
 void		 rl_free_line_state(void);
 int		 rl_set_keyboard_input_timeout(int);
+int		 rl_abort(int, int);
+int	         rl_set_keymap_name(const char *, Keymap);
+histdata_t	 free_history_entry(HIST_ENTRY *);
+void		 _rl_erase_entire_line(void);
 
 #ifdef __cplusplus
 }

@@ -14,6 +14,39 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ---------------------------------------------------------------------------
+# libedit (built from vendored source via autotools)
+# ---------------------------------------------------------------------------
+include(ExternalProject)
+
+set(LIBEDIT_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libedit-20230828-3.1)
+set(LIBEDIT_PREFIX  ${CMAKE_CURRENT_BINARY_DIR}/libedit-prefix)
+
+ExternalProject_Add(libedit_ext
+    SOURCE_DIR      ${LIBEDIT_SRC_DIR}
+    BINARY_DIR      ${CMAKE_CURRENT_BINARY_DIR}/libedit-build
+    PREFIX          ${LIBEDIT_PREFIX}
+    CONFIGURE_COMMAND
+        ${LIBEDIT_SRC_DIR}/configure
+            --prefix=${LIBEDIT_PREFIX}
+            --enable-static
+            --disable-shared
+            --with-pic
+    BUILD_COMMAND   $(MAKE)
+    INSTALL_COMMAND $(MAKE) install
+    BUILD_BYPRODUCTS ${LIBEDIT_PREFIX}/lib/libedit.a
+)
+
+# Pre-create the install include dir so CMake accepts it as an INTERFACE path
+file(MAKE_DIRECTORY ${LIBEDIT_PREFIX}/include)
+
+add_library(libedit_vendored STATIC IMPORTED GLOBAL)
+add_dependencies(libedit_vendored libedit_ext)
+set_target_properties(libedit_vendored PROPERTIES
+    IMPORTED_LOCATION             ${LIBEDIT_PREFIX}/lib/libedit.a
+    INTERFACE_INCLUDE_DIRECTORIES ${LIBEDIT_PREFIX}/include
+)
+
+# ---------------------------------------------------------------------------
 # Dash static library
 #
 # We vendor dash 0.5.12 and compile it as a static library.  The generated
@@ -70,7 +103,7 @@ target_include_directories(dash_static
     PUBLIC
         ${DASH_SRC_DIR}
         ${DASH_ROOT}       # for config.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libedit/include
+        ${LIBEDIT_SRC_DIR}/src
 )
 
 target_compile_definitions(dash_static
@@ -138,8 +171,7 @@ target_link_libraries(boxsh
     PRIVATE
         dash_static
         nlohmann_json
-        -L${CMAKE_CURRENT_SOURCE_DIR}/third_party/libedit
-        edit
+        libedit_vendored
         tinfo
         pthread
 )
