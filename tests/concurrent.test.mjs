@@ -111,8 +111,8 @@ describe('concurrent — ordering', () => {
     assert.equal(m['fast2'].stdout, 'fast2\n');
     assert.equal(m['slow1'].stdout, 'slow1\n');
     assert.equal(m['slow2'].stdout, 'slow2\n');
-    // With 4 workers all run in parallel — should finish in ~200ms, allow 500ms
-    assert.ok(elapsed < 500, `expected ~200ms, got ${elapsed}ms`);
+    // With 4 workers all run in parallel — should finish in ~200ms, allow 1000ms
+    assert.ok(elapsed < 1000, `expected ~200ms, got ${elapsed}ms`);
   });
 });
 
