@@ -212,15 +212,6 @@ target_link_libraries(boxsh
 
 add_dependencies(boxsh libedit_vendored)
 
-# ---------------------------------------------------------------------------
-# Copy binary to SDK after build
-# ---------------------------------------------------------------------------
-set(SDK_EXEC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/sdk/js/src/exec)
-add_custom_command(TARGET boxsh POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${SDK_EXEC_DIR}
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:boxsh> ${SDK_EXEC_DIR}/boxsh
-    COMMENT "Copying boxsh to sdk/js/src/exec/"
-)
 
 # ---------------------------------------------------------------------------
 # Install

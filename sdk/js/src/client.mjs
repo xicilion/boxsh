@@ -15,11 +15,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import { createInterface } from 'node:readline';
-
-const _bundledBoxsh = join(import.meta.dirname, 'exec', 'boxsh');
 
 /**
  * POSIX single-quote escaping.
@@ -40,15 +36,14 @@ export class BoxshClient {
 
     /**
      * @param {object} [options]
-     * @param {string}  [options.boxshPath]   Path to boxsh binary (default: BOXSH env var → bundled src/exec/boxsh → 'boxsh')
+     * @param {string}  [options.boxshPath]   Path to boxsh binary (default: BOXSH env var → 'boxsh' in PATH)
      * @param {number}  [options.workers]     Worker count (default: 1)
      * @param {boolean} [options.sandbox]     Enable --sandbox flag
      * @param {boolean} [options.newNetNs]    Enable --new-net-ns flag
      * @param {Array<{ mode: 'ro'|'wr', path: string } | { mode: 'cow', src: string, dst: string }>} [options.binds]
      */
     constructor(options = {}) {
-        const boxsh = options.boxshPath ?? process.env['BOXSH'] ??
-            (existsSync(_bundledBoxsh) ? _bundledBoxsh : 'boxsh');
+        const boxsh = options.boxshPath ?? process.env['BOXSH'] ?? 'boxsh';
         const args = ['--rpc', '--workers', String(options.workers ?? 1)];
 
         if (options.sandbox) args.push('--sandbox');

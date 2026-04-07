@@ -1,6 +1,6 @@
 {
   "name": "boxsh.js",
-  "version": "0.1.2",
+  "version": "1.0.0",
   "description": "Node.js SDK for boxsh — sandboxed shell execution with overlay copy-on-write and JSON-line RPC",
   "type": "module",
   "main": "./src/index.mjs",
