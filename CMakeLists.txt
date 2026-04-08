@@ -140,6 +140,14 @@ if(CMAKE_OSX_ARCHITECTURES)
     endif()
 endif()
 
+
+# On macOS the SDK sysroot must be forwarded to the autotools build so that
+# the linker can find libSystem and other system libraries.
+set(LIBEDIT_SYSROOT_LDFLAGS "")
+if(APPLE AND CMAKE_OSX_SYSROOT)
+    set(LIBEDIT_SYSROOT_LDFLAGS "-isysroot ${CMAKE_OSX_SYSROOT}")
+endif()
+
 ExternalProject_Add(libedit_vendored
     SOURCE_DIR ${LIBEDIT_SRC_DIR}
     # Touch autotools-generated files so make does not try to regenerate
@@ -155,7 +163,7 @@ ExternalProject_Add(libedit_vendored
         ${LIBEDIT_HOST_FLAG}
         "CC=${CMAKE_C_COMPILER}"
         "CFLAGS=${CMAKE_C_FLAGS} ${LIBEDIT_EXTRA_CFLAGS} ${LIBEDIT_CFLAGS}"
-        "LDFLAGS=${CMAKE_EXE_LINKER_FLAGS} ${LIBEDIT_EXTRA_LDFLAGS}"
+        "LDFLAGS=${CMAKE_EXE_LINKER_FLAGS} ${LIBEDIT_EXTRA_LDFLAGS} ${LIBEDIT_SYSROOT_LDFLAGS}"
     BUILD_COMMAND make -j4
     INSTALL_COMMAND make install
     BUILD_IN_SOURCE 0
