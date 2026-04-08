@@ -370,44 +370,7 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
             return res;
     }
 
-    // --- 7. Auto-bind CWD into the new root (if not already covered) ---
-    // Ensures CWD-relative writes reach the host filesystem.
-    // COW mounts handle their own CWD redirection; skip auto-bind when CWD
-    // falls within any COW source (the overlay will cover that path).
-    if (!saved_cwd.empty()) {
-        auto is_under = [](const std::string &path,
-                           const std::string &prefix) -> bool {
-            return path == prefix ||
-                   (path.size() > prefix.size() && path[prefix.size()] == '/' &&
-                    path.compare(0, prefix.size(), prefix) == 0);
-        };
-        // System dirs already set up: no auto-bind needed for these.
-        static const char *sys_prefixes[] = {
-            "/usr", "/bin", "/sbin", "/lib", "/proc", "/dev",
-        };
-        bool cwd_covered = false;
-        for (auto &p : sys_prefixes)
-            if (is_under(saved_cwd, p)) { cwd_covered = true; break; }
-        if (!cwd_covered) {
-            for (const auto &bm : cfg.bind_mounts) {
-                if (bm.mode == BindMount::Mode::COW) {
-                    // CWD within a COW source will be redirected to dst after pivot.
-                    if (is_under(saved_cwd, bm.src) || is_under(saved_cwd, bm.dst)) {
-                        cwd_covered = true; break;
-                    }
-                } else {
-                    if (is_under(saved_cwd, bm.dst)) { cwd_covered = true; break; }
-                }
-            }
-        }
-        if (!cwd_covered) {
-            // Best-effort: ignore failures (CWD may be /tmp which is a fresh tmpfs).
-            std::string cwd_err;
-            bind_mount(saved_cwd, new_root + saved_cwd, false, cwd_err);
-        }
-    }
-
-    // --- 8. COW bind mounts: overlayfs with auto-created workdir ---
+    // --- 7. COW bind mounts: overlayfs with auto-created workdir ---
     // dst is used as the upperdir (captures writes); a sibling workdir is
     // created automatically.  After the sandbox exits, dst on the host holds
     // the upper layer so the caller can inspect changes.

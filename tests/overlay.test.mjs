@@ -218,24 +218,116 @@ describe('sandbox — cow CWD redirect', () => {
     }
   });
 
-  test('CWD outside src is unaffected', () => {
-    // When CWD is not under src, the auto-bind of CWD handles it normally.
+  test('CWD outside src is not writable without explicit bind', () => {
+    // With sandbox hardening, CWD is NOT auto-bound.  Writing to a
+    // directory that was not explicitly exposed via --bind must fail.
     const { src, dst, cleanup } = makeCowDirs();
     const outsideDir = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-outside-'));
     try {
       const r = spawnSync(
         BOXSH,
-        ['--sandbox', '--bind', `cow:${src}:${dst}`, '-c', 'touch outside-file'],
+        ['--sandbox', '--bind', `cow:${src}:${dst}`, '-c', `touch ${outsideDir}/outside-file`],
         { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
       );
-      assert.equal(r.status, 0, `boxsh failed: ${r.stderr}`);
-      // File written relative to outsideDir is visible there.
-      assert.ok(fs.existsSync(path.join(outsideDir, 'outside-file')),
-        'expected outside-file to exist in outsideDir');
-      // dst must remain empty (no write went through the overlay).
-      assert.deepEqual(fs.readdirSync(dst), []);
+      assert.notEqual(r.status, 0, 'touch should fail — outsideDir is not bound');
+      // File must NOT exist — sandbox denied the write.
+      assert.ok(!fs.existsSync(path.join(outsideDir, 'outside-file')),
+        'outside-file must not be created');
     } finally {
       cleanup();
+      spawnSync('rm', ['-rf', outsideDir]);
+    }
+  });
+
+  test('CWD outside src is not readable without explicit bind', () => {
+    // Sandbox does not auto-bind CWD.  Listing a directory that was not
+    // exposed via --bind must fail.
+    const { src, dst, cleanup } = makeCowDirs();
+    const outsideDir = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-outside-'));
+    fs.writeFileSync(path.join(outsideDir, 'secret.txt'), 'hidden');
+    try {
+      const r = spawnSync(
+        BOXSH,
+        ['--sandbox', '--bind', `cow:${src}:${dst}`, '-c', `ls ${outsideDir}`],
+        { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
+      );
+      assert.notEqual(r.status, 0, 'ls should fail — outsideDir is not bound');
+      assert.ok(!r.stdout.includes('secret.txt'),
+        'secret.txt must not be visible');
+    } finally {
+      cleanup();
+      spawnSync('rm', ['-rf', outsideDir]);
+    }
+  });
+
+  test('sandbox without any bind — CWD is not auto-bound', () => {
+    // The host CWD must NOT be automatically bind-mounted into the sandbox.
+    const outsideDir = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-outside-'));
+    fs.writeFileSync(path.join(outsideDir, 'marker.txt'), 'host-cwd');
+    try {
+      // pwd should NOT return outsideDir inside the sandbox.
+      const rPwd = spawnSync(
+        BOXSH,
+        ['--sandbox', '-c', 'pwd'],
+        { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
+      );
+      assert.equal(rPwd.status, 0);
+      assert.notEqual(rPwd.stdout.trim(), outsideDir,
+        'CWD inside sandbox must not be the host CWD');
+
+      // Writing via absolute path should fail — CWD directory not bound.
+      const rTouch = spawnSync(
+        BOXSH,
+        ['--sandbox', '-c', `touch ${outsideDir}/new-file`],
+        { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
+      );
+      assert.notEqual(rTouch.status, 0, 'touch should fail — CWD not bound');
+      assert.ok(!fs.existsSync(path.join(outsideDir, 'new-file')),
+        'new-file must not be created on host');
+
+      // Reading via absolute path should fail — CWD directory not bound.
+      const rCat = spawnSync(
+        BOXSH,
+        ['--sandbox', '-c', `cat ${outsideDir}/marker.txt`],
+        { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
+      );
+      assert.notEqual(rCat.status, 0, 'cat should fail — CWD not bound');
+      assert.ok(!rCat.stdout.includes('host-cwd'),
+        'marker.txt content must not be visible');
+    } finally {
+      spawnSync('rm', ['-rf', outsideDir]);
+    }
+  });
+
+  test('sandbox without any bind — CWD is not writable via absolute path', () => {
+    const outsideDir = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-outside-'));
+    try {
+      const r = spawnSync(
+        BOXSH,
+        ['--sandbox', '-c', `touch ${outsideDir}/outside-file`],
+        { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
+      );
+      assert.notEqual(r.status, 0, 'touch should fail — no bind mounts');
+      assert.ok(!fs.existsSync(path.join(outsideDir, 'outside-file')),
+        'outside-file must not be created');
+    } finally {
+      spawnSync('rm', ['-rf', outsideDir]);
+    }
+  });
+
+  test('sandbox without any bind — CWD is not readable via absolute path', () => {
+    const outsideDir = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-outside-'));
+    fs.writeFileSync(path.join(outsideDir, 'secret.txt'), 'hidden');
+    try {
+      const r = spawnSync(
+        BOXSH,
+        ['--sandbox', '-c', `ls ${outsideDir}`],
+        { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
+      );
+      assert.notEqual(r.status, 0, 'ls should fail — no bind mounts');
+      assert.ok(!r.stdout.includes('secret.txt'),
+        'secret.txt must not be visible');
+    } finally {
       spawnSync('rm', ['-rf', outsideDir]);
     }
   });

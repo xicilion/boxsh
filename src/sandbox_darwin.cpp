@@ -55,24 +55,56 @@ static bool is_under(const std::string &path, const std::string &prefix) {
 // configuration.  sandbox_init() with flags=0 and a custom SBPL string is an
 // undocumented private API verified to work on macOS 26+.
 //
-// Design: allow reads globally but deny the user-owned temp dir
-// (/private/var/folders) so sandbox-external temp files are inaccessible.
-// Write access is granted only to /dev, explict bind-mount destinations, and
-// the process CWD (when it is not itself a COW source).
+// Design: whitelist system-maintained directories for read access; everything
+// else (user homes, external drives, network mounts, …) is denied unless
+// explicitly exposed via --bind.  Write access is granted only to /dev and
+// explicit bind-mount destinations.
 //
 // All paths are resolved via realpath() so SBPL subpath rules use canonical
 // paths (e.g. /private/tmp rather than the /tmp symlink).
-//
-// writable_cwd: canonical CWD to allow writes for; pass empty to skip.
-static std::string build_sbpl(const SandboxConfig &cfg,
-                               const std::string &writable_cwd) {
+
+// Emit (allow file-read-metadata (literal "…")) for each ancestor directory
+// of 'path' so that the kernel can traverse intermediate directories outside
+// the whitelisted system paths.  Required for getcwd() and path lookup when
+// a bound path lives under e.g. /Users/me/project.
+static void allow_ancestor_metadata(std::string &p, const std::string &path) {
+    for (size_t i = 1; i < path.size(); ++i) {
+        if (path[i] == '/') {
+            std::string dir = path.substr(0, i);
+            p += "(allow file-read-metadata (literal \"" + dir + "\"))\n";
+        }
+    }
+}
+
+static std::string build_sbpl(const SandboxConfig &cfg) {
     std::string p;
     p += "(version 1)\n";
     p += "(deny default)\n";
 
-    // Allow reading the entire filesystem.  macOS processes need broad read
-    // access for dyld shared cache, system frameworks, mach services, etc.
-    p += "(allow file-read*)\n";
+    // Root directory — full read access.  macOS has symlinks at root level
+    // (/var → /private/var, /tmp → /private/tmp, /etc → /private/etc) and
+    // resolving them requires file-read-data, not just metadata.
+    p += "(allow file-read* (literal \"/\"))\n";
+
+    // System-maintained directories — read-only access.  These are owned and
+    // managed by the OS; they do not contain user data.
+    static const char *const system_dirs[] = {
+        "/usr", "/bin", "/sbin",
+        "/System", "/Library", "/Applications",
+        "/opt",
+        "/dev",
+        "/private",
+        // /var, /tmp, /etc are symlinks to /private/* on macOS.  The sandbox
+        // evaluates paths before resolving symlinks, so these must be listed
+        // explicitly in addition to /private.
+        "/var", "/tmp", "/etc",
+        nullptr
+    };
+    for (int i = 0; system_dirs[i]; i++) {
+        p += "(allow file-read* (subpath \"";
+        p += system_dirs[i];
+        p += "\"))\n";
+    }
 
     // Allow all process, mach and IPC operations.
     p += "(allow process*)\n";
@@ -83,25 +115,25 @@ static std::string build_sbpl(const SandboxConfig &cfg,
     p += "(allow file-ioctl)\n";
 
     // Allow reads and writes to /dev (e.g. /dev/null, /dev/zero, /dev/urandom).
-    p += "(allow file-read* (subpath \"/dev\"))\n";
     p += "(allow file-write* (subpath \"/dev\"))\n";
-
-    // Allow writes to the process CWD when it is not a COW source so that
-    // plain --sandbox mode does not block relative writes.
-    if (!writable_cwd.empty()) {
-        p += "(allow file-read* (subpath \"" + writable_cwd + "\"))\n";
-        p += "(allow file-write* (subpath \"" + writable_cwd + "\"))\n";
-    }
 
     // User-specified bind rules.  Paths are resolved so SBPL matches the
     // canonical path that the kernel presents to the policy engine.
+    // For each bound path we also allow file-read-metadata on its ancestor
+    // directories so that getcwd() and path lookup work correctly.
     for (const auto &bm : cfg.bind_mounts) {
         std::string rsrc = resolve_path(bm.src);
-        if (bm.mode == BindMount::Mode::RW) {
+        allow_ancestor_metadata(p, rsrc);
+        if (bm.mode == BindMount::Mode::RO) {
+            p += "(allow file-read* (subpath \"" + rsrc + "\"))\n";
+        } else if (bm.mode == BindMount::Mode::RW) {
             p += "(allow file-read* (subpath \"" + rsrc + "\"))\n";
             p += "(allow file-write* (subpath \"" + rsrc + "\"))\n";
         } else if (bm.mode == BindMount::Mode::COW) {
             std::string rdst = resolve_path(bm.dst);
+            allow_ancestor_metadata(p, rdst);
+            // Allow reads on the COW source.
+            p += "(allow file-read* (subpath \"" + rsrc + "\"))\n";
             // Block writes to the COW source so it stays pristine.
             p += "(deny file-write* (subpath \"" + rsrc + "\"))\n";
             // Allow full read+write access to the clone (dst).
@@ -200,31 +232,16 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     }
 
     // ── 2. Apply Seatbelt profile ─────────────────────────────────────────
-    // Capture the CWD before sandbox_init so we can allow writes there if
-    // it is not itself a COW source (which must remain read-only).
-    std::string writable_cwd;
-    {
-        char *cwd_buf = getcwd(nullptr, 0);
-        if (cwd_buf) {
-            std::string rcwd = resolve_path(cwd_buf);
-            free(cwd_buf);
-            bool cwd_is_cow_src = false;
-            for (const auto &bm : cfg.bind_mounts) {
-                if (bm.mode == BindMount::Mode::COW) {
-                    if (is_under(rcwd, resolve_path(bm.src))) {
-                        cwd_is_cow_src = true;
-                        break;
-                    }
-                }
-            }
-            if (!cwd_is_cow_src) writable_cwd = rcwd;
-        }
-    }
+    // Capture CWD before sandbox_init — afterwards getcwd() may fail if
+    // CWD is outside the whitelisted system paths.
+    char *cwd_buf = getcwd(nullptr, 0);
+    std::string saved_cwd = cwd_buf ? cwd_buf : "";
+    free(cwd_buf);
 
     // sandbox_init() with flags=0 and a custom SBPL string is an undocumented
     // private API.  On failure we print a warning and continue without
     // sandboxing (documented fallback; see macos-sandbox-design.md §7).
-    std::string profile = build_sbpl(cfg, writable_cwd);
+    std::string profile = build_sbpl(cfg);
     char *sb_err = nullptr;
     int rc = sandbox_init(profile.c_str(), 0, &sb_err);
     if (rc != 0) {
@@ -237,14 +254,13 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         return res;
     }
 
-    // ── 3. Redirect CWD into the COW dst if it was within a COW src ──────
-    // getcwd() on macOS returns the canonical (symlink-resolved) path, so
-    // we must resolve bm.src before comparing with is_under().
+    // ── 3. Redirect CWD ──────────────────────────────────────────────────
+    // Use the saved_cwd captured before sandbox_init.  If the old CWD was
+    // within a COW source, redirect into the clone (dst).  Otherwise, if
+    // CWD is no longer accessible (outside whitelisted paths), fall back
+    // to "/".
     {
-        char *cwd_buf = getcwd(nullptr, 0);
-        std::string saved_cwd = cwd_buf ? cwd_buf : "";
-        free(cwd_buf);
-
+        bool redirected = false;
         for (const auto &bm : cfg.bind_mounts) {
             if (bm.mode != BindMount::Mode::COW) continue;
             std::string rsrc = resolve_path(bm.src);
@@ -256,7 +272,20 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
             if (chdir(new_cwd.c_str()) != 0) {
                 chdir(bm.dst.c_str()); // fall back to clone root
             }
+            redirected = true;
             break;
+        }
+
+        // If CWD was not redirected, verify it is still accessible.
+        // With the whitelist SBPL, CWD under /Users (or other non-system
+        // paths) becomes inaccessible — fall back to "/".
+        if (!redirected) {
+            char *check = getcwd(nullptr, 0);
+            if (!check) {
+                chdir("/");
+            } else {
+                free(check);
+            }
         }
     }
 
