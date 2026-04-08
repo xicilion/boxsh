@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { run, BOXSH, TEMPDIR } from './helpers.mjs';
+import { run, BOXSH, TEMPDIR, toJsonRpc, fromJsonRpc } from './helpers.mjs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -37,7 +37,7 @@ function makeCowDirs() {
  * Returns the parsed response object.
  */
 function rpcWith(extraFlags, cmd, timeout_ms = 5000) {
-  const input = JSON.stringify({ id: '1', cmd }) + '\n';
+  const input = JSON.stringify(toJsonRpc({ id: '1', cmd })) + '\n';
   const r = run(
     ['--rpc', '--workers', '1', '--sandbox', ...extraFlags],
     input,
@@ -46,7 +46,7 @@ function rpcWith(extraFlags, cmd, timeout_ms = 5000) {
   assert.equal(r.signal, null, `boxsh killed by signal ${r.signal}`);
   const line = r.stdout.trim();
   assert.ok(line.length > 0, `no output; stderr: ${r.stderr}`);
-  return JSON.parse(line);
+  return fromJsonRpc(JSON.parse(line));
 }
 
 /** Convenience: run with a single --bind cow:SRC:DST flag. */

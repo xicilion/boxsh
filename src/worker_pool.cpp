@@ -244,10 +244,8 @@ static void run_shell_command(const std::string &shell_path,
 }
 
 // Minimal JSON serialization for the request payload sent to the worker.
-// We keep it simple: just flatten the needed fields.
+// JSON-RPC 2.0 format: {"jsonrpc":"2.0","id":"...","method":"exec","params":{...}}
 static std::string serialize_req_payload(const RpcRequest &req) {
-    // Build a minimal JSON object manually. cmd is the only field that needs
-    // escaping; the helper below handles all ASCII control characters.
     auto escape = [](const std::string &s) -> std::string {
         std::string o;
         o.reserve(s.size());
@@ -273,14 +271,13 @@ static std::string serialize_req_payload(const RpcRequest &req) {
     };
 
     char buf[256];
-    std::string out = "{\"id\":\"";
-    out += escape(req.id);
-    out += "\",\"cmd\":\"";
+    std::string out = "{\"jsonrpc\":\"2.0\",\"id\":";
+    out += req.id.dump();
+    out += ",\"method\":\"tools/call\",\"params\":{\"name\":\"bash\",\"arguments\":{\"command\":\"";
     out += escape(req.cmd);
-    std::snprintf(buf, sizeof(buf), "\",\"timeout\":%d,\"sandbox\":", req.timeout_sec);
+    std::snprintf(buf, sizeof(buf), "\",\"timeout\":%d", req.timeout_sec);
     out += buf;
-    out += req.sandbox_json_raw.empty() ? "null" : req.sandbox_json_raw;
-    out += "}";
+    out += "}}}";
     return out;
 }
 
@@ -300,6 +297,7 @@ static void worker_loop(int sock_fd, const std::string &shell_path) {
             RpcResponse resp;
             resp.id    = req.id;
             resp.error = "worker_parse_error: " + err;
+            resp.is_protocol_error = true;
             extern std::string rpc_serialize_response(const RpcResponse &);
             std::string r = rpc_serialize_response(resp);
             write_msg(sock_fd, r);
@@ -385,9 +383,9 @@ bool WorkerPool::init(std::string &error) {
     return true;
 }
 
-// Parse a worker response JSON payload into an RpcResponse.
+// Parse a worker response (JSON-RPC 2.0) payload into an RpcResponse.
 static RpcResponse parse_worker_response(const std::string &payload,
-                                         const std::string &fallback_id) {
+                                         const nlohmann::json &fallback_id) {
     RpcResponse resp;
     resp.id = fallback_id;
 
@@ -402,12 +400,26 @@ static RpcResponse parse_worker_response(const std::string &payload,
         return resp;
     }
 
-    resp.exit_code   = j.value("exit_code", -1);
-    resp.stdout_data = j.value("stdout",    "");
-    resp.stderr_data = j.value("stderr",    "");
-    resp.duration_ms = j.value("duration_ms", (uint64_t)0);
-    if (j.contains("error") && j["error"].is_string())
-        resp.error = j["error"].get<std::string>();
+    // JSON-RPC 2.0 error response.
+    if (j.contains("error") && j["error"].is_object()) {
+        resp.error = j["error"].value("message", "unknown error");
+        return resp;
+    }
+
+    auto result = j.value("result", nlohmann::json::object());
+    auto sc = result.value("structuredContent", nlohmann::json::object());
+    if (sc.contains("exit_code")) {
+        // Command ran — extract from structuredContent.
+        resp.exit_code   = sc.value("exit_code", -1);
+        resp.stdout_data = sc.value("stdout",    "");
+        resp.stderr_data = sc.value("stderr",    "");
+        resp.duration_ms = sc.value("duration_ms", (uint64_t)0);
+    } else if (result.value("isError", false)) {
+        // Tool error without structuredContent (e.g. worker internal error).
+        auto content = result.value("content", nlohmann::json::array());
+        if (!content.empty() && content[0].contains("text"))
+            resp.error = content[0]["text"].get<std::string>();
+    }
     return resp;
 }
 
@@ -448,7 +460,7 @@ RpcResponse WorkerPool::collect(size_t idx) {
     std::string payload;
     if (!read_msg(w.fd, payload)) {
         // Worker crashed: respawn and return an error.
-        std::string inflight = w.inflight_id;
+        nlohmann::json inflight = w.inflight_id;
         close(w.fd);
         waitpid(w.pid, nullptr, WNOHANG);
         w = Worker{};
@@ -460,9 +472,9 @@ RpcResponse WorkerPool::collect(size_t idx) {
         return resp;
     }
 
-    std::string inflight = w.inflight_id;
+    nlohmann::json inflight = w.inflight_id;
     w.busy        = false;
-    w.inflight_id.clear();
+    w.inflight_id = nullptr;
 
     return parse_worker_response(payload, inflight);
 }

@@ -63,7 +63,7 @@ private:
         pid_t       pid         = -1;
         int         fd          = -1;   // coordinator-side socketpair fd
         bool        busy        = false;
-        std::string inflight_id;        // request id in flight (for crash reports)
+        nlohmann::json inflight_id;     // request id in flight (for crash reports)
     };
 
     void spawn_worker(Worker &w);

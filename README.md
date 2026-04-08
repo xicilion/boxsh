@@ -1,14 +1,15 @@
 # boxsh
 
-A sandboxed POSIX shell with a concurrent JSON-line RPC mode, built on [dash 0.5.12](http://gondor.apana.org.au/~herbert/dash/).
+A sandboxed POSIX shell and MCP server, built on [dash 0.5.12](http://gondor.apana.org.au/~herbert/dash/).
 
-boxsh is designed as a **programmable execution substrate** — a backend that an AI agent, build system, or orchestration layer can drive over a simple JSON protocol, with OS-native sandbox isolation baked in. The core use cases it is built for:
+boxsh works as a **command-line shell** and as an **MCP (Model Context Protocol) server** for AI agents. OS-native sandbox isolation is baked in — give an AI agent, build system, or orchestration layer a shell that can execute arbitrary commands while constraining exactly what it can see and modify.
 
-- **AI agent command sandbox** — give an agent a worker that can run arbitrary shell commands while constraining exactly what it can see and modify: mount only the directories it needs, block outbound network, isolate its PID tree.
-- **Zero-cost directory forking** — overlay any directory as a copy-on-write workspace. The agent reads and writes freely; at the end of a session you inspect the diff in the destination directory and decide whether to commit or discard — no git index required, works on any directory.
-- **Session checkpointing and branching** — freeze the current session's destination directory, stack new overlays on top to branch in two directions from the same point, and compare the results. You can also archive the destination directory for long-term storage.
-- **Parallel isolated workers** — share one large read-only base (a node_modules tree, a Python venv, a compiled sysroot) across many workers, each with its own writable destination directory, all running concurrently without interfering.
-- **Deployment / migration dry-runs** — run `make install`, a database migration, or a package upgrade on a COW overlay, inspect exactly which files changed in the destination directory, then decide whether to apply the change for real.
+**Core capabilities:**
+
+- **AI agent sandbox** — MCP-compatible server that AI clients (VS Code, Claude Desktop, Cursor, etc.) connect to directly. The agent gets `bash`, `read`, `write`, and `edit` tools inside an isolated environment.
+- **Copy-on-write workspace** — overlay any directory as a COW workspace. The agent reads and writes freely; all modifications land in a separate destination directory. The original is never touched.
+- **Interactive sandboxed shell** — `boxsh --try` drops you into a root shell over your current directory with COW. Experiment freely; discard everything on exit.
+- **Parallel isolated workers** — pre-forked worker pool with configurable concurrency. Crash recovery, per-request timeout, out-of-order response streaming.
 
 For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/usage.md)**.
 
@@ -18,13 +19,14 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 
 | Feature | Details |
 |---|---|
+| **MCP server** | Implements MCP (Model Context Protocol) over stdio with Content-Length framing or newline-delimited JSON. Four tools: `bash`, `read`, `write`, `edit` — each with `inputSchema`, `outputSchema`, and `annotations`. |
 | **OS-native sandbox** | Linux: user/mount/network namespaces via direct syscalls; macOS: Seatbelt (sandbox_init) + SBPL profiles — no external tools required |
 | **Overlay filesystem** | Copy-on-write workspace over any read-only base; writes accumulate in a caller-managed destination directory and persist between commands |
-| **Built-in file tools** | `read` (with offset/limit), `write`, and `edit` (multi-replacement matched against the original file, producing a unified diff) run on background threads — the event loop is never blocked |
-| **JSON-line RPC** | Line-delimited JSON over stdin/stdout; responses stream back out of order as workers finish |
+| **Built-in file tools** | `read` (with offset/limit), `write`, and `edit` (multi-replacement with unified diff) run on background threads — the event loop is never blocked |
+| **JSON-RPC 2.0** | Dual transport: Content-Length framed (LSP-style) or newline-delimited JSON over stdin/stdout |
 | **Pre-forked worker pool** | Configurable number of workers (`--workers N`); each worker is forked once and reused across requests |
 | **Crash recovery** | If a worker is killed (timeout, segfault, OOM), the coordinator detects `POLLHUP`, returns an error response, and immediately respawns a replacement |
-| **Per-request timeout** | `"timeout"` field in the request; enforced via `alarm(2)` inside the worker |
+| **Per-request timeout** | `timeout` argument on the `bash` tool; enforced via `alarm(2)` inside the worker |
 | **Bind mounts** | Selectively expose host paths (read-write or read-only) inside the sandbox |
 | **Drop-in `/bin/sh`** | Shell mode delegates to embedded dash 0.5.12 — any script or flag that works with POSIX sh works here |
 | **Single static binary** | dash, nlohmann/json, and libedit are vendored; no runtime dependencies beyond the OS kernel |
@@ -33,15 +35,15 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 
 ## Overview
 
-boxsh has two modes, plus a one-command sandbox shortcut:
+boxsh has three modes:
 
 | Mode | How to start | What it does |
 |---|---|---|
-| **Quick-try shell** | `boxsh --try` | Drop into a sandboxed root shell on your CWD; writes go to a temp directory — original directory untouched |
 | **Shell mode** | `boxsh` (default) | Drop-in `dash` replacement — interactive shell, `-c`, script files |
-| **RPC mode** | `boxsh --rpc` | Reads JSON requests from stdin, executes shell commands concurrently via a pre-forked worker pool, writes JSON responses to stdout |
+| **MCP / RPC mode** | `boxsh --rpc` | MCP server over stdio. Reads JSON-RPC 2.0 requests, executes tools via a pre-forked worker pool, writes JSON-RPC 2.0 responses. |
+| **Quick-try** | `boxsh --try` | Drop into a sandboxed root shell on your CWD; writes go to a temp directory — original directory untouched |
 
-In either mode, an optional OS-native sandbox can be enabled with `--sandbox`.
+In any mode, an optional OS-native sandbox can be enabled with `--sandbox`.
 
 ---
 
@@ -124,181 +126,167 @@ boxsh --sandbox --new-net-ns -c 'curl example.com'  # network isolated
 
 ---
 
-## RPC mode
+## MCP server
+
+boxsh implements [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) over stdio. Any MCP-compatible client can connect to it directly as a sandboxed code execution server.
 
 ```sh
 boxsh --rpc [--workers N] [--shell PATH] [sandbox flags...]
 ```
 
-boxsh pre-forks `N` worker processes (default 4), then reads newline-delimited JSON from stdin. Each request is dispatched to a free worker; responses are written to stdout as they complete — **not** in submission order.
+### Transport
 
-### Shell command request
+boxsh supports two JSON-RPC 2.0 transports, auto-detected from the first bytes:
 
-```json
-{"id": "req1", "cmd": "echo hello", "timeout": 10}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `id` | string | no | Arbitrary identifier, echoed back verbatim |
-| `cmd` | string | **yes** | Shell command string (parsed by the embedded dash) |
-| `timeout` | number | no | Kill the command after this many seconds (0 or absent = no limit) |
-| `sandbox` | object | no | Per-request sandbox override (reserved; not yet implemented) |
-
-### Shell command response
-
-```json
-{"id": "req1", "exit_code": 0, "stdout": "hello\n", "stderr": "", "duration_ms": 4}
-```
-
-| Field | Type | Description |
+| Transport | Format | Used by |
 |---|---|---|
-| `id` | string | Echoed from the request |
-| `exit_code` | number | Exit status of the command |
-| `stdout` | string | Captured standard output |
-| `stderr` | string | Captured standard error |
-| `duration_ms` | number | Wall-clock time in milliseconds |
-| `error` | string | Present only on failure (parse error, worker crash); absent on success |
+| **Content-Length framed** | `Content-Length: N\r\n\r\nJSON` | VS Code, most MCP clients |
+| **Newline-delimited** | One JSON object per line | CLI testing, piped input |
 
-### Concurrency example
+### MCP methods
+
+| Method | Description |
+|---|---|
+| `initialize` | Returns server capabilities and protocol version |
+| `notifications/initialized` | Acknowledged silently (no response) |
+| `tools/list` | Returns the four tools with `inputSchema`, `outputSchema`, and `annotations` |
+| `tools/call` | Dispatches to a named tool: `bash`, `read`, `write`, `edit` |
+
+### Tools
+
+#### `bash` — Execute a shell command
+
+```json
+{"jsonrpc":"2.0", "id":"1", "method":"tools/call",
+ "params":{"name":"bash", "arguments":{"command":"echo hello", "timeout":10}}}
+```
+
+Response (MCP `CallToolResult` format):
+
+```json
+{"jsonrpc":"2.0", "id":"1", "result":{
+  "content":[{"type":"text", "text":"hello\n"}],
+  "structuredContent":{"exit_code":0, "stdout":"hello\n", "stderr":"", "duration_ms":3}
+}}
+```
+
+- `content` — text representation for the LLM
+- `structuredContent` — typed fields (`exit_code`, `stdout`, `stderr`, `duration_ms`)
+- `isError: true` — set when `exit_code != 0` or the command fails
+
+#### `read` — Read a file
+
+```json
+{"jsonrpc":"2.0", "id":"2", "method":"tools/call",
+ "params":{"name":"read", "arguments":{"path":"/etc/hostname", "offset":1, "limit":10}}}
+```
+
+`offset` (1-indexed start line) and `limit` (max lines) are optional. `structuredContent` includes `truncation: {truncated, line_count}`.
+
+#### `write` — Write a file
+
+```json
+{"jsonrpc":"2.0", "id":"3", "method":"tools/call",
+ "params":{"name":"write", "arguments":{"path":"/tmp/hello.txt", "content":"hello\n"}}}
+```
+
+#### `edit` — Search-and-replace edit
+
+```json
+{"jsonrpc":"2.0", "id":"4", "method":"tools/call",
+ "params":{"name":"edit", "arguments":{"path":"config.ini",
+   "edits":[{"oldText":"debug = false", "newText":"debug = true"}]}}}
+```
+
+Each `oldText` must appear exactly once in the original file. Edits must not overlap. `structuredContent` includes `diff` (unified diff) and `firstChangedLine`.
+
+### Error model
+
+boxsh distinguishes two kinds of errors per the MCP spec:
+
+| Error type | Serialization | Example |
+|---|---|---|
+| **Protocol error** | JSON-RPC `{"error": {"code": N, "message": "..."}}` | Invalid JSON, unknown method, unknown tool |
+| **Tool execution error** | `{"result": {"content": [...], "isError": true}}` | Non-zero exit code, file not found |
+
+### Client configuration
+
+`--sandbox` enforces minimal privileges — only system directories are accessible. You must explicitly `--bind` any project directories the agent needs.
+
+**VS Code** (`.vscode/mcp.json`):
+
+```json
+{
+  "servers": {
+    "boxsh": {
+      "command": "boxsh",
+      "args": [
+        "--rpc", "--workers", "4",
+        "--sandbox", "--bind", "ro:${workspaceFolder}"
+      ]
+    }
+  }
+}
+```
+
+**Claude Desktop** (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "boxsh": {
+      "command": "boxsh",
+      "args": [
+        "--rpc", "--workers", "4",
+        "--sandbox", "--bind", "cow:/path/to/project:/path/to/dst"
+      ]
+    }
+  }
+}
+```
+
+**Cursor** (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "boxsh": {
+      "command": "boxsh",
+      "args": [
+        "--rpc", "--workers", "4",
+        "--sandbox", "--bind", "cow:/path/to/project:/path/to/dst"
+      ]
+    }
+  }
+}
+```
+
+**Bind modes:** `cow:SRC:DST` (copy-on-write — project is read-only, writes go to DST), `ro:PATH` (read-only), `wr:PATH` (direct read-write). Add `--new-net-ns` to block network access.
+
+### Handshake example
 
 ```sh
 printf '%s\n' \
-  '{"id":"slow","cmd":"sleep 0.5; echo slow"}' \
-  '{"id":"fast","cmd":"echo fast"}' \
+  '{"jsonrpc":"2.0","id":"1","method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":"2","method":"tools/list"}' \
+  '{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"bash","arguments":{"command":"echo hello"}}}' \
+| boxsh --rpc --workers 1
+```
+
+### Concurrency
+
+Multiple requests sent at once are dispatched to different workers and execute in parallel. Responses arrive in completion order — fast commands don't wait for slow ones.
+
+```sh
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":"slow","method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 0.5; echo slow"}}}' \
+  '{"jsonrpc":"2.0","id":"fast","method":"tools/call","params":{"name":"bash","arguments":{"command":"echo fast"}}}' \
 | boxsh --rpc --workers 2
 # "fast" response arrives first, then "slow"
 ```
 
-### Protocol notes
-
-- Blank lines are silently ignored.
-- Invalid JSON produces an error response with `"error"` set; boxsh continues reading.
-- A request with neither `cmd` nor `tool` produces an error response.
-
----
-
-## Built-in tools
-
-In RPC mode, three file-operation tools execute directly in the coordinator process — no worker is needed. Use `"tool"` instead of `"cmd"`.
-
-### Common fields
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `id` | string | no | Identifier echoed back |
-| `tool` | string | **yes** | `"read"`, `"write"`, or `"edit"` |
-| `path` | string | **yes** | Path to the target file |
-
-### Tool response shape
-
-On success:
-
-```json
-{"id": "1", "content": [{"type": "text", "text": "..."}], "details": {...}}
-```
-
-On failure, only `"error"` is set:
-
-```json
-{"id": "1", "error": "read: cannot open file: /no/such: No such file or directory"}
-```
-
----
-
-### `read`
-
-Read a file, optionally restricting output to a line range.
-
-**Additional fields:**
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `offset` | number | 1 | 1-indexed first line to return |
-| `limit` | number | unlimited | Maximum number of lines to return |
-
-**Response `details`:**
-
-```json
-{"truncation": {"truncated": false, "line_count": 24}}
-```
-
-**Examples:**
-
-```sh
-# Read entire file
-echo '{"id":"1","tool":"read","path":"/etc/os-release"}' | boxsh --rpc
-
-# Read lines 20–29
-echo '{"id":"2","tool":"read","path":"src/main.cpp","offset":20,"limit":10}' | boxsh --rpc
-```
-
----
-
-### `write`
-
-Write (create or overwrite) a file with the given content.
-
-**Additional fields:**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `content` | string | **yes** | Full content to write |
-
-**Response:** `content[0].text` is `"written N bytes"`. No `details`.
-
-**Example:**
-
-```sh
-echo '{"id":"1","tool":"write","path":"/tmp/hello.txt","content":"hello\n"}' | boxsh --rpc
-# {"id":"1","content":[{"type":"text","text":"written 6 bytes"}]}
-```
-
----
-
-### `edit`
-
-Apply one or more string replacements to a file in a single atomic operation.
-
-**Additional fields:**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `edits` | array | **yes** | Array of `{"oldText": "...", "newText": "..."}` objects |
-
-**Constraints:**
-
-- Each `oldText` must appear **exactly once** in the original file. A match count of 0 or ≥ 2 is rejected.
-- Edits must not overlap.
-- `oldText` must not be empty.
-- All `oldText` values are matched against the **original** file — not against the partially-modified result.
-
-**Response `details`:**
-
-```json
-{"diff": "--- a/file\n+++ b/file\n@@ -3,1 +3,1 @@\n-old line\n+new line\n", "firstChangedLine": 3}
-```
-
-`firstChangedLine` is the 1-indexed line number of the first changed line in the original file.
-
-**Examples:**
-
-```sh
-# Single replacement
-echo '{
-  "id": "1", "tool": "edit", "path": "config.ini",
-  "edits": [{"oldText": "debug = false", "newText": "debug = true"}]
-}' | boxsh --rpc
-
-# Multiple replacements in one request
-echo '{
-  "id": "2", "tool": "edit", "path": "server.js",
-  "edits": [
-    {"oldText": "const PORT = 3000", "newText": "const PORT = 8080"},
-    {"oldText": "console.log(\"debug\")", "newText": ""}
-  ]
-}' | boxsh --rpc
-```
+File tool requests (`read`, `write`, `edit`) run on background threads and do not occupy a worker slot.
 
 ---
 
@@ -309,7 +297,7 @@ Usage: boxsh [OPTIONS] [-- shell-args...]
 
 Modes:
   (default)            Run as an ordinary POSIX shell (delegates to dash).
-  --rpc                Read JSON-line requests from stdin, write responses to stdout.
+  --rpc                Read JSON-RPC 2.0 requests from stdin, write responses to stdout. MCP-compatible.
 
 RPC options:
   --workers N          Number of pre-forked worker processes (default: 4).
@@ -348,7 +336,7 @@ boxsh --sandbox --bind wr:/data -c 'ls /'
 
 | Flag | Effect |
 |---|---|
-| `--sandbox` | Isolated environment; auto-includes system directories; current UID mapped as root inside (Linux) |
+| `--sandbox` | Isolated environment; only system directories accessible; all project access requires explicit `--bind`; current UID mapped as root inside (Linux) |
 | `--new-net-ns` | Loopback-only; outbound network blocked |
 | `--bind ro:PATH` | Expose a host path read-only inside the sandbox |
 | `--bind wr:PATH` | Expose a host path read-write inside the sandbox |
@@ -383,13 +371,17 @@ The coordinator runs a `poll(2)` event loop — it reads requests from stdin and
 ## Timeout
 
 ```sh
-echo '{"id":"t","cmd":"sleep 60","timeout":5}' | boxsh --rpc
+echo '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 60","timeout":5}}}' | boxsh --rpc
 ```
 
-When a request includes a `timeout` field, the worker kills the running command after the specified number of seconds and returns a normal response with `exit_code: -1` and `stderr: "timeout"`. The worker itself remains alive and immediately accepts the next request — no respawn is needed.
+When a request includes a `timeout` argument, the worker kills the running command after the specified number of seconds and returns a tool result with `exit_code: -1` and `stderr: "timeout"`. The worker itself remains alive and immediately accepts the next request — no respawn is needed.
 
 ```json
-{"id":"t","exit_code":-1,"stdout":"","stderr":"timeout","duration_ms":5001}
+{"jsonrpc":"2.0","id":"t","result":{
+  "content":[{"type":"text","text":"timeout"}],
+  "structuredContent":{"exit_code":-1,"stdout":"","stderr":"timeout","duration_ms":5001},
+  "isError":true
+}}
 ```
 
 ---
@@ -412,6 +404,8 @@ node --test tests/index.test.mjs
 | `concurrent.test.mjs` | Concurrent correctness, out-of-order responses, isolation, stress |
 | `overlay.test.mjs` | COW bind mounts, copy-on-write, delete/whiteout |
 | `tools.test.mjs` | Built-in tools: read (offset/limit), write, edit (diff, uniqueness checks) |
+| `mcp.test.mjs` | MCP protocol: initialize, tools/list, tools/call, notifications, handshake |
+| `protocol-regression.test.mjs` | Content-Length transport, ID type preservation, initialize handshake, error distinction |
 
 ---
 
@@ -421,7 +415,7 @@ node --test tests/index.test.mjs
 boxsh/
 ├── src/
 │   ├── main.cpp              CLI parsing, mode dispatch
-│   ├── rpc.h / rpc.cpp       JSON-line protocol, built-in tools, poll(2) event loop
+│   ├── rpc.h / rpc.cpp       JSON-RPC 2.0 protocol, MCP handlers, built-in tools, poll(2) event loop
 │   ├── worker_pool.h / .cpp  Worker lifecycle, IPC, shell command execution
 │   ├── sandbox.h              Platform-neutral sandbox interface
 │   ├── sandbox.cpp            Linux implementation (namespaces/overlayfs)

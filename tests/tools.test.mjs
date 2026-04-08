@@ -80,7 +80,7 @@ describe('tool — read', () => {
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.ok(resp.details?.truncation?.line_count >= 3, 'expected line_count >= 3');
+      assert.ok(resp.truncation?.line_count >= 3, 'expected line_count >= 3');
     } finally { fs.rmSync(p, { force: true }); }
   });
 });
@@ -137,9 +137,9 @@ describe('tool — edit', () => {
         edits: [{ oldText: 'world', newText: 'earth' }] });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
       assert.equal(fs.readFileSync(p, 'utf8'), 'hello earth\n');
-      assert.ok(resp.details?.diff?.includes('-hello world'), 'diff should show removed line');
-      assert.ok(resp.details?.diff?.includes('+hello earth'), 'diff should show added line');
-      assert.equal(resp.details?.firstChangedLine, 1);
+      assert.ok(resp.diff?.includes('-hello world'), 'diff should show removed line');
+      assert.ok(resp.diff?.includes('+hello earth'), 'diff should show added line');
+      assert.equal(resp.firstChangedLine, 1);
     } finally { fs.rmSync(p, { force: true }); }
   });
 

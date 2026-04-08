@@ -8,11 +8,15 @@ import { fileURLToPath } from 'node:url';
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 
 /**
- * Absolute path to the bundled boxsh binary.
- * Override with the BOXSH environment variable.
+ * Absolute path to the boxsh binary.
+ * Resolution order: BOXSH env var → build/boxsh.
  */
-export const BOXSH =
-    process.env['BOXSH'] ?? path.resolve(__dir, '../src/exec/boxsh');
+function findBoxsh() {
+    if (process.env['BOXSH']) return process.env['BOXSH'];
+    return path.resolve(__dir, '../../../build/boxsh');
+}
+
+export const BOXSH = findBoxsh();
 
 /**
  * Create a simple output collector compatible with BashOperations.onData.

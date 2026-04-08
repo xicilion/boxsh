@@ -40,71 +40,106 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
         return false;
     }
 
-    if (j.contains("id") && j["id"].is_string())
-        req.id = j["id"].get<std::string>();
+    // JSON-RPC 2.0: preserve id exactly (string, number, or null).
+    if (j.contains("id"))
+        req.id = j["id"];
 
-    // Determine if this is a built-in tool invocation or a shell command.
-    if (j.contains("tool") && j["tool"].is_string()) {
-        const std::string tool = j["tool"].get<std::string>();
+    // JSON-RPC 2.0: require "method" field.
+    if (!j.contains("method") || !j["method"].is_string()) {
+        parse_error = "missing or non-string field: method";
+        return false;
+    }
+    const std::string method = j["method"].get<std::string>();
 
-        if (!j.contains("path") || !j["path"].is_string()) {
-            parse_error = "tool request missing string field: path";
-            return false;
-        }
-        req.path = j["path"].get<std::string>();
+    // Extract params (default to empty object).
+    const json params = j.contains("params") && j["params"].is_object()
+        ? j["params"] : json::object();
 
-        if (tool == "read") {
-            req.tool = ToolKind::Read;
-            if (j.contains("offset") && j["offset"].is_number_integer())
-                req.offset = j["offset"].get<int>();
-            if (j.contains("limit") && j["limit"].is_number_integer())
-                req.limit = j["limit"].get<int>();
-
-        } else if (tool == "write") {
-            req.tool = ToolKind::Write;
-            if (!j.contains("content") || !j["content"].is_string()) {
-                parse_error = "write tool missing string field: content";
-                return false;
-            }
-            req.content = j["content"].get<std::string>();
-
-        } else if (tool == "edit") {
-            req.tool = ToolKind::Edit;
-            if (!j.contains("edits") || !j["edits"].is_array()) {
-                parse_error = "edit tool missing array field: edits";
-                return false;
-            }
-            for (const auto &op : j["edits"]) {
-                if (!op.contains("oldText") || !op["oldText"].is_string() ||
-                    !op.contains("newText") || !op["newText"].is_string()) {
-                    parse_error = "each edit must have string fields oldText and newText";
-                    return false;
-                }
-                req.edits.push_back({op["oldText"].get<std::string>(),
-                                     op["newText"].get<std::string>()});
-            }
-
-        } else {
-            parse_error = "unknown tool: " + tool;
-            return false;
+    // MCP protocol methods: initialize, tools/list — handled synchronously.
+    if (method == "initialize" || method == "tools/list") {
+        req.cmd = method;        // sentinel: handled in event loop
+        req.tool = ToolKind::None;
+        req.timeout_sec = -1;    // flag for protocol methods
+        // Stash client protocolVersion for initialize response.
+        if (method == "initialize" && params.contains("protocolVersion")
+            && params["protocolVersion"].is_string()) {
+            req.sandbox_json_raw = params["protocolVersion"].get<std::string>();
         }
         return true;
     }
 
-    // Shell command mode.
-    if (!j.contains("cmd") || !j["cmd"].is_string()) {
-        parse_error = "missing or non-string field: cmd";
+    // MCP notifications: no response needed.
+    if (method == "notifications/initialized") {
+        req.cmd = method;
+        req.tool = ToolKind::None;
+        req.timeout_sec = -2;    // flag for notifications
+        return true;
+    }
+
+    // MCP tools/call: dispatch to the named tool.
+    if (method == "tools/call") {
+        if (!params.contains("name") || !params["name"].is_string()) {
+            parse_error = "tools/call missing string field: params.name";
+            return false;
+        }
+        const std::string tool_name = params["name"].get<std::string>();
+        const json args = params.contains("arguments") && params["arguments"].is_object()
+            ? params["arguments"] : json::object();
+
+        if (tool_name == "bash") {
+            if (!args.contains("command") || !args["command"].is_string()) {
+                parse_error = "bash tool missing string field: command";
+                return false;
+            }
+            req.cmd = args["command"].get<std::string>();
+            if (args.contains("timeout") && args["timeout"].is_number())
+                req.timeout_sec = args["timeout"].get<int>();
+            return true;
+        }
+        if (tool_name == "read" || tool_name == "write" || tool_name == "edit") {
+            if (!args.contains("path") || !args["path"].is_string()) {
+                parse_error = tool_name + " tool missing string field: path";
+                return false;
+            }
+            req.path = args["path"].get<std::string>();
+
+            if (tool_name == "read") {
+                req.tool = ToolKind::Read;
+                if (args.contains("offset") && args["offset"].is_number_integer())
+                    req.offset = args["offset"].get<int>();
+                if (args.contains("limit") && args["limit"].is_number_integer())
+                    req.limit = args["limit"].get<int>();
+            } else if (tool_name == "write") {
+                req.tool = ToolKind::Write;
+                if (!args.contains("content") || !args["content"].is_string()) {
+                    parse_error = "write tool missing string field: content";
+                    return false;
+                }
+                req.content = args["content"].get<std::string>();
+            } else { // edit
+                req.tool = ToolKind::Edit;
+                if (!args.contains("edits") || !args["edits"].is_array()) {
+                    parse_error = "edit tool missing array field: edits";
+                    return false;
+                }
+                for (const auto &op : args["edits"]) {
+                    if (!op.contains("oldText") || !op["oldText"].is_string() ||
+                        !op.contains("newText") || !op["newText"].is_string()) {
+                        parse_error = "each edit must have string fields oldText and newText";
+                        return false;
+                    }
+                    req.edits.push_back({op["oldText"].get<std::string>(),
+                                         op["newText"].get<std::string>()});
+                }
+            }
+            return true;
+        }
+        parse_error = "unknown tool: " + tool_name;
         return false;
     }
-    req.cmd = j["cmd"].get<std::string>();
 
-    if (j.contains("timeout") && j["timeout"].is_number())
-        req.timeout_sec = j["timeout"].get<int>();
-
-    if (j.contains("sandbox") && j["sandbox"].is_object())
-        req.sandbox_json_raw = j["sandbox"].dump();
-
-    return true;
+    parse_error = "unknown method: " + method;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,31 +148,233 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
 
 std::string rpc_serialize_response(const RpcResponse &resp) {
     json j;
+    j["jsonrpc"] = "2.0";
     j["id"] = resp.id;
 
-    if (resp.tool == ToolKind::None) {
-        // Shell command response.
-        j["exit_code"]   = resp.exit_code;
-        j["stdout"]      = resp.stdout_data;
-        j["stderr"]      = resp.stderr_data;
-        j["duration_ms"] = resp.duration_ms;
-    } else if (resp.tool == ToolKind::Read || resp.tool == ToolKind::Write) {
-        j["content"] = json::array({{{"type", "text"}, {"text", resp.tool_content}}});
-        if (resp.tool == ToolKind::Read) {
-            // Count lines in the returned content.
-            int lines = 0;
-            for (char c : resp.tool_content) if (c == '\n') lines++;
-            j["details"] = {{"truncation", {{"truncated", false}, {"line_count", lines}}}};
+    if (resp.is_protocol_error && !resp.error.empty()) {
+        // JSON-RPC 2.0 protocol error (parse error, unknown method, etc.).
+        j["error"] = {{"code", resp.error_code}, {"message", resp.error}};
+    } else {
+        // MCP CallToolResult format.
+        json result;
+        bool is_error = !resp.error.empty();
+
+        if (resp.tool == ToolKind::None) {
+            // Bash command result.
+            std::string text;
+            if (is_error) {
+                text = resp.error;
+            } else {
+                text = resp.stdout_data;
+                if (!resp.stderr_data.empty()) {
+                    if (!text.empty()) text += "\n";
+                    text += resp.stderr_data;
+                }
+                if (text.empty())
+                    text = "(exit code " + std::to_string(resp.exit_code) + ")";
+            }
+            result["content"] = json::array({{{"type", "text"}, {"text", text}}});
+            if (!is_error) {
+                result["structuredContent"] = {
+                    {"exit_code",   resp.exit_code},
+                    {"stdout",      resp.stdout_data},
+                    {"stderr",      resp.stderr_data},
+                    {"duration_ms", resp.duration_ms}
+                };
+                if (resp.exit_code != 0)
+                    is_error = true;
+            }
+        } else if (resp.tool == ToolKind::Read) {
+            std::string text = is_error ? resp.error : resp.tool_content;
+            result["content"] = json::array({{{"type", "text"}, {"text", text}}});
+            if (!is_error) {
+                int lines = 0;
+                for (char c : resp.tool_content) if (c == '\n') lines++;
+                result["structuredContent"] = {
+                    {"truncation", {{"truncated", false}, {"line_count", lines}}}
+                };
+            }
+        } else if (resp.tool == ToolKind::Write) {
+            std::string text = is_error ? resp.error : resp.tool_content;
+            result["content"] = json::array({{{"type", "text"}, {"text", text}}});
+        } else if (resp.tool == ToolKind::Edit) {
+            std::string text = is_error ? resp.error : "OK";
+            result["content"] = json::array({{{"type", "text"}, {"text", text}}});
+            if (!is_error) {
+                result["structuredContent"] = {
+                    {"diff", resp.diff},
+                    {"firstChangedLine", resp.first_changed_line}
+                };
+            }
         }
-    } else if (resp.tool == ToolKind::Edit) {
-        j["content"] = json::array({{{"type", "text"}, {"text", "OK"}}});
-        j["details"] = {{"diff", resp.diff},
-                        {"firstChangedLine", resp.first_changed_line}};
+
+        if (is_error)
+            result["isError"] = true;
+        j["result"] = result;
     }
 
-    if (!resp.error.empty())
-        j["error"] = resp.error;
+    return j.dump();
+}
 
+// ---------------------------------------------------------------------------
+// MCP protocol handlers
+// ---------------------------------------------------------------------------
+
+static std::string mcp_initialize_response(const json &id,
+                                            const std::string &client_version) {
+    // Echo the client's protocolVersion so the handshake succeeds.
+    // Fall back to a known baseline if the client didn't supply one.
+    std::string version = client_version.empty() ? "2024-11-05" : client_version;
+    json j;
+    j["jsonrpc"] = "2.0";
+    j["id"] = id;
+    j["result"] = {
+        {"protocolVersion", version},
+        {"capabilities", {
+            {"tools", json::object()}
+        }},
+        {"serverInfo", {
+            {"name", "boxsh"},
+            {"version", "1.0.0"}
+        }}
+    };
+    return j.dump();
+}
+
+static std::string mcp_tools_list_response(const json &id) {
+    json tools = json::array();
+
+    // bash tool
+    tools.push_back({
+        {"name", "bash"},
+        {"description",
+         "Execute a bash command in the sandbox. "
+         "Returns stdout and stderr. Output is truncated to 10MB per stream."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"command", {{"type", "string"}, {"description", "Bash command to execute"}}},
+                {"timeout", {{"type", "number"}, {"description", "Timeout in seconds (optional)"}}}
+            }},
+            {"required", json::array({"command"})}
+        }},
+        {"outputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"exit_code", {{"type", "integer"}, {"description", "Process exit code (0 = success)"}}},
+                {"stdout",    {{"type", "string"},  {"description", "Standard output"}}},
+                {"stderr",    {{"type", "string"},  {"description", "Standard error"}}},
+                {"duration_ms", {{"type", "integer"}, {"description", "Execution time in milliseconds"}}}
+            }},
+            {"required", json::array({"exit_code", "stdout", "stderr", "duration_ms"})}
+        }},
+        {"annotations", {
+            {"title", "Bash"},
+            {"readOnlyHint", false},
+            {"destructiveHint", true}
+        }}
+    });
+
+    // read tool
+    tools.push_back({
+        {"name", "read"},
+        {"description",
+         "Read the contents of a file. Use offset/limit for large files."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}, {"description", "Path to the file to read (relative or absolute)"}}},
+                {"offset", {{"type", "number"}, {"description", "Line number to start reading from (1-indexed)"}}},
+                {"limit", {{"type", "number"}, {"description", "Maximum number of lines to read"}}}
+            }},
+            {"required", json::array({"path"})}
+        }},
+        {"outputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"truncation", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"truncated", {{"type", "boolean"}, {"description", "Whether the output was truncated"}}},
+                        {"line_count", {{"type", "integer"}, {"description", "Number of lines returned"}}}
+                    }},
+                    {"required", json::array({"truncated", "line_count"})}
+                }}
+            }},
+            {"required", json::array({"truncation"})}
+        }},
+        {"annotations", {
+            {"title", "Read File"},
+            {"readOnlyHint", true},
+            {"destructiveHint", false}
+        }}
+    });
+
+    // write tool
+    tools.push_back({
+        {"name", "write"},
+        {"description",
+         "Write content to a file. Creates the file if it doesn't exist, "
+         "overwrites if it does."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}, {"description", "Path to the file to write (relative or absolute)"}}},
+                {"content", {{"type", "string"}, {"description", "Content to write to the file"}}}
+            }},
+            {"required", json::array({"path", "content"})}
+        }},
+        {"annotations", {
+            {"title", "Write File"},
+            {"readOnlyHint", false},
+            {"destructiveHint", true}
+        }}
+    });
+
+    // edit tool
+    tools.push_back({
+        {"name", "edit"},
+        {"description",
+         "Edit a file using exact text replacement. "
+         "Every edits[].oldText must match a unique, non-overlapping region of the original file."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}, {"description", "Path to the file to edit (relative or absolute)"}}},
+                {"edits", {
+                    {"type", "array"},
+                    {"items", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"oldText", {{"type", "string"}, {"description", "Exact text to find (must be unique)"}}},
+                            {"newText", {{"type", "string"}, {"description", "Replacement text"}}}
+                        }},
+                        {"required", json::array({"oldText", "newText"})}
+                    }},
+                    {"description", "One or more targeted replacements"}
+                }}
+            }},
+            {"required", json::array({"path", "edits"})}
+        }},
+        {"outputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"diff", {{"type", "string"}, {"description", "Unified diff of the changes made"}}},
+                {"firstChangedLine", {{"type", "integer"}, {"description", "Line number of the first change (1-indexed)"}}}
+            }},
+            {"required", json::array({"diff", "firstChangedLine"})}
+        }},
+        {"annotations", {
+            {"title", "Edit File"},
+            {"readOnlyHint", false},
+            {"destructiveHint", false}
+        }}
+    });
+
+    json j;
+    j["jsonrpc"] = "2.0";
+    j["id"] = id;
+    j["result"] = {{"tools", tools}};
     return j.dump();
 }
 
@@ -324,6 +561,12 @@ static RpcResponse tool_edit(const RpcRequest &req) {
 // Non-blocking line reader
 // ---------------------------------------------------------------------------
 
+// Reads messages from a file descriptor.  Supports two transport formats:
+//   (a) Newline-delimited JSON  — one JSON object per line terminated by '\n'.
+//   (b) Content-Length framing  — "Content-Length: N\r\n\r\n" followed by N bytes.
+// The mode is auto-detected from the first bytes received: if the buffer
+// starts with "Content-Length:" we switch to framed mode; otherwise we use
+// line mode.  Once detected the mode is fixed for the lifetime of the reader.
 class LineReader {
 public:
     explicit LineReader(int fd) : fd_(fd) {
@@ -335,7 +578,10 @@ public:
         char tmp[8192];
         while (true) {
             ssize_t n = read(fd_, tmp, sizeof(tmp));
-            if (n > 0) { buf_.append(tmp, (size_t)n); continue; }
+            if (n > 0) {
+                buf_.append(tmp, (size_t)n);
+                continue;
+            }
             if (n == 0) { eof_ = true; return false; }
             if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
             return false;
@@ -343,6 +589,46 @@ public:
     }
 
     bool get_line(std::string &line) {
+        detect_mode();
+        if (framed_) return get_framed(line);
+        return get_newline(line);
+    }
+
+    bool has_line() {
+        detect_mode();
+        if (framed_) return has_framed();
+        return buf_.find('\n') != std::string::npos;
+    }
+
+    bool eof()    const { return eof_; }
+    int  fd()     const { return fd_; }
+    bool framed() const { return framed_; }
+
+private:
+    int         fd_;
+    std::string buf_;
+    bool        eof_       = false;
+    bool        framed_    = false;
+    bool        detected_  = false;
+
+    void detect_mode() {
+        if (detected_ || buf_.empty()) return;
+        // Peek at first non-whitespace characters.
+        size_t i = 0;
+        while (i < buf_.size() && (buf_[i] == ' ' || buf_[i] == '\t' ||
+                                    buf_[i] == '\r' || buf_[i] == '\n'))
+            ++i;
+        if (i >= buf_.size()) return; // not enough data yet
+        static const char prefix[] = "Content-Length:";
+        size_t remain = buf_.size() - i;
+        size_t plen = sizeof(prefix) - 1;
+        if (remain >= plen && buf_.compare(i, plen, prefix) == 0)
+            framed_ = true;
+        detected_ = true;
+    }
+
+    // Newline-delimited mode: return content up to '\n'.
+    bool get_newline(std::string &line) {
         auto pos = buf_.find('\n');
         if (pos == std::string::npos) return false;
         size_t end = (pos > 0 && buf_[pos - 1] == '\r') ? pos - 1 : pos;
@@ -351,14 +637,63 @@ public:
         return true;
     }
 
-    bool has_line() const { return buf_.find('\n') != std::string::npos; }
-    bool eof()      const { return eof_; }
-    int  fd()       const { return fd_; }
+    // Content-Length framed mode: parse header, then extract body.
+    bool has_framed() const {
+        auto hdr_end = buf_.find("\r\n\r\n");
+        if (hdr_end == std::string::npos) return false;
+        int content_length = parse_content_length(buf_, hdr_end);
+        if (content_length < 0) return false;
+        size_t body_start = hdr_end + 4;
+        return buf_.size() >= body_start + (size_t)content_length;
+    }
 
-private:
-    int         fd_;
-    std::string buf_;
-    bool        eof_ = false;
+    bool get_framed(std::string &line) {
+        auto hdr_end = buf_.find("\r\n\r\n");
+        if (hdr_end == std::string::npos) return false;
+        int content_length = parse_content_length(buf_, hdr_end);
+        if (content_length < 0) {
+            // Malformed header — skip past the header block.
+            buf_.erase(0, hdr_end + 4);
+            return false;
+        }
+        size_t body_start = hdr_end + 4;
+        if (buf_.size() < body_start + (size_t)content_length) return false;
+        line = buf_.substr(body_start, (size_t)content_length);
+        buf_.erase(0, body_start + (size_t)content_length);
+        return true;
+    }
+
+    static int parse_content_length(const std::string &buf, size_t hdr_end) {
+        // Search for "Content-Length:" (case-insensitive) in the header block.
+        std::string hdr = buf.substr(0, hdr_end);
+        size_t pos = 0;
+        while (pos < hdr.size()) {
+            size_t eol = hdr.find("\r\n", pos);
+            if (eol == std::string::npos) eol = hdr.size();
+            std::string field = hdr.substr(pos, eol - pos);
+            // "Content-Length: 123"
+            size_t colon = field.find(':');
+            if (colon != std::string::npos) {
+                std::string name = field.substr(0, colon);
+                // Case-insensitive compare.
+                bool match = name.size() == 14;
+                if (match) {
+                    static const char cl[] = "content-length";
+                    for (size_t i = 0; i < 14 && match; i++)
+                        match = (std::tolower((unsigned char)name[i]) == cl[i]);
+                }
+                if (match) {
+                    std::string val = field.substr(colon + 1);
+                    // Trim whitespace.
+                    size_t s = val.find_first_not_of(" \t");
+                    if (s != std::string::npos) val = val.substr(s);
+                    return std::atoi(val.c_str());
+                }
+            }
+            pos = eol + 2;
+        }
+        return -1;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -370,12 +705,26 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
     if (!fout) return;
     setvbuf(fout, nullptr, _IOLBF, 0);
 
-    auto write_resp = [&](const RpcResponse &resp) {
-        std::string line = rpc_serialize_response(resp) + '\n';
-        fwrite(line.c_str(), 1, line.size(), fout);
+    LineReader reader(fd_in);
+
+    // Write a JSON-RPC message to fout.  Format depends on the transport
+    // mode detected by the reader: Content-Length framed or newline-delimited.
+    auto write_msg = [&](const std::string &body) {
+        if (reader.framed()) {
+            std::string hdr = "Content-Length: " +
+                              std::to_string(body.size()) + "\r\n\r\n";
+            fwrite(hdr.c_str(), 1, hdr.size(), fout);
+            fwrite(body.c_str(), 1, body.size(), fout);
+        } else {
+            std::string line = body + '\n';
+            fwrite(line.c_str(), 1, line.size(), fout);
+        }
+        fflush(fout);
     };
 
-    LineReader reader(fd_in);
+    auto write_resp = [&](const RpcResponse &resp) {
+        write_msg(rpc_serialize_response(resp));
+    };
     size_t in_flight = 0;
 
     // Each in-flight tool request gets its own socketpair.  A detached thread
@@ -450,7 +799,22 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
                 RpcResponse err;
                 err.id    = req.id;
                 err.error = "parse_error: " + parse_error;
+                err.is_protocol_error = true;
                 write_resp(err);
+                continue;
+            }
+
+            // MCP notifications: no response.
+            if (req.timeout_sec == -2) continue;
+
+            // MCP protocol methods: respond synchronously.
+            if (req.timeout_sec == -1) {
+                std::string resp_body;
+                if (req.cmd == "initialize")
+                    resp_body = mcp_initialize_response(req.id, req.sandbox_json_raw);
+                else if (req.cmd == "tools/list")
+                    resp_body = mcp_tools_list_response(req.id);
+                write_msg(resp_body);
                 continue;
             }
 
@@ -525,8 +889,14 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
                     if (n <= 0) break;
                     received += (size_t)n;
                 }
-                if (received == len)
-                    fwrite(payload.c_str(), 1, payload.size(), fout);
+                if (received == len) {
+                    // payload includes trailing '\n' from the serializer;
+                    // strip it so write_msg can apply the correct framing.
+                    std::string body = payload;
+                    if (!body.empty() && body.back() == '\n')
+                        body.pop_back();
+                    write_msg(body);
+                }
             }
             close(tfd);
             done_tool_indices.push_back(i);

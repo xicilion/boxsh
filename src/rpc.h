@@ -5,6 +5,8 @@
 #include <vector>
 #include <optional>
 
+#include "../third_party/nlohmann/json.hpp"
+
 namespace boxsh {
 
 // ---------------------------------------------------------------------------
@@ -24,7 +26,7 @@ struct EditOp {
 
 // A parsed RPC request from a single JSON line on stdin.
 struct RpcRequest {
-    std::string id;       // caller-assigned request id (echoed back)
+    nlohmann::json id;    // caller-assigned request id (echoed back, preserves type)
     std::string cmd;      // shell command string (only when tool == None)
     int timeout_sec = 0;  // 0 = no timeout
 
@@ -52,7 +54,7 @@ struct RpcRequest {
 
 // Result to be serialized as a single JSON line to stdout.
 struct RpcResponse {
-    std::string id;
+    nlohmann::json id;
     ToolKind tool = ToolKind::None;
 
     // Shell command result (tool == None)
@@ -69,7 +71,14 @@ struct RpcResponse {
     int first_changed_line = 0;
 
     // Present on any failure (shell crash or tool error)
+    int error_code = -32000; // JSON-RPC 2.0 error code
     std::string error;
+
+    // When true, error is a protocol-level error (parse_error, unknown method)
+    // and should be serialized as a JSON-RPC error response.
+    // When false and error is set, it is a tool execution error and should be
+    // serialized as MCP CallToolResult with isError=true.
+    bool is_protocol_error = false;
 };
 
 // ---------------------------------------------------------------------------

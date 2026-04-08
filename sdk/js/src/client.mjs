@@ -74,7 +74,12 @@ export class BoxshClient {
             const entry = this.#pending.get(id);
             if (!entry) return;
             this.#pending.delete(id);
-            entry.resolve(resp);
+            // JSON-RPC 2.0: unwrap result or reject with error.
+            if (resp.error) {
+                entry.reject(new Error(resp.error.message || 'unknown error'));
+            } else {
+                entry.resolve(resp.result);
+            }
         });
 
         this.#proc.on('error', (err) => this.#failAll(err));
@@ -107,7 +112,13 @@ export class BoxshClient {
             }
             const id = this.#nextId();
             this.#pending.set(id, { resolve, reject });
-            this.#proc.stdin.write(JSON.stringify({ ...req, id }) + '\n');
+            // JSON-RPC 2.0 envelope.
+            this.#proc.stdin.write(JSON.stringify({
+                jsonrpc: '2.0',
+                id,
+                method: req.method,
+                params: req.params,
+            }) + '\n');
         });
     }
 
@@ -121,14 +132,18 @@ export class BoxshClient {
      */
     async exec(cmd, cwd, timeout) {
         const command = cwd ? `(cd ${shellQuote(cwd)} && ${cmd})` : cmd;
-        const req = { cmd: command };
-        if (timeout !== undefined && timeout > 0) req.timeout = timeout;
+        const args = { command };
+        if (timeout !== undefined && timeout > 0) args.timeout = timeout;
 
-        const resp = await this.#send(req);
+        const result = await this.#send({
+            method: 'tools/call',
+            params: { name: 'bash', arguments: args },
+        });
+        const sc = result.structuredContent ?? {};
         return {
-            exitCode: typeof resp.exit_code === 'number' ? resp.exit_code : null,
-            stdout:   typeof resp.stdout    === 'string' ? resp.stdout    : '',
-            stderr:   typeof resp.stderr    === 'string' ? resp.stderr    : '',
+            exitCode: typeof sc.exit_code === 'number' ? sc.exit_code : null,
+            stdout:   typeof sc.stdout    === 'string' ? sc.stdout    : '',
+            stderr:   typeof sc.stderr    === 'string' ? sc.stderr    : '',
         };
     }
 
@@ -141,13 +156,15 @@ export class BoxshClient {
      * @returns {Promise<string>}
      */
     async read(filePath, offset, limit) {
-        const req = { tool: 'read', path: filePath };
-        if (offset !== undefined) req.offset = offset;
-        if (limit  !== undefined) req.limit  = limit;
+        const args = { path: filePath };
+        if (offset !== undefined) args.offset = offset;
+        if (limit  !== undefined) args.limit  = limit;
 
-        const resp = await this.#send(req);
-        if (resp.error) throw new Error(String(resp.error));
-        return resp.content[0].text;
+        const result = await this.#send({
+            method: 'tools/call',
+            params: { name: 'read', arguments: args },
+        });
+        return result.content[0].text;
     }
 
     /**
@@ -157,8 +174,10 @@ export class BoxshClient {
      * @param {string} content    Full file content to write
      */
     async write(filePath, content) {
-        const resp = await this.#send({ tool: 'write', path: filePath, content });
-        if (resp.error) throw new Error(String(resp.error));
+        await this.#send({
+            method: 'tools/call',
+            params: { name: 'write', arguments: { path: filePath, content } },
+        });
     }
 
     /**
@@ -172,11 +191,14 @@ export class BoxshClient {
      * @returns {Promise<{ diff: string, firstChangedLine: number }>}
      */
     async edit(filePath, edits) {
-        const resp = await this.#send({ tool: 'edit', path: filePath, edits });
-        if (resp.error) throw new Error(String(resp.error));
+        const result = await this.#send({
+            method: 'tools/call',
+            params: { name: 'edit', arguments: { path: filePath, edits } },
+        });
+        const sc = result.structuredContent ?? {};
         return {
-            diff:             resp.details?.diff ?? '',
-            firstChangedLine: resp.details?.firstChangedLine ?? 0,
+            diff:             sc.diff ?? '',
+            firstChangedLine: sc.firstChangedLine ?? 0,
         };
     }
 

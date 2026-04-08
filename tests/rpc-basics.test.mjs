@@ -7,7 +7,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { run, rpc, rpcMany, byId } from './helpers.mjs';
+import { run, rpc, rpcMany, byId, toJsonRpc, fromJsonRpc } from './helpers.mjs';
 
 // ---------------------------------------------------------------------------
 // Response shape
@@ -16,7 +16,7 @@ import { run, rpc, rpcMany, byId } from './helpers.mjs';
 describe('rpc — response shape', () => {
   test('response is a single JSON line (no trailing spaces)', () => {
     const r = run(['--rpc', '--workers', '1'],
-      JSON.stringify({ id: 't', cmd: 'true' }) + '\n');
+      JSON.stringify(toJsonRpc({ id: 't', cmd: 'true' })) + '\n');
     const lines = r.stdout.split('\n').filter(Boolean);
     assert.equal(lines.length, 1);
     assert.doesNotThrow(() => JSON.parse(lines[0]));
@@ -55,7 +55,7 @@ describe('rpc — response shape', () => {
 
   test('no extra top-level fields on success', () => {
     const resp = rpc({ id: 't', cmd: 'true' });
-    const allowed = new Set(['id', 'exit_code', 'stdout', 'stderr', 'duration_ms']);
+    const allowed = new Set(['id', 'exit_code', 'stdout', 'stderr', 'duration_ms', 'content']);
     for (const k of Object.keys(resp)) {
       assert.ok(allowed.has(k), `unexpected field: ${k}`);
     }
@@ -212,33 +212,33 @@ describe('rpc — protocol robustness', () => {
   test('invalid JSON → error response (no crash)', () => {
     const r = run(['--rpc', '--workers', '1'], 'not json at all\n');
     const resp = JSON.parse(r.stdout.trim());
-    assert.ok(resp.error?.includes('parse_error'));
+    assert.ok(resp.error?.message?.includes('parse_error'));
   });
 
   test('JSON array (not object) → error response', () => {
     const r = run(['--rpc', '--workers', '1'], '[1,2,3]\n');
     const resp = JSON.parse(r.stdout.trim());
-    assert.ok(typeof resp.error === 'string' && resp.error.length > 0);
+    assert.ok(typeof resp.error?.message === 'string' && resp.error.message.length > 0);
   });
 
-  test('missing cmd field → error response', () => {
+  test('missing method field → error response', () => {
     const resp = rpc({ id: 'x', foo: 'bar' });
     assert.ok(resp.error?.includes('parse_error'));
   });
 
   test('cmd with non-string value → error response', () => {
     const r = run(['--rpc', '--workers', '1'],
-      JSON.stringify({ id: 't', cmd: 42 }) + '\n');
+      JSON.stringify({ jsonrpc: '2.0', id: 't', method: 'exec', params: { cmd: 42 } }) + '\n');
     const resp = JSON.parse(r.stdout.trim());
-    assert.ok(typeof resp.error === 'string' && resp.error.length > 0);
+    assert.ok(typeof resp.error?.message === 'string' && resp.error.message.length > 0);
   });
 
   test('blank lines between requests are skipped', () => {
-    const input = '\n\n' + JSON.stringify({ id: 'skip', cmd: 'echo ok' }) + '\n\n';
+    const input = '\n\n' + JSON.stringify(toJsonRpc({ id: 'skip', cmd: 'echo ok' })) + '\n\n';
     const r = run(['--rpc', '--workers', '1'], input);
     const lines = r.stdout.trim().split('\n').filter(Boolean);
     assert.equal(lines.length, 1);
-    assert.equal(JSON.parse(lines[0]).stdout, 'ok\n');
+    assert.equal(fromJsonRpc(JSON.parse(lines[0])).stdout, 'ok\n');
   });
 
   test('multiple requests → one response per request', () => {
@@ -251,11 +251,11 @@ describe('rpc — protocol robustness', () => {
   });
 
   test('valid request after invalid one is still processed', () => {
-    const input = 'BAD JSON\n' + JSON.stringify({ id: 'good', cmd: 'echo ok' }) + '\n';
+    const input = 'BAD JSON\n' + JSON.stringify(toJsonRpc({ id: 'good', cmd: 'echo ok' })) + '\n';
     const r = run(['--rpc', '--workers', '1'], input);
     const lines = r.stdout.trim().split('\n').filter(Boolean);
     assert.equal(lines.length, 2);
-    const parsed = lines.map(l => JSON.parse(l));
+    const parsed = lines.map(l => fromJsonRpc(JSON.parse(l)));
     const good = parsed.find(p => p.id === 'good');
     assert.ok(good, 'good request should still be processed');
     assert.equal(good.stdout, 'ok\n');
@@ -292,8 +292,8 @@ describe('rpc — CLI flags', () => {
 
   test('--shell /bin/sh is accepted', () => {
     const r = run(['--rpc', '--workers', '1', '--shell', '/bin/sh'],
-      JSON.stringify({ id: 't', cmd: 'echo custom-shell' }) + '\n');
-    const resp = JSON.parse(r.stdout.trim());
+      JSON.stringify(toJsonRpc({ id: 't', cmd: 'echo custom-shell' })) + '\n');
+    const resp = fromJsonRpc(JSON.parse(r.stdout.trim()));
     assert.equal(resp.stdout, 'custom-shell\n');
   });
 });

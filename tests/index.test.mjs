@@ -7,3 +7,5 @@ import './concurrent.test.mjs';
 import './overlay.test.mjs';
 import './try.test.mjs';
 import './tools.test.mjs';
+import './mcp.test.mjs';
+import './protocol-regression.test.mjs';

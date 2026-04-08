@@ -1,8 +1,8 @@
 # boxsh Usage Guide
 
-boxsh is a sandboxed POSIX shell with built-in OS-native isolation and a programmable JSON-line RPC interface.
+boxsh is a sandboxed POSIX shell and MCP server with built-in OS-native isolation.
 
-It works in two modes: **Shell mode** — a drop-in `/bin/sh` replacement with optional sandboxing and overlay COW; and **RPC mode** — a JSON protocol backend that AI agents, build systems, or orchestration layers can drive programmatically.
+It works in two main modes: **Shell mode** — a drop-in `/bin/sh` replacement with optional sandboxing and overlay COW; and **MCP / RPC mode** — an [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server over stdio that AI agents, build systems, or orchestration layers can drive programmatically.
 
 This guide walks through the core scenarios boxsh is built for, with concrete examples you can run directly.
 
@@ -125,9 +125,9 @@ flowchart TB
         SM2 --> SM3["Interactive prompt\nor -c 'cmd'"]
     end
 
-    subgraph RPCMode["RPC Mode"]
+    subgraph RPCMode["MCP / RPC Mode"]
         direction TB
-        Coord["Coordinator\n(reads JSON from stdin)"]
+        Coord["Coordinator\n(reads JSON-RPC 2.0 from stdin)"]
         Coord --> W1["Worker 1"]
         Coord --> W2["Worker 2"]
         Coord --> WN["Worker N"]
@@ -136,12 +136,12 @@ flowchart TB
 
 **Shell mode** is a sandboxed `/bin/sh`. You get an interactive shell (or run a one-liner with `-c`). Good for manual exploration and scripting.
 
-**RPC mode** is for programmatic integration. boxsh reads JSON requests from stdin and writes JSON responses to stdout:
+**MCP / RPC mode** is for programmatic integration. boxsh implements the MCP protocol over stdio — AI clients connect to it as a sandboxed code execution server. It reads JSON-RPC 2.0 requests from stdin and writes responses to stdout:
 
-1. You send a request: `{"id":"1", "cmd":"make"}`
+1. You send a request: `{"method":"tools/call", "params":{"name":"bash", "arguments":{"command":"make"}}}`
 2. The coordinator dispatches it to an available worker
 3. The worker runs the command and collects stdout/stderr
-4. You receive: `{"id":"1", "exit_code":0, "stdout":"..."}`
+4. You receive: `{"result":{"content":[...], "structuredContent":{"exit_code":0, "stdout":"..."}}}`
 
 Multiple workers run in parallel. Responses arrive in completion order, not submission order. File operations (read / write / edit) do not occupy a worker slot.
 
@@ -152,13 +152,13 @@ sequenceDiagram
     participant W1 as Worker 1
     participant W2 as Worker 2
 
-    Agent->>Coord: {"id":"1", "cmd":"npm install"}
-    Agent->>Coord: {"id":"2", "cmd":"npm test"}
+    Agent->>Coord: tools/call bash "npm install"
+    Agent->>Coord: tools/call bash "npm test"
     Coord->>W1: dispatch cmd 1
     Coord->>W2: dispatch cmd 2
-    W2-->>Coord: {"id":"2", exit_code: 0} (faster)
+    W2-->>Coord: {exit_code: 0} (faster)
     Coord-->>Agent: {"id":"2", ...}
-    W1-->>Coord: {"id":"1", exit_code: 0}
+    W1-->>Coord: {exit_code: 0}
     Coord-->>Agent: {"id":"1", ...}
 ```
 
@@ -206,11 +206,11 @@ boxsh --rpc --workers 2 --sandbox --new-net-ns \
   --bind cow:"$project:$sandbox/dst"
 ```
 
-Now the agent sends JSON commands:
+Now the agent sends JSON-RPC 2.0 requests:
 
 ```json
-{"id":"1", "cmd":"cd /tmp/agent-session/dst && npm install"}
-{"id":"2", "cmd":"cd /tmp/agent-session/dst && npm test"}
+{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd /tmp/agent-session/dst && npm install"}}}
+{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd /tmp/agent-session/dst && npm test"}}}
 ```
 
 Inside the sandbox, `$sandbox/dst` looks like a complete copy of the project — the agent can `npm install`, create files, delete files, run builds. But:
@@ -376,11 +376,11 @@ pid_b=$!
 
 # Send different commands to each branch...
 # Branch A1: try lodash
-echo '{"id":"1","cmd":"cd '$session'/dst_a1 && npm install lodash"}' \
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd '$session'/dst_a1 && npm install lodash"}}}' \
   > /proc/$pid_a1/fd/0
 
 # Branch B: try underscore
-echo '{"id":"1","cmd":"cd '$session'/dst_b && npm install underscore"}' \
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd '$session'/dst_b && npm install underscore"}}}' \
   > /proc/$pid_b/fd/0
 ```
 
@@ -455,14 +455,14 @@ Send 8 requests at once — they execute in parallel:
 
 ```sh
 printf '%s\n' \
-  '{"id":"test-1", "cmd":"cd /tmp/parallel/dst && make test SUITE=unit"}' \
-  '{"id":"test-2", "cmd":"cd /tmp/parallel/dst && make test SUITE=integration"}' \
-  '{"id":"test-3", "cmd":"cd /tmp/parallel/dst && make test SUITE=e2e"}' \
-  '{"id":"build-1","cmd":"cd /tmp/parallel/dst && make build ARCH=x86_64"}' \
-  '{"id":"build-2","cmd":"cd /tmp/parallel/dst && make build ARCH=aarch64"}' \
-  '{"id":"lint",   "cmd":"cd /tmp/parallel/dst && make lint"}' \
-  '{"id":"docs",   "cmd":"cd /tmp/parallel/dst && make docs"}' \
-  '{"id":"bench",  "cmd":"cd /tmp/parallel/dst && make bench"}' \
+  '{"jsonrpc":"2.0","id":"test-1","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd /tmp/parallel/dst && make test SUITE=unit"}}}' \
+  '{"jsonrpc":"2.0","id":"test-2","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd /tmp/parallel/dst && make test SUITE=integration"}}}' \
+  '{"jsonrpc":"2.0","id":"test-3","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd /tmp/parallel/dst && make test SUITE=e2e"}}}' \
+  '{"jsonrpc":"2.0","id":"build-1","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd /tmp/parallel/dst && make build ARCH=x86_64"}}}' \
+  '{"jsonrpc":"2.0","id":"build-2","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd /tmp/parallel/dst && make build ARCH=aarch64"}}}' \
+  '{"jsonrpc":"2.0","id":"lint","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd /tmp/parallel/dst && make lint"}}}' \
+  '{"jsonrpc":"2.0","id":"docs","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd /tmp/parallel/dst && make docs"}}}' \
+  '{"jsonrpc":"2.0","id":"bench","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd /tmp/parallel/dst && make bench"}}}' \
 | boxsh --rpc --workers 8 --sandbox \
     --bind cow:"/opt/sysroot:/tmp/parallel/dst"
 ```
@@ -522,7 +522,7 @@ await client.close();
 ```sh
 mkdir -p /tmp/dryrun/dst
 
-echo '{"id":"1","cmd":"make install PREFIX=/tmp/dryrun/dst/usr"}' \
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"bash","arguments":{"command":"make install PREFIX=/tmp/dryrun/dst/usr"}}}' \
 | boxsh --rpc --sandbox \
     --bind cow:"/:/tmp/dryrun/dst"
 
@@ -536,7 +536,7 @@ find /tmp/dryrun/dst -type f | sed 's|^/tmp/dryrun/dst||'
 ```sh
 mkdir -p /tmp/upgrade/dst
 
-echo '{"id":"1","cmd":"apt-get install -y --simulate nginx 2>&1; dpkg --configure -a"}' \
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"bash","arguments":{"command":"apt-get install -y --simulate nginx 2>&1; dpkg --configure -a"}}}' \
 | boxsh --rpc --sandbox \
     --bind cow:"/:/tmp/upgrade/dst"
 
@@ -724,9 +724,9 @@ boxsh --sandbox --bind cow:"$project:$dst" -c '
 
 | | Shell Mode | RPC Mode |
 |---|---|---|
-| Protocol | stdin/stdout text stream | JSON-line structured messages |
+| Protocol | stdin/stdout text stream | JSON-RPC 2.0 (MCP-compatible) |
 | Concurrency | Sequential (one command at a time) | Parallel (multi-worker) |
-| Output format | Raw text (agent must parse) | Structured JSON with exit code, duration |
+| Output format | Raw text (agent must parse) | Structured JSON (`content` + `structuredContent`) |
 | Interactive programs | Yes (with PTY) | No |
 | Shell state | Persists (cd, export, aliases) | Isolated per command |
 | Built-in file tools | No | read / write / edit |
@@ -797,7 +797,7 @@ but reduced to a single flag.
 
 ### RPC Mode
 
-RPC mode turns boxsh into a programmable backend. It reads newline-delimited JSON requests from stdin and writes JSON responses to stdout.
+RPC mode turns boxsh into an MCP-compatible server. It reads JSON-RPC 2.0 requests from stdin and writes responses to stdout. Any MCP client (VS Code, Claude Desktop, Cursor, etc.) can connect directly.
 
 ```sh
 boxsh --rpc [--workers N] [sandbox flags...]
@@ -806,96 +806,90 @@ boxsh --rpc [--workers N] [sandbox flags...]
 - `--workers N` — number of parallel workers (default: 4)
 - Responses arrive in **completion order**, not submission order
 
+boxsh supports two transports, auto-detected from the first bytes:
+
+| Transport | Format | Used by |
+|---|---|---|
+| **Content-Length framed** | `Content-Length: N\r\n\r\nJSON` | VS Code, most MCP clients |
+| **Newline-delimited** | One JSON object per line | CLI testing, piped input |
+
+#### MCP Methods
+
+| Method | Description |
+|---|---|
+| `initialize` | Returns server capabilities and protocol version |
+| `notifications/initialized` | Acknowledged silently (no response) |
+| `tools/list` | Returns the four tools with `inputSchema`, `outputSchema`, and `annotations` |
+| `tools/call` | Dispatches to a named tool: `bash`, `read`, `write`, `edit` |
+
 #### Shell Commands
 
-Send a shell command with a `cmd` field:
+Execute shell commands via the `bash` tool:
 
 ```sh
-echo '{"id":"1", "cmd":"echo hello"}' | boxsh --rpc
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"bash","arguments":{"command":"echo hello"}}}' | boxsh --rpc
 ```
 
-**Request:**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `id` | string | no | Echoed back in the response |
-| `cmd` | string | yes | Shell command (parsed by embedded dash) |
-| `timeout` | number | no | Kill after N seconds (0 = no limit) |
-
-**Response:**
+**Response** (MCP `CallToolResult` format):
 
 ```json
-{"id":"1", "exit_code":0, "stdout":"hello\n", "stderr":"", "duration_ms":3}
+{"jsonrpc":"2.0","id":"1","result":{
+  "content":[{"type":"text","text":"hello\n"}],
+  "structuredContent":{"exit_code":0,"stdout":"hello\n","stderr":"","duration_ms":3}
+}}
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `id` | string | Echoed from request |
-| `exit_code` | number | Exit status (128+signal if killed) |
-| `stdout` | string | Captured standard output |
-| `stderr` | string | Captured standard error |
-| `duration_ms` | number | Wall-clock time in milliseconds |
-| `error` | string | Present only on failure (parse error, worker crash) |
+- `content` — text representation for the LLM
+- `structuredContent` — typed fields: `exit_code`, `stdout`, `stderr`, `duration_ms`
+- `isError: true` — set when `exit_code != 0` or the command fails
 
 Full shell syntax is supported — pipes, redirections, variables, subshells, etc.:
 
 ```sh
-echo '{"id":"1", "cmd":"echo hello | tr a-z A-Z"}' | boxsh --rpc
-# {"id":"1","exit_code":0,"stdout":"HELLO\n","stderr":"","duration_ms":4}
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"bash","arguments":{"command":"echo hello | tr a-z A-Z"}}}' | boxsh --rpc
+# → content: "HELLO\n", structuredContent: {exit_code: 0, stdout: "HELLO\n", ...}
 
-echo '{"id":"2", "cmd":"x=42; echo $((x * 2))"}' | boxsh --rpc
-# {"id":"2","exit_code":0,"stdout":"84\n","stderr":"","duration_ms":3}
+echo '{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"bash","arguments":{"command":"x=42; echo $((x * 2))"}}}' | boxsh --rpc
+# → content: "84\n", structuredContent: {exit_code: 0, stdout: "84\n", ...}
 ```
 
-#### Built-in Tools
+#### Built-in File Tools
 
-Three file-operation tools are available. They do not occupy a worker slot, so you can use them freely alongside shell commands. Use `tool` instead of `cmd`.
+Three file-operation tools are available via `tools/call`. They run on background threads and do not occupy a worker slot.
 
-**Common response format:**
-
-```json
-{"id":"1", "content":[{"type":"text","text":"..."}], "details":{...}}
-```
-
-On error: `{"id":"1", "error":"message"}`.
-
-**read** — Read a file, optionally restricting to a line range.
+**`read`** — Read a file, optionally restricting to a line range.
 
 ```sh
 # Read entire file
-echo '{"id":"1", "tool":"read", "path":"/etc/hostname"}' | boxsh --rpc
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"read","arguments":{"path":"/etc/hostname"}}}' | boxsh --rpc
 
 # Read lines 10–19
-echo '{"id":"1", "tool":"read", "path":"src/main.cpp", "offset":10, "limit":10}' | boxsh --rpc
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"read","arguments":{"path":"src/main.cpp","offset":10,"limit":10}}}' | boxsh --rpc
 ```
 
-| Field | Type | Default | Description |
+| Argument | Type | Default | Description |
 |---|---|---|---|
 | `offset` | number | 1 | 1-based start line |
 | `limit` | number | unlimited | Maximum lines to return |
 
-Response includes truncation info:
+`structuredContent` includes truncation info: `{"truncation": {"truncated": false, "line_count": 24}}`.
 
-```json
-{"id":"1", "content":[{"type":"text","text":"..."}], "details":{"truncation":{"truncated":false,"line_count":24}}}
-```
-
-**write** — Create or overwrite a file.
+**`write`** — Create or overwrite a file.
 
 ```sh
-echo '{"id":"1", "tool":"write", "path":"/tmp/hello.txt", "content":"hello\n"}' | boxsh --rpc
-# {"id":"1","content":[{"type":"text","text":"written 6 bytes"}]}
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"write","arguments":{"path":"/tmp/hello.txt","content":"hello\n"}}}' | boxsh --rpc
+# → content: "written 6 bytes"
 ```
 
-**edit** — Apply one or more search-and-replace operations on a file.
+**`edit`** — Apply one or more search-and-replace operations on a file.
 
 ```sh
 echo '{
-  "id":"1", "tool":"edit", "path":"config.ini",
-  "edits":[
-    {"oldText":"debug = false", "newText":"debug = true"},
-    {"oldText":"port = 3000",   "newText":"port = 8080"}
-  ]
+  "jsonrpc":"2.0","id":"1","method":"tools/call",
+  "params":{"name":"edit","arguments":{"path":"config.ini","edits":[
+    {"oldText":"debug = false","newText":"debug = true"},
+    {"oldText":"port = 3000","newText":"port = 8080"}
+  ]}}
 }' | boxsh --rpc
 ```
 
@@ -906,15 +900,16 @@ Rules:
 - Edits must not overlap
 - `oldText` must not be empty
 
-The response includes a unified diff and the first changed line number:
+`structuredContent` includes `diff` (unified diff) and `firstChangedLine` (1-indexed line number of the first changed line).
 
-```json
-{
-  "id":"1",
-  "content":[{"type":"text","text":"OK"}],
-  "details":{"diff":"--- a/config.ini\n+++ b/config.ini\n@@ ...", "firstChangedLine":3}
-}
-```
+#### Error Model
+
+boxsh distinguishes two kinds of errors per the MCP spec:
+
+| Error type | Serialization | Example |
+|---|---|---|
+| **Protocol error** | JSON-RPC `{"error": {"code": N, "message": "..."}}` | Invalid JSON, unknown method, unknown tool |
+| **Tool execution error** | `{"result": {"content": [...], "isError": true}}` | Non-zero exit code, file not found |
 
 #### Concurrency
 
@@ -922,31 +917,96 @@ Multiple requests sent at once are dispatched to different workers and execute i
 
 ```sh
 printf '%s\n' \
-  '{"id":"slow", "cmd":"sleep 0.5; echo slow"}' \
-  '{"id":"fast", "cmd":"echo fast"}' \
+  '{"jsonrpc":"2.0","id":"slow","method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 0.5; echo slow"}}}' \
+  '{"jsonrpc":"2.0","id":"fast","method":"tools/call","params":{"name":"bash","arguments":{"command":"echo fast"}}}' \
 | boxsh --rpc --workers 2
 ```
 
 Output (fast completes first):
 
 ```
-{"id":"fast","exit_code":0,"stdout":"fast\n","stderr":"","duration_ms":3}
-{"id":"slow","exit_code":0,"stdout":"slow\n","stderr":"","duration_ms":503}
+{"jsonrpc":"2.0","id":"fast","result":{"content":[...],"structuredContent":{"exit_code":0,"stdout":"fast\n",...}}}
+{"jsonrpc":"2.0","id":"slow","result":{"content":[...],"structuredContent":{"exit_code":0,"stdout":"slow\n",...}}}
 ```
 
 Tool requests and shell commands can be interleaved — tools do not occupy a worker.
 
 #### Timeout
 
-Set a per-request timeout in seconds. When the timeout fires, the command is killed and the worker is respawned automatically.
+Set a per-request timeout via the `timeout` argument. When the timeout fires, the command is killed and the worker is respawned automatically.
 
 ```sh
-echo '{"id":"t", "cmd":"sleep 60", "timeout":2}' | boxsh --rpc
+echo '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 60","timeout":2}}}' | boxsh --rpc
 # Response after ~2 seconds:
-# {"id":"t","exit_code":-1,"stderr":"timeout","duration_ms":2001}
+# {"jsonrpc":"2.0","id":"t","result":{"content":[{"type":"text","text":"timeout"}],"structuredContent":{"exit_code":-1,"stdout":"","stderr":"timeout","duration_ms":2001},"isError":true}}
 ```
 
 Subsequent requests continue to work normally — the crashed worker is replaced transparently.
+
+#### Client Configuration
+
+`--sandbox` enforces minimal privileges — you must explicitly `--bind` any project directories.
+
+**VS Code** (`.vscode/mcp.json`):
+
+```json
+{
+  "servers": {
+    "boxsh": {
+      "command": "boxsh",
+      "args": [
+        "--rpc", "--workers", "4",
+        "--sandbox", "--bind", "ro:${workspaceFolder}"
+      ]
+    }
+  }
+}
+```
+
+**Claude Desktop** (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "boxsh": {
+      "command": "boxsh",
+      "args": [
+        "--rpc", "--workers", "4",
+        "--sandbox", "--bind", "cow:/path/to/project:/path/to/dst"
+      ]
+    }
+  }
+}
+```
+
+**Cursor** (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "boxsh": {
+      "command": "boxsh",
+      "args": [
+        "--rpc", "--workers", "4",
+        "--sandbox", "--bind", "cow:/path/to/project:/path/to/dst"
+      ]
+    }
+  }
+}
+```
+
+**Bind modes:** `cow:SRC:DST` (copy-on-write — project is read-only, writes go to DST), `ro:PATH` (read-only), `wr:PATH` (direct read-write). Add `--new-net-ns` to block network access.
+
+**Example handshake:**
+
+```sh
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":"1","method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":"2","method":"tools/list"}' \
+  '{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"bash","arguments":{"command":"echo hello"}}}' \
+| boxsh --rpc --workers 1
+```
 
 ### Sandbox Flags
 
@@ -997,7 +1057,7 @@ dst=/tmp/sandbox/dst
 mkdir -p "$dst"
 
 # Run inside COW overlay
-echo '{"id":"1","cmd":"cd /tmp/sandbox/dst && npm install"}' \
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"bash","arguments":{"command":"cd /tmp/sandbox/dst && npm install"}}}' \
 | boxsh --rpc --sandbox --bind cow:"$project:$dst"
 
 # Base is untouched; all changes are in $dst
