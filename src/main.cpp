@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <cerrno>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <pwd.h>
 
 // Bring in dash's main() under a renamed symbol so we can call it directly
@@ -314,7 +315,55 @@ int main(int argc, char **argv) {
         for (int i = 0; i < shell_argc; i++)
             dash_args.push_back(shell_argv[i]);
         dash_args.push_back(nullptr);
-        return dash_main((int)dash_args.size() - 1, dash_args.data());
+
+        // Without sandbox, run dash directly in the current process.
+        if (!cli.sandbox.enabled) {
+            return dash_main((int)dash_args.size() - 1, dash_args.data());
+        }
+
+        // With sandbox enabled, fork a child and run dash in a new process
+        // group.  When the shell exits the parent kills the entire process
+        // group, cleaning up any backgrounded jobs that would otherwise
+        // become orphans.
+        signal(SIGTTOU, SIG_IGN);
+        pid_t child = fork();
+        if (child < 0) {
+            std::fprintf(stderr, "boxsh: fork: %s\n", strerror(errno));
+            return 1;
+        }
+        if (child == 0) {
+            // Child: create its own process group and run the shell.
+            setpgid(0, 0);
+            if (interactive)
+                tcsetpgrp(STDIN_FILENO, getpid());
+            signal(SIGTTOU, SIG_DFL);
+            _exit(dash_main((int)dash_args.size() - 1, dash_args.data()));
+        }
+
+        // Parent: hand terminal to child, wait, then clean up.
+        setpgid(child, child);  // race-free: both sides call setpgid
+        if (interactive)
+            tcsetpgrp(STDIN_FILENO, child);
+
+        // Ignore job-control signals while the shell owns the terminal.
+        signal(SIGINT,  SIG_IGN);
+        signal(SIGQUIT, SIG_IGN);
+        signal(SIGTSTP, SIG_IGN);
+        signal(SIGTTIN, SIG_IGN);
+
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+
+        // Kill any orphaned processes in the child's process group.
+        kill(-child, SIGKILL);
+
+        // Reclaim the terminal before exiting.
+        if (interactive)
+            tcsetpgrp(STDIN_FILENO, getpgrp());
+
+        if (WIFEXITED(status))    return WEXITSTATUS(status);
+        if (WIFSIGNALED(status))  return 128 + WTERMSIG(status);
+        return 1;
     }
 
     // -------------------------------------------------------------------

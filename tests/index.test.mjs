@@ -10,3 +10,4 @@ import './tools.test.mjs';
 import './mcp.test.mjs';
 import './protocol-regression.test.mjs';
 import './sandbox-escape.test.mjs';
+import './sandbox-security.test.mjs';
