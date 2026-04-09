@@ -106,13 +106,86 @@ static std::string build_sbpl(const SandboxConfig &cfg) {
         p += "\"))\n";
     }
 
-    // Allow all process, mach and IPC operations.
-    p += "(allow process*)\n";
-    p += "(allow signal)\n";
-    p += "(allow mach*)\n";
-    p += "(allow ipc*)\n";
-    p += "(allow sysctl*)\n";
-    p += "(allow file-ioctl)\n";
+    // Process permissions — only exec, fork, and same-sandbox info/signal.
+    p += "(allow process-exec)\n";
+    p += "(allow process-fork)\n";
+    p += "(allow process-info* (target same-sandbox))\n";
+    p += "(allow signal (target same-sandbox))\n";
+
+    // Mach IPC — whitelist of audited safe XPC services.
+    p += "(allow mach-lookup\n";
+    p += "  (global-name \"com.apple.audio.systemsoundserver\")\n";
+    p += "  (global-name \"com.apple.distributed_notifications@Uv3\")\n";
+    p += "  (global-name \"com.apple.FontObjectsServer\")\n";
+    p += "  (global-name \"com.apple.fonts\")\n";
+    p += "  (global-name \"com.apple.logd\")\n";
+    p += "  (global-name \"com.apple.lsd.mapdb\")\n";
+    p += "  (global-name \"com.apple.PowerManagement.control\")\n";
+    p += "  (global-name \"com.apple.system.logger\")\n";
+    p += "  (global-name \"com.apple.system.notification_center\")\n";
+    p += "  (global-name \"com.apple.system.opendirectoryd.libinfo\")\n";
+    p += "  (global-name \"com.apple.system.opendirectoryd.membership\")\n";
+    p += "  (global-name \"com.apple.bsd.dirhelper\")\n";
+    p += "  (global-name \"com.apple.securityd.xpc\")\n";
+    p += "  (global-name \"com.apple.SecurityServer\")\n";
+    p += ")\n";
+
+    // POSIX IPC — only shared memory and semaphores.
+    p += "(allow ipc-posix-shm)\n";
+    p += "(allow ipc-posix-sem)\n";
+
+    // sysctl — read-only, restricted to a curated whitelist.
+    p += "(allow sysctl-read\n";
+    p += "  (sysctl-name \"hw.activecpu\")\n";
+    p += "  (sysctl-name \"hw.busfrequency_compat\")\n";
+    p += "  (sysctl-name \"hw.byteorder\")\n";
+    p += "  (sysctl-name \"hw.cacheconfig\")\n";
+    p += "  (sysctl-name \"hw.cachelinesize_compat\")\n";
+    p += "  (sysctl-name \"hw.cpufamily\")\n";
+    p += "  (sysctl-name \"hw.cpufrequency\")\n";
+    p += "  (sysctl-name \"hw.cpufrequency_compat\")\n";
+    p += "  (sysctl-name \"hw.cputype\")\n";
+    p += "  (sysctl-name \"hw.l1dcachesize_compat\")\n";
+    p += "  (sysctl-name \"hw.l1icachesize_compat\")\n";
+    p += "  (sysctl-name \"hw.l2cachesize_compat\")\n";
+    p += "  (sysctl-name \"hw.l3cachesize_compat\")\n";
+    p += "  (sysctl-name \"hw.logicalcpu\")\n";
+    p += "  (sysctl-name \"hw.logicalcpu_max\")\n";
+    p += "  (sysctl-name \"hw.machine\")\n";
+    p += "  (sysctl-name \"hw.memsize\")\n";
+    p += "  (sysctl-name \"hw.ncpu\")\n";
+    p += "  (sysctl-name \"hw.nperflevels\")\n";
+    p += "  (sysctl-name \"hw.packages\")\n";
+    p += "  (sysctl-name \"hw.pagesize_compat\")\n";
+    p += "  (sysctl-name \"hw.pagesize\")\n";
+    p += "  (sysctl-name \"hw.physicalcpu\")\n";
+    p += "  (sysctl-name \"hw.physicalcpu_max\")\n";
+    p += "  (sysctl-name \"hw.tbfrequency_compat\")\n";
+    p += "  (sysctl-name \"hw.vectorunit\")\n";
+    p += "  (sysctl-name \"kern.argmax\")\n";
+    p += "  (sysctl-name \"kern.hostname\")\n";
+    p += "  (sysctl-name \"kern.maxfiles\")\n";
+    p += "  (sysctl-name \"kern.maxfilesperproc\")\n";
+    p += "  (sysctl-name \"kern.maxproc\")\n";
+    p += "  (sysctl-name \"kern.ngroups\")\n";
+    p += "  (sysctl-name \"kern.osproductversion\")\n";
+    p += "  (sysctl-name \"kern.osrelease\")\n";
+    p += "  (sysctl-name \"kern.ostype\")\n";
+    p += "  (sysctl-name \"kern.osversion\")\n";
+    p += "  (sysctl-name \"kern.version\")\n";
+    p += "  (sysctl-name-prefix \"hw.optional.\")\n";
+    p += "  (sysctl-name-prefix \"hw.perflevel\")\n";
+    p += "  (sysctl-name-prefix \"kern.proc.pid.\")\n";
+    p += "  (sysctl-name-prefix \"machdep.cpu.\")\n";
+    p += "  (sysctl-name-prefix \"sysctl.\")\n";
+    p += ")\n";
+
+    // File ioctl — restricted to specific device paths.
+    p += "(allow file-ioctl (literal \"/dev/null\"))\n";
+    p += "(allow file-ioctl (literal \"/dev/zero\"))\n";
+    p += "(allow file-ioctl (literal \"/dev/random\"))\n";
+    p += "(allow file-ioctl (literal \"/dev/urandom\"))\n";
+    p += "(allow file-ioctl (literal \"/dev/tty\"))\n";
 
     // Allow reads and writes to /dev (e.g. /dev/null, /dev/zero, /dev/urandom).
     p += "(allow file-write* (subpath \"/dev\"))\n";
@@ -245,12 +318,9 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     char *sb_err = nullptr;
     int rc = sandbox_init(profile.c_str(), 0, &sb_err);
     if (rc != 0) {
-        std::fprintf(stderr,
-            "boxsh: warning: sandbox_init failed: %s"
-            " (running without sandbox)\n",
-            sb_err ? sb_err : "unknown error");
+        res.error = std::string("sandbox_init failed: ") +
+                   (sb_err ? sb_err : "unknown error");
         if (sb_err) sandbox_free_error(sb_err);
-        res.ok = true;
         return res;
     }
 
