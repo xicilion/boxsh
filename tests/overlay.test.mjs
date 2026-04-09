@@ -26,9 +26,12 @@ function makeCowDirs() {
   fs.mkdirSync(dst);
   return {
     src, dst,
-    // Use the shell rm -rf: overlayfs leaves kernel-internal entries in the
-    // auto-created work directory that Node's fs.rmSync cannot always remove.
-    cleanup: () => spawnSync('rm', ['-rf', base]),
+    // Overlayfs sets the internal work directory permissions to 0000.
+    // chmod first so rm -rf can remove everything.
+    cleanup: () => {
+      spawnSync('chmod', ['-R', 'u+rwx', base]);
+      spawnSync('rm', ['-rf', base]);
+    },
   };
 }
 

@@ -34,7 +34,10 @@ process.on('exit', () => {
   try {
     for (const entry of fs.readdirSync(TEMPDIR)) {
       if (entry.startsWith('boxsh-')) {
-        fs.rmSync(path.join(TEMPDIR, entry), { recursive: true, force: true });
+        const p = path.join(TEMPDIR, entry);
+        // Overlayfs sets work directory permissions to 0000; chmod first.
+        spawnSync('chmod', ['-R', 'u+rwx', p]);
+        fs.rmSync(p, { recursive: true, force: true });
       }
     }
   } catch { /* best-effort */ }
