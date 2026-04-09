@@ -219,7 +219,7 @@ describe('Phase 4 — Process lifecycle', () => {
       '--try', '-c',
       // Use exec to rename the sleep so we can identify it later
       `sh -c 'sleep 120 &' && echo ${marker}_$$`,
-    ], { encoding: 'utf8', timeout: 8000 });
+    ], { encoding: 'utf8', timeout: 8000, cwd: TEMPDIR });
 
     // Give a moment for cleanup
     spawnSync('sleep', ['0.5']);

@@ -187,17 +187,43 @@ int main(int argc, char **argv) {
         try_cwd = cwd_buf;
         free(cwd_buf);
 
-        char tmpl[] = "/tmp/boxsh-try-XXXXXX";
-        if (!mkdtemp(tmpl)) {
-            std::fprintf(stderr, "boxsh: --try: mkdtemp failed: %s\n",
-                         strerror(errno));
-            return 1;
+        // Create the temp directory on the same volume as CWD when possible.
+        // clonefile(2) requires src and dst to reside on the same APFS
+        // volume; using /tmp would fail when CWD is on another volume.
+        std::string try_tmpdir;
+        {
+            // Try CWD's parent directory first (same volume guaranteed).
+            std::string cwd_parent = try_cwd;
+            size_t slash = cwd_parent.rfind('/');
+            if (slash != std::string::npos && slash > 0)
+                cwd_parent.resize(slash);
+            else
+                cwd_parent = "/tmp";
+
+            std::string tmpl_str = cwd_parent + "/.boxsh-try-XXXXXX";
+            std::vector<char> tmpl_buf(tmpl_str.begin(), tmpl_str.end());
+            tmpl_buf.push_back('\0');
+
+            if (!mkdtemp(tmpl_buf.data())) {
+                // Fall back to /tmp (may fail later if cross-volume).
+                char fallback[] = "/tmp/boxsh-try-XXXXXX";
+                if (!mkdtemp(fallback)) {
+                    std::fprintf(stderr, "boxsh: --try: mkdtemp failed: %s\n",
+                                 strerror(errno));
+                    return 1;
+                }
+                tmpl_str = fallback;
+            } else {
+                tmpl_str.assign(tmpl_buf.data());
+            }
+
+            // Canonicalize /tmp -> /private/tmp (and similar symlinks) so
+            // the printed path matches what getcwd() reports inside the
+            // sandbox.
+            char real_path[PATH_MAX];
+            const char *rp = realpath(tmpl_str.c_str(), real_path);
+            try_tmpdir = rp ? std::string(rp) : tmpl_str;
         }
-        // Canonicalize /tmp -> /private/tmp (and similar symlinks) so the
-        // printed path matches what getcwd() will report inside the sandbox.
-        char real_tmpl[PATH_MAX];
-        const char *rp = realpath(tmpl, real_tmpl);
-        std::string try_tmpdir = rp ? std::string(rp) : std::string(tmpl);
         std::string dst = try_tmpdir + "/work";
         if (mkdir(dst.c_str(), 0700) != 0) {
             std::fprintf(stderr, "boxsh: --try: failed to create work dir: %s\n",

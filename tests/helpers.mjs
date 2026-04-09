@@ -30,17 +30,22 @@ fs.mkdirSync(TEMPDIR, { recursive: true });
 // Remove all boxsh-* subdirs created under TEMPDIR when the process exits.
 // This is a belt-and-suspenders cleanup: each test already has its own
 // try/finally, but this handler catches anything left behind by aborted runs.
+// Also cleans up .boxsh-try-* dirs created by --try mode in TEMPDIR and its
+// parent (--try creates temp dirs as siblings of CWD for same-volume cloning).
 process.on('exit', () => {
-  try {
-    for (const entry of fs.readdirSync(TEMPDIR)) {
-      if (entry.startsWith('boxsh-')) {
-        const p = path.join(TEMPDIR, entry);
-        // Overlayfs sets work directory permissions to 0000; chmod first.
-        spawnSync('chmod', ['-R', 'u+rwx', p]);
-        fs.rmSync(p, { recursive: true, force: true });
+  const cleanDirs = [TEMPDIR, path.dirname(TEMPDIR)];
+  for (const dir of cleanDirs) {
+    try {
+      for (const entry of fs.readdirSync(dir)) {
+        if (entry.startsWith('boxsh-') || entry.startsWith('.boxsh-try-')) {
+          const p = path.join(dir, entry);
+          // Overlayfs sets work directory permissions to 0000; chmod first.
+          spawnSync('chmod', ['-R', 'u+rwx', p]);
+          fs.rmSync(p, { recursive: true, force: true });
+        }
       }
-    }
-  } catch { /* best-effort */ }
+    } catch { /* best-effort */ }
+  }
 });
 
 // ---------------------------------------------------------------------------
