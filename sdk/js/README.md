@@ -198,7 +198,7 @@ Read file contents. `offset` is the 1-based start line; `limit` is the maximum n
 
 ### `client.write(path, content) → Promise<void>`
 
-Write a file (full replacement).
+Create a new file. Fails if the file already exists — use `edit` to modify existing files.
 
 ### `client.edit(path, edits) → Promise<{ diff, firstChangedLine }>`
 

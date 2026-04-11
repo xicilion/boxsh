@@ -12,6 +12,102 @@ import { BoxshClient } from '../src/client.mjs';
 import { getChanges, formatChanges } from '../src/changes.mjs';
 import { BOXSH } from './helpers.mjs';
 
+// =========================================================================
+// Tool error handling (no sandbox needed — tests run against bare boxsh)
+// =========================================================================
+
+describe('BoxshClient — tool error handling', () => {
+    /** @type {BoxshClient} */
+    let client;
+    const tmpDir = path.join(os.tmpdir(), `boxsh-sdk-errors-${Date.now()}`);
+
+    before(() => {
+        fs.mkdirSync(tmpDir, { recursive: true });
+        client = new BoxshClient({ boxshPath: BOXSH, workers: 1 });
+    });
+
+    after(async () => {
+        await client.close();
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    });
+
+    it('read() throws on missing file', async () => {
+        await assert.rejects(
+            () => client.read('/nonexistent/boxsh-test-file'),
+            (err) => {
+                assert.ok(err instanceof Error);
+                assert.match(err.message, /read:/);
+                return true;
+            },
+        );
+    });
+
+    it('write() creates a new file successfully', async () => {
+        const p = path.join(tmpDir, 'new-file.txt');
+        await client.write(p, 'hello\n');
+        assert.equal(fs.readFileSync(p, 'utf8'), 'hello\n');
+    });
+
+    it('write() throws on existing file', async () => {
+        const p = path.join(tmpDir, 'existing.txt');
+        fs.writeFileSync(p, 'original\n');
+        await assert.rejects(
+            () => client.write(p, 'overwrite\n'),
+            (err) => {
+                assert.ok(err instanceof Error);
+                assert.match(err.message, /already exists/);
+                return true;
+            },
+        );
+        // File must be unchanged.
+        assert.equal(fs.readFileSync(p, 'utf8'), 'original\n');
+    });
+
+    it('edit() throws on missing file', async () => {
+        await assert.rejects(
+            () => client.edit('/nonexistent/boxsh-test-file', [{ oldText: 'x', newText: 'y' }]),
+            (err) => {
+                assert.ok(err instanceof Error);
+                assert.match(err.message, /edit:/);
+                return true;
+            },
+        );
+    });
+
+    it('edit() throws when oldText not found', async () => {
+        const p = path.join(tmpDir, 'edit-notfound.txt');
+        fs.writeFileSync(p, 'hello\n');
+        await assert.rejects(
+            () => client.edit(p, [{ oldText: 'goodbye', newText: 'hi' }]),
+            (err) => {
+                assert.ok(err instanceof Error);
+                assert.match(err.message, /not found/);
+                return true;
+            },
+        );
+    });
+
+    it('edit() succeeds on valid replacement', async () => {
+        const p = path.join(tmpDir, 'edit-ok.txt');
+        fs.writeFileSync(p, 'hello world\n');
+        const result = await client.edit(p, [{ oldText: 'world', newText: 'earth' }]);
+        assert.equal(fs.readFileSync(p, 'utf8'), 'hello earth\n');
+        assert.ok(result.diff.includes('-hello world'));
+        assert.ok(result.diff.includes('+hello earth'));
+    });
+
+    it('exec() does not throw on non-zero exit code', async () => {
+        const result = await client.exec('exit 42');
+        assert.equal(result.exitCode, 42);
+    });
+
+    it('exec() returns stderr on failure', async () => {
+        const result = await client.exec('cat /nonexistent/boxsh-test-file');
+        assert.equal(result.exitCode, 1);
+        assert.ok(result.stderr.length > 0);
+    });
+});
+
 describe('BoxshClient — overlay sandbox', () => {
     const tmpDir  = path.join(os.tmpdir(), `boxsh-sdk-session-${Date.now()}`);
     const baseDir = path.join(tmpDir, 'project');

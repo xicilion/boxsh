@@ -28,11 +28,10 @@ function mcpBytes(input, opts = {}) {
   const r = spawnSync(BOXSH, ['--rpc', '--workers', String(opts.workers ?? 1)], {
     input: Buffer.from(input, 'utf8'),
     timeout: opts.timeout_ms ?? 5000,
-    encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
   });
   assert.equal(r.signal, null, `boxsh killed by signal ${r.signal}`);
-  return r.stdout;
+  return r.stdout; // Buffer — preserves byte offsets for Content-Length parsing
 }
 
 /** Build a Content-Length framed message from a JSON object. */
@@ -41,19 +40,22 @@ function frame(obj) {
   return `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
 }
 
-/** Parse Content-Length framed responses from raw output. */
+/** Parse Content-Length framed responses from raw Buffer output. */
 function parseFramedResponses(raw) {
+  // Work with Buffer throughout to match byte-based Content-Length values.
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw, 'utf8');
+  const SEP = Buffer.from('\r\n\r\n');
   const results = [];
   let pos = 0;
-  while (pos < raw.length) {
-    const hdrEnd = raw.indexOf('\r\n\r\n', pos);
+  while (pos < buf.length) {
+    const hdrEnd = buf.indexOf(SEP, pos);
     if (hdrEnd === -1) break;
-    const hdr = raw.slice(pos, hdrEnd);
+    const hdr = buf.slice(pos, hdrEnd).toString('utf8');
     const m = hdr.match(/Content-Length:\s*(\d+)/i);
     if (!m) break;
     const len = parseInt(m[1], 10);
     const bodyStart = hdrEnd + 4;
-    const body = raw.slice(bodyStart, bodyStart + len);
+    const body = buf.slice(bodyStart, bodyStart + len).toString('utf8');
     results.push(JSON.parse(body));
     pos = bodyStart + len;
   }

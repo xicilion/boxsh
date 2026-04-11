@@ -99,17 +99,19 @@ describe('tool — write', () => {
     } finally { fs.rmSync(p, { force: true }); }
   });
 
-  test('overwrites an existing file', () => {
+  test('writing to an existing file returns error', () => {
     const p = tmpFile('old content\n');
     try {
       const resp = rpc({ id: '1', tool: 'write', path: p, content: 'new content\n' });
-      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(fs.readFileSync(p, 'utf8'), 'new content\n');
+      assert.ok(resp.error, 'expected error for existing file');
+      assert.match(resp.error, /already exists/);
+      // File must be unchanged.
+      assert.equal(fs.readFileSync(p, 'utf8'), 'old content\n');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
   test('confirmation message mentions bytes written', () => {
-    const p = tmpFile('');
+    const p = path.join(os.tmpdir(), `boxsh-write-${process.pid}-${Math.random().toString(36).slice(2)}.txt`);
     try {
       const content = 'abc';
       const resp = rpc({ id: '1', tool: 'write', path: p, content });
@@ -208,6 +210,58 @@ describe('tool — protocol errors', () => {
   test('write tool missing content returns parse error', () => {
     const resp = rpc({ id: '1', tool: 'write', path: '/tmp/x' });
     assert.ok(resp.error, 'expected error for missing content');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isError consistency — all tool errors set isError: true in raw response
+// ---------------------------------------------------------------------------
+
+describe('tool — isError consistency', () => {
+  test('read missing file sets isError in raw response', () => {
+    const resp = rpc({ id: '1', tool: 'read', path: '/nonexistent/boxsh-test-file' });
+    assert.ok(resp.isError === true, 'expected isError to be true');
+    assert.ok(resp.error, 'expected error text');
+  });
+
+  test('write existing file sets isError in raw response', () => {
+    const p = tmpFile('existing\n');
+    try {
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: 'overwrite\n' });
+      assert.ok(resp.isError === true, 'expected isError to be true');
+      assert.ok(resp.error, 'expected error text');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('edit missing file sets isError in raw response', () => {
+    const resp = rpc({ id: '1', tool: 'edit', path: '/nonexistent/boxsh-test-file',
+      edits: [{ oldText: 'x', newText: 'y' }] });
+    assert.ok(resp.isError === true, 'expected isError to be true');
+    assert.ok(resp.error, 'expected error text');
+  });
+
+  test('edit missing oldText sets isError in raw response', () => {
+    const p = tmpFile('hello\n');
+    try {
+      const resp = rpc({ id: '1', tool: 'edit', path: p,
+        edits: [{ oldText: 'goodbye', newText: 'hi' }] });
+      assert.ok(resp.isError === true, 'expected isError to be true');
+      assert.ok(resp.error, 'expected error text');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('bash non-zero exit sets isError with structuredContent', () => {
+    const resp = rpc({ id: '1', cmd: 'exit 42' });
+    assert.ok(resp.isError === true, 'expected isError to be true');
+    assert.equal(resp.exit_code, 42);
+    assert.equal(typeof resp.duration_ms, 'number');
+  });
+
+  test('bash command failure sets isError with stderr', () => {
+    const resp = rpc({ id: '1', cmd: 'cat /nonexistent/boxsh-test-file' });
+    assert.ok(resp.isError === true, 'expected isError to be true');
+    assert.equal(resp.exit_code, 1);
+    assert.ok(resp.stderr.length > 0, 'expected non-empty stderr');
   });
 });
 

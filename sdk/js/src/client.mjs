@@ -100,6 +100,19 @@ export class BoxshClient {
     }
 
     /**
+     * Throw if the MCP CallToolResult indicates a tool execution error.
+     * @param {Record<string, unknown>} result
+     */
+    #checkToolError(result) {
+        if (result.isError) {
+            const text = Array.isArray(result.content)
+                ? result.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
+                : 'tool error';
+            throw new Error(text);
+        }
+    }
+
+    /**
      * Send a raw request and return the parsed response.
      * @param {Record<string, unknown>} req
      * @returns {Promise<Record<string, unknown>>}
@@ -164,20 +177,23 @@ export class BoxshClient {
             method: 'tools/call',
             params: { name: 'read', arguments: args },
         });
+        this.#checkToolError(result);
         return result.content[0].text;
     }
 
     /**
      * Write a file using boxsh's built-in write tool.
+     * Fails if the file already exists — use edit() to modify existing files.
      *
      * @param {string} filePath   Absolute path to the file
      * @param {string} content    Full file content to write
      */
     async write(filePath, content) {
-        await this.#send({
+        const result = await this.#send({
             method: 'tools/call',
             params: { name: 'write', arguments: { path: filePath, content } },
         });
+        this.#checkToolError(result);
     }
 
     /**
@@ -195,6 +211,7 @@ export class BoxshClient {
             method: 'tools/call',
             params: { name: 'edit', arguments: { path: filePath, edits } },
         });
+        this.#checkToolError(result);
         const sc = result.structuredContent ?? {};
         return {
             diff:             sc.diff ?? '',

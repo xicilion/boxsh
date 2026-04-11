@@ -314,8 +314,8 @@ static std::string mcp_tools_list_response(const json &id) {
     tools.push_back({
         {"name", "write"},
         {"description",
-         "Write content to a file. Creates the file if it doesn't exist, "
-         "overwrites if it does."},
+         "Create a new file with the given content. "
+         "Fails if the file already exists — use the edit tool to modify existing files."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
@@ -427,17 +427,31 @@ static RpcResponse tool_write(const RpcRequest &req) {
     resp.id   = req.id;
     resp.tool = ToolKind::Write;
 
-    std::ofstream f(req.path, std::ios::binary | std::ios::trunc);
-    if (!f) {
-        resp.error = std::string("write: cannot open file: ") + req.path +
-                     ": " + strerror(errno);
+    // O_CREAT | O_EXCL: atomic create-only — fails if the file already exists.
+    int fd = open(req.path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        if (errno == EEXIST)
+            resp.error = std::string("write: file already exists: ") + req.path;
+        else
+            resp.error = std::string("write: cannot create file: ") + req.path +
+                         ": " + strerror(errno);
         return resp;
     }
-    f << req.content;
-    if (!f) {
-        resp.error = std::string("write: failed writing to: ") + req.path;
-        return resp;
+
+    const char *data = req.content.data();
+    size_t remaining = req.content.size();
+    while (remaining > 0) {
+        ssize_t n = ::write(fd, data, remaining);
+        if (n < 0) {
+            close(fd);
+            resp.error = std::string("write: failed writing to: ") + req.path +
+                         ": " + strerror(errno);
+            return resp;
+        }
+        data += n;
+        remaining -= (size_t)n;
     }
+    close(fd);
     resp.tool_content = "written " + std::to_string(req.content.size()) + " bytes";
     return resp;
 }

@@ -183,12 +183,14 @@ Response (MCP `CallToolResult` format):
 
 `offset` (1-indexed start line) and `limit` (max lines) are optional. `structuredContent` includes `truncation: {truncated, line_count}`.
 
-#### `write` — Write a file
+#### `write` — Create a new file
 
 ```json
 {"jsonrpc":"2.0", "id":"3", "method":"tools/call",
  "params":{"name":"write", "arguments":{"path":"/tmp/hello.txt", "content":"hello\n"}}}
 ```
+
+Returns an error if the file already exists — use the `edit` tool to modify existing files.
 
 #### `edit` — Search-and-replace edit
 
