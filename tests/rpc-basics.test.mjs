@@ -179,6 +179,21 @@ describe('rpc — stdout/stderr capture', () => {
     assert.equal(resp.stdout.length, 65536);
     assert.ok(resp.stdout.split('').every(c => c === 'A'));
   });
+
+  test('stdout_truncated is absent when output fits', () => {
+    const resp = rpc({ id: 't', cmd: 'echo hello' });
+    assert.equal(resp.exit_code, 0);
+    assert.equal(resp.stdout_truncated, undefined);
+  });
+
+  test('stdout_truncated is true when output exceeds 10 MiB', () => {
+    // Generate ~11 MiB of output (11264 x 1024-byte lines).
+    const resp = rpc(
+      { id: 't', cmd: 'dd if=/dev/zero bs=1048576 count=11 2>/dev/null | tr "\\0" A' },
+      { timeout_ms: 30000 },
+    );
+    assert.equal(resp.stdout_truncated, true);
+  });
 });
 
 // ---------------------------------------------------------------------------

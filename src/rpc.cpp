@@ -216,6 +216,10 @@ std::string rpc_serialize_response(const RpcResponse &resp) {
                     {"stderr",      resp.stderr_data},
                     {"duration_ms", resp.duration_ms}
                 };
+                if (resp.stdout_truncated)
+                    sc["stdout_truncated"] = true;
+                if (resp.stderr_truncated)
+                    sc["stderr_truncated"] = true;
                 result["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
                 result["structuredContent"] = sc;
                 if (resp.exit_code != 0)
@@ -634,6 +638,10 @@ static std::string tool_read_json(const RpcRequest &req) {
         }
     } else {
         // Text mode: line-based reading with offset/limit.
+        // Default safety limits: 2000 lines AND 50KB, whichever triggers first.
+        static constexpr int    DEFAULT_MAX_LINES = 2000;
+        static constexpr size_t DEFAULT_MAX_BYTES = 50 * 1024;  // 50KB
+
         std::ifstream f(req.path);
         if (!f) {
             r["content"] = json::array({{{"type", "text"},
@@ -648,16 +656,31 @@ static std::string tool_read_json(const RpcRequest &req) {
         std::ostringstream out;
         int line_no   = 0;
         int start     = req.offset.value_or(1);
-        int max_lines = req.limit.value_or(INT_MAX);
+        int max_lines = req.limit.value_or(DEFAULT_MAX_LINES);
         int collected = 0;
+        size_t total_bytes = 0;
         bool truncated = false;
 
         while (std::getline(f, line)) {
             ++line_no;
             if (line_no < start) continue;
             if (collected >= max_lines) { truncated = true; break; }
+            size_t line_bytes = line.size() + 1;  // +1 for '\n'
+            if (collected > 0 && total_bytes + line_bytes > DEFAULT_MAX_BYTES) {
+                truncated = true;
+                break;
+            }
             out << line << '\n';
+            total_bytes += line_bytes;
             ++collected;
+        }
+
+        // Count remaining lines to get total_lines.
+        int total_lines = line_no;
+        if (truncated) {
+            while (std::getline(f, line))
+                ++line_no;
+            total_lines = line_no;
         }
 
         std::string text_content = out.str();
@@ -668,6 +691,10 @@ static std::string tool_read_json(const RpcRequest &req) {
             json sc = {{"content", text_content}, {"encoding", "text"},
                        {"mime_type", ft.mime}, {"line_count", collected},
                        {"truncated", truncated}};
+            if (truncated) {
+                sc["total_lines"] = total_lines;
+                sc["next_offset"] = start + collected;
+            }
             // content[].text = plain text for LLM readability.
             // structuredContent carries the same content + metadata for programmatic access.
             r["content"] = json::array({{{"type", "text"}, {"text", text_content}}});
@@ -694,6 +721,22 @@ static RpcResponse tool_write(const RpcRequest &req) {
 
     // O_CREAT | O_EXCL: atomic create-only — fails if the file already exists.
     int fd = open(req.path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0 && errno == ENOENT) {
+        // Auto-create parent directories (mkdir -p).
+        std::string dir = req.path;
+        auto slash = dir.rfind('/');
+        if (slash != std::string::npos && slash > 0) {
+            dir.resize(slash);
+            // Iteratively create directories from root to leaf.
+            for (size_t i = 1; i <= dir.size(); ++i) {
+                if (i == dir.size() || dir[i] == '/') {
+                    std::string part = dir.substr(0, i);
+                    mkdir(part.c_str(), 0755);  // ignore EEXIST
+                }
+            }
+            fd = open(req.path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+        }
+    }
     if (fd < 0) {
         if (errno == EEXIST)
             resp.error = std::string("write: file already exists: ") + req.path;
@@ -779,39 +822,139 @@ static RpcResponse tool_edit(const RpcRequest &req) {
     std::string content = buf.str();
     fin.close();
 
+    // BOM handling: strip UTF-8 BOM before matching, restore when writing.
+    static const std::string utf8_bom = "\xEF\xBB\xBF";
+    bool has_bom = (content.size() >= 3 && content.compare(0, 3, utf8_bom) == 0);
+    if (has_bom)
+        content.erase(0, 3);
+
+    // CRLF handling: normalize to LF for matching, restore when writing.
+    bool has_crlf = (content.find("\r\n") != std::string::npos);
+    if (has_crlf) {
+        std::string lf_content;
+        lf_content.reserve(content.size());
+        for (size_t i = 0; i < content.size(); ++i) {
+            if (content[i] == '\r' && i + 1 < content.size() && content[i + 1] == '\n')
+                continue;  // skip \r before \n
+            lf_content.push_back(content[i]);
+        }
+        content = std::move(lf_content);
+    }
+
     const std::string original = content;
 
     // Apply edits sequentially against the ORIGINAL content (per spec:
     // each edit matches original, not the result of previous edits).
     // To achieve this, collect all match positions in the original first,
     // then apply in reverse order.
-    struct Match { size_t pos; const EditOp *op; };
+    struct Match { size_t pos; size_t old_len; const EditOp *op; };
     std::vector<Match> matches;
     matches.reserve(req.edits.size());
+
+    // Helper: strip trailing whitespace from each line.
+    auto strip_trailing_ws = [](const std::string &s) -> std::string {
+        std::string result;
+        result.reserve(s.size());
+        size_t line_start = 0;
+        for (size_t i = 0; i <= s.size(); ++i) {
+            if (i == s.size() || s[i] == '\n') {
+                // Find end of non-whitespace in this line.
+                size_t end = i;
+                while (end > line_start && (s[end - 1] == ' ' || s[end - 1] == '\t'))
+                    --end;
+                result.append(s, line_start, end - line_start);
+                if (i < s.size()) result.push_back('\n');
+                line_start = i + 1;
+            }
+        }
+        return result;
+    };
+
+    // Helper: build a mapping from positions in stripped text to positions
+    // in the original text.  Each position in the stripped text corresponds
+    // to a position in the original text.
+    auto build_pos_map = [](const std::string &orig, const std::string &stripped)
+        -> std::vector<size_t> {
+        std::vector<size_t> map;
+        map.reserve(stripped.size() + 1);
+        size_t oi = 0;
+        for (size_t si = 0; si < stripped.size(); ++si) {
+            // Skip trailing whitespace that was removed.
+            if (stripped[si] == '\n') {
+                // In original, advance past trailing whitespace + newline.
+                while (oi < orig.size() && orig[oi] != '\n')
+                    ++oi;
+            }
+            map.push_back(oi);
+            ++oi;
+        }
+        map.push_back(oi); // sentinel for end position
+        return map;
+    };
 
     for (const auto &op : req.edits) {
         if (op.old_text.empty()) {
             resp.error = "edit: oldText must not be empty";
             return resp;
         }
-        size_t pos = content.find(op.old_text);
+        // Normalize oldText line endings to match content (already LF-normalized).
+        std::string old_normalized = op.old_text;
+        if (has_crlf) {
+            // Strip any \r\n → \n in oldText (LLMs may send either).
+            std::string tmp;
+            tmp.reserve(old_normalized.size());
+            for (size_t i = 0; i < old_normalized.size(); ++i) {
+                if (old_normalized[i] == '\r' && i + 1 < old_normalized.size() &&
+                    old_normalized[i + 1] == '\n')
+                    continue;
+                tmp.push_back(old_normalized[i]);
+            }
+            old_normalized = std::move(tmp);
+        }
+
+        // Try exact match first.
+        size_t pos = content.find(old_normalized);
+        size_t match_len = old_normalized.size();
+        bool fuzzy = false;
+
         if (pos == std::string::npos) {
-            resp.error = "edit: oldText not found in file: " + op.old_text.substr(0, 40);
-            return resp;
+            // Fuzzy: strip trailing whitespace from both, retry.
+            std::string stripped_content = strip_trailing_ws(content);
+            std::string stripped_old = strip_trailing_ws(old_normalized);
+            size_t spos = stripped_content.find(stripped_old);
+            if (spos == std::string::npos) {
+                resp.error = "edit: oldText not found in file: " +
+                             op.old_text.substr(0, 40);
+                return resp;
+            }
+            // Check uniqueness in stripped space.
+            if (stripped_content.find(stripped_old, spos + 1) != std::string::npos) {
+                resp.error = "edit: oldText is not unique in file: " +
+                             op.old_text.substr(0, 40);
+                return resp;
+            }
+            // Map stripped position back to original content position.
+            auto pos_map = build_pos_map(content, stripped_content);
+            pos = pos_map[spos];
+            size_t end_orig = pos_map[spos + stripped_old.size()];
+            match_len = end_orig - pos;
+            fuzzy = true;
+        } else {
+            // Check uniqueness for exact match.
+            if (content.find(old_normalized, pos + 1) != std::string::npos) {
+                resp.error = "edit: oldText is not unique in file: " +
+                             op.old_text.substr(0, 40);
+                return resp;
+            }
         }
-        // Check uniqueness.
-        if (content.find(op.old_text, pos + 1) != std::string::npos) {
-            resp.error = "edit: oldText is not unique in file: " + op.old_text.substr(0, 40);
-            return resp;
-        }
-        matches.push_back({pos, &op});
+        matches.push_back({pos, match_len, &op});
     }
 
     // Check for overlaps.
     std::sort(matches.begin(), matches.end(),
               [](const Match &a, const Match &b) { return a.pos < b.pos; });
     for (size_t i = 1; i < matches.size(); ++i) {
-        size_t prev_end = matches[i-1].pos + matches[i-1].op->old_text.size();
+        size_t prev_end = matches[i-1].pos + matches[i-1].old_len;
         if (matches[i].pos < prev_end) {
             resp.error = "edit: overlapping edits are not allowed";
             return resp;
@@ -819,8 +962,38 @@ static RpcResponse tool_edit(const RpcRequest &req) {
     }
 
     // Apply in reverse order so positions remain valid.
-    for (auto it = matches.rbegin(); it != matches.rend(); ++it)
-        content.replace(it->pos, it->op->old_text.size(), it->op->new_text);
+    // Normalize newText line endings: strip \r\n → \n (content is LF-normalized).
+    for (auto it = matches.rbegin(); it != matches.rend(); ++it) {
+        std::string new_text = it->op->new_text;
+        if (has_crlf) {
+            std::string tmp;
+            tmp.reserve(new_text.size());
+            for (size_t i = 0; i < new_text.size(); ++i) {
+                if (new_text[i] == '\r' && i + 1 < new_text.size() &&
+                    new_text[i + 1] == '\n')
+                    continue;
+                tmp.push_back(new_text[i]);
+            }
+            new_text = std::move(tmp);
+        }
+        content.replace(it->pos, it->old_len, new_text);
+    }
+
+    // Restore CRLF if the original file used it.
+    if (has_crlf) {
+        std::string crlf_content;
+        crlf_content.reserve(content.size() + content.size() / 10);
+        for (size_t i = 0; i < content.size(); ++i) {
+            if (content[i] == '\n')
+                crlf_content.push_back('\r');
+            crlf_content.push_back(content[i]);
+        }
+        content = std::move(crlf_content);
+    }
+
+    // Restore BOM if the original file had one.
+    if (has_bom)
+        content.insert(0, utf8_bom);
 
     // Write result.
     std::ofstream fout(req.path, std::ios::binary | std::ios::trunc);

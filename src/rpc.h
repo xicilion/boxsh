@@ -69,6 +69,8 @@ struct RpcResponse {
     std::string stdout_data;
     std::string stderr_data;
     uint64_t duration_ms = 0;
+    bool stdout_truncated = false;
+    bool stderr_truncated = false;
 
     // Built-in tool result
     std::string tool_content; // read: file text; write: confirmation

@@ -78,7 +78,11 @@ static void run_shell_command(const std::string &shell_path,
                               int timeout_sec,
                               std::string &stdout_out,
                               std::string &stderr_out,
-                              int &exit_code) {
+                              int &exit_code,
+                              bool &stdout_truncated,
+                              bool &stderr_truncated) {
+    stdout_truncated = false;
+    stderr_truncated = false;
     int pfd_out[2], pfd_err[2];
     if (pipe(pfd_out) != 0 || pipe(pfd_err) != 0) {
         exit_code = -1;
@@ -218,10 +222,13 @@ static void run_shell_command(const std::string &shell_path,
                 if (pfds[i].fd == pfd_out[0]) {
                     if (out_buf.size() < MAX_OUTPUT_BYTES)
                         out_buf.append(tmp, n);
-                    // else: discard — keep draining so child is not blocked
+                    else
+                        stdout_truncated = true;
                 } else {
                     if (err_buf.size() < MAX_OUTPUT_BYTES)
                         err_buf.append(tmp, n);
+                    else
+                        stderr_truncated = true;
                 }
             }
         }
@@ -308,18 +315,22 @@ static void worker_loop(int sock_fd, const std::string &shell_path) {
 
         std::string out, serr;
         int code = -1;
-        run_shell_command(shell_path, req.cmd, req.timeout_sec, out, serr, code);
+        bool out_trunc = false, err_trunc = false;
+        run_shell_command(shell_path, req.cmd, req.timeout_sec,
+                          out, serr, code, out_trunc, err_trunc);
 
         auto t1 = std::chrono::steady_clock::now();
         uint64_t ms = (uint64_t)std::chrono::duration_cast<
                           std::chrono::milliseconds>(t1 - t0).count();
 
         RpcResponse resp;
-        resp.id          = req.id;
-        resp.exit_code   = code;
-        resp.stdout_data = std::move(out);
-        resp.stderr_data = std::move(serr);
-        resp.duration_ms = ms;
+        resp.id                = req.id;
+        resp.exit_code         = code;
+        resp.stdout_data       = std::move(out);
+        resp.stderr_data       = std::move(serr);
+        resp.duration_ms       = ms;
+        resp.stdout_truncated  = out_trunc;
+        resp.stderr_truncated  = err_trunc;
 
         extern std::string rpc_serialize_response(const RpcResponse &);
         std::string r = rpc_serialize_response(resp);
@@ -414,6 +425,8 @@ static RpcResponse parse_worker_response(const std::string &payload,
         resp.stdout_data = sc.value("stdout",    "");
         resp.stderr_data = sc.value("stderr",    "");
         resp.duration_ms = sc.value("duration_ms", (uint64_t)0);
+        resp.stdout_truncated = sc.value("stdout_truncated", false);
+        resp.stderr_truncated = sc.value("stderr_truncated", false);
     } else if (result.value("isError", false)) {
         // Tool error without structuredContent (e.g. worker internal error).
         auto content = result.value("content", nlohmann::json::array());

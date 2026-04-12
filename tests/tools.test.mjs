@@ -114,6 +114,73 @@ describe('tool — read', () => {
     } finally { fs.rmSync(p, { force: true }); }
   });
 
+  test('truncated returns total_lines and next_offset', () => {
+    const lines = Array.from({ length: 100 }, (_, i) => `line${i + 1}`).join('\n') + '\n';
+    const p = tmpFile(lines);
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p, limit: 10 });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.truncated, true);
+      assert.equal(resp.line_count, 10);
+      assert.equal(resp.total_lines, 100);
+      assert.equal(resp.next_offset, 11);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('truncated with offset returns correct next_offset', () => {
+    const lines = Array.from({ length: 100 }, (_, i) => `line${i + 1}`).join('\n') + '\n';
+    const p = tmpFile(lines);
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p, offset: 20, limit: 10 });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.truncated, true);
+      assert.equal(resp.line_count, 10);
+      assert.equal(resp.total_lines, 100);
+      assert.equal(resp.next_offset, 30);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('non-truncated response has no total_lines or next_offset', () => {
+    const p = tmpFile('a\nb\nc\n');
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.truncated, false);
+      assert.equal(resp.total_lines, undefined);
+      assert.equal(resp.next_offset, undefined);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('default line limit truncates large files', () => {
+    // Generate 3000 lines — exceeds the 2000 default.
+    const lines = Array.from({ length: 3000 }, (_, i) => `L${i + 1}`).join('\n') + '\n';
+    const p = tmpFile(lines);
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.truncated, true);
+      assert.equal(resp.line_count, 2000);
+      assert.equal(resp.total_lines, 3000);
+      assert.equal(resp.next_offset, 2001);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('byte limit truncates before line limit', () => {
+    // Each line ~100 bytes → 600 lines ≈ 60KB, exceeds 50KB limit before 2000 lines.
+    const longLine = 'x'.repeat(99);
+    const lines = Array.from({ length: 600 }, () => longLine).join('\n') + '\n';
+    const p = tmpFile(lines);
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.truncated, true);
+      assert.ok(resp.line_count < 600, `expected fewer than 600 lines, got ${resp.line_count}`);
+      assert.ok(resp.line_count > 0, 'expected at least 1 line');
+      assert.equal(resp.total_lines, 600);
+      assert.equal(resp.next_offset, resp.line_count + 1);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
   test('reads binary image as metadata (truncated image)', () => {
     // Create a small PNG-like binary file (too small for stb to decode).
     const p = path.join(os.tmpdir(),
@@ -225,6 +292,29 @@ describe('tool — write', () => {
     assert.ok(resp.error, 'expected error for non-writable path');
     assert.match(resp.error, /write:/);
   });
+
+  test('write auto-creates parent directories', () => {
+    const base = path.join(os.tmpdir(), `boxsh-mkdir-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    const p = path.join(base, 'sub', 'dir', 'file.txt');
+    try {
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: 'hello\n' });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(fs.readFileSync(p, 'utf8'), 'hello\n');
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+
+  test('write auto-create dirs still rejects existing file', () => {
+    const base = path.join(os.tmpdir(), `boxsh-mkdir2-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    const p = path.join(base, 'file.txt');
+    try {
+      fs.mkdirSync(base, { recursive: true });
+      fs.writeFileSync(p, 'old\n');
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: 'new\n' });
+      assert.ok(resp.error, 'expected error for existing file');
+      assert.match(resp.error, /already exists/);
+      assert.equal(fs.readFileSync(p, 'utf8'), 'old\n');
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -288,6 +378,103 @@ describe('tool — edit', () => {
       edits: [{ oldText: 'x', newText: 'y' }] });
     assert.ok(resp.error, 'expected error for missing file');
     assert.match(resp.error, /edit:/);
+  });
+
+  test('edit CRLF file with LF oldText', () => {
+    const p = tmpFile(null);
+    fs.writeFileSync(p, 'hello\r\nworld\r\n', 'binary');
+    try {
+      const resp = rpc({ id: '1', tool: 'edit', path: p,
+        edits: [{ oldText: 'hello\nworld', newText: 'hi\nearth' }] });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      const result = fs.readFileSync(p, 'binary');
+      assert.equal(result, 'hi\r\nearth\r\n', 'CRLF should be preserved');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('edit CRLF file preserves line endings throughout', () => {
+    const p = tmpFile(null);
+    fs.writeFileSync(p, 'aaa\r\nbbb\r\nccc\r\n', 'binary');
+    try {
+      const resp = rpc({ id: '1', tool: 'edit', path: p,
+        edits: [{ oldText: 'bbb', newText: 'BBB' }] });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      const result = fs.readFileSync(p, 'binary');
+      assert.equal(result, 'aaa\r\nBBB\r\nccc\r\n');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('edit BOM file matches oldText without BOM', () => {
+    const p = tmpFile(null);
+    fs.writeFileSync(p, '\xEF\xBB\xBFhello world\n', 'binary');
+    try {
+      const resp = rpc({ id: '1', tool: 'edit', path: p,
+        edits: [{ oldText: 'hello', newText: 'hi' }] });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      const result = fs.readFileSync(p, 'binary');
+      assert.ok(result.startsWith('\xEF\xBB\xBF'), 'BOM should be preserved');
+      assert.equal(result, '\xEF\xBB\xBFhi world\n');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('edit BOM + CRLF file works correctly', () => {
+    const p = tmpFile(null);
+    fs.writeFileSync(p, '\xEF\xBB\xBFfoo\r\nbar\r\n', 'binary');
+    try {
+      const resp = rpc({ id: '1', tool: 'edit', path: p,
+        edits: [{ oldText: 'foo\nbar', newText: 'FOO\nBAR' }] });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      const result = fs.readFileSync(p, 'binary');
+      assert.equal(result, '\xEF\xBB\xBFFOO\r\nBAR\r\n');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('fuzzy match with trailing whitespace difference', () => {
+    const p = tmpFile(null);
+    // File has trailing spaces on lines.
+    fs.writeFileSync(p, 'hello   \nworld  \n');
+    try {
+      // oldText has no trailing whitespace — fuzzy should match.
+      const resp = rpc({ id: '1', tool: 'edit', path: p,
+        edits: [{ oldText: 'hello\nworld', newText: 'hi\nearth' }] });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      const result = fs.readFileSync(p, 'utf8');
+      assert.equal(result, 'hi\nearth\n');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('fuzzy match with tabs as trailing whitespace', () => {
+    const p = tmpFile(null);
+    fs.writeFileSync(p, 'aaa\t\nbbb\n');
+    try {
+      const resp = rpc({ id: '1', tool: 'edit', path: p,
+        edits: [{ oldText: 'aaa\nbbb', newText: 'AAA\nBBB' }] });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(fs.readFileSync(p, 'utf8'), 'AAA\nBBB\n');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('exact match preferred over fuzzy', () => {
+    const p = tmpFile('hello\nworld\n');
+    try {
+      // Exact match exists — should not need fuzzy.
+      const resp = rpc({ id: '1', tool: 'edit', path: p,
+        edits: [{ oldText: 'hello\nworld', newText: 'hi\nearth' }] });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(fs.readFileSync(p, 'utf8'), 'hi\nearth\n');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('fuzzy match still enforces uniqueness', () => {
+    const p = tmpFile(null);
+    // Two identical blocks after stripping whitespace.
+    fs.writeFileSync(p, 'dup  \ndup  \n');
+    try {
+      const resp = rpc({ id: '1', tool: 'edit', path: p,
+        edits: [{ oldText: 'dup', newText: 'unique' }] });
+      assert.ok(resp.error, 'expected uniqueness error');
+      assert.match(resp.error, /not unique/);
+    } finally { fs.rmSync(p, { force: true }); }
   });
 });
 
