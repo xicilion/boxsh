@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 #include <vector>
 
 #include <fcntl.h>
@@ -14,6 +15,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <dirent.h>
 
 namespace boxsh {
 
@@ -148,6 +150,13 @@ static std::string path_parent(const std::string &p) {
     size_t pos = p.rfind('/');
     if (pos == std::string::npos || pos == 0) return "/";
     return p.substr(0, pos);
+}
+
+// Return the last component of a path.
+static std::string path_basename(const std::string &p) {
+    size_t pos = p.rfind('/');
+    if (pos == std::string::npos) return p;
+    return p.substr(pos + 1);
 }
 
 // Mount a tmpfs at 'path', creating the directory if needed.
@@ -370,25 +379,55 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
             return res;
     }
 
-    // --- 7. COW bind mounts: overlayfs with auto-created workdir ---
-    // dst is used as the upperdir (captures writes); a sibling workdir is
-    // created automatically.  After the sandbox exits, dst on the host holds
-    // the upper layer so the caller can inspect changes.
+    // --- 7. COW bind mounts: overlayfs with deterministic workdir ---
+    // dst is used as the upperdir (captures writes); the workdir is placed
+    // at <parent>/.boxsh/<basename> so it lives inside the same filesystem
+    // and is cleaned up together with dst.  The deterministic path also
+    // prevents duplicate COW mounts on the same dst (overlayfs returns
+    // EBUSY when two mounts share a workdir).
+
+    // Lazy cleanup: scan .boxsh dirs and remove entries whose corresponding
+    // sibling directory no longer exists.
+    {
+        std::set<std::string> boxsh_parents;
+        for (const auto &bm : cfg.bind_mounts) {
+            if (bm.mode != BindMount::Mode::COW) continue;
+            boxsh_parents.insert(path_parent(bm.dst));
+        }
+        for (const auto &parent : boxsh_parents) {
+            std::string dotboxsh = parent + "/.boxsh";
+            DIR *d = opendir(dotboxsh.c_str());
+            if (!d) continue;
+            struct dirent *ent;
+            while ((ent = readdir(d)) != nullptr) {
+                if (ent->d_name[0] == '.') continue;
+                std::string sibling = parent + "/" + ent->d_name;
+                struct stat st;
+                if (stat(sibling.c_str(), &st) != 0) {
+                    // Sibling gone — remove stale workdir.
+                    std::string stale = dotboxsh + "/" + ent->d_name;
+                    // workdir may contain a kernel-created "work" subdir.
+                    rmdir((stale + "/work").c_str());
+                    rmdir(stale.c_str());
+                }
+            }
+            closedir(d);
+            // Remove .boxsh itself if now empty.
+            rmdir(dotboxsh.c_str());
+        }
+    }
+
     for (const auto &bm : cfg.bind_mounts) {
         if (bm.mode != BindMount::Mode::COW) continue;
 
         // Ensure upper layer directory exists on the host.
         if (!mkdir_p(bm.dst, 0755, res.error)) return res;
 
-        // Auto-create workdir as a sibling of dst (same filesystem as upper).
-        std::string work_tmpl = path_parent(bm.dst) + "/.boxsh-ovl-work-XXXXXX";
-        std::vector<char> work_buf(work_tmpl.begin(), work_tmpl.end());
-        work_buf.push_back('\0');
-        if (!mkdtemp(work_buf.data())) {
-            res.error = errno_str("mkdtemp for COW workdir");
-            return res;
-        }
-        std::string workdir(work_buf.data());
+        // Deterministic workdir: <parent>/.boxsh/<basename>
+        std::string parent = path_parent(bm.dst);
+        std::string name   = path_basename(bm.dst);
+        std::string workdir = parent + "/.boxsh/" + name;
+        if (!mkdir_p(workdir, 0755, res.error)) return res;
 
         if (!mount_overlay_at(bm.src, new_root + bm.dst, bm.dst, workdir,
                               new_root, res.error))

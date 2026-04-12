@@ -170,6 +170,123 @@ describe('sandbox — cow mounts', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Deterministic workdir and cleanup
+// ---------------------------------------------------------------------------
+
+describe('sandbox — cow workdir management',
+  { skip: process.platform === 'darwin' ? 'workdir management is Linux overlayfs only' : false },
+  () => {
+
+  test('workdir is created at <parent>/.boxsh/<basename>', () => {
+    const { src, dst, cleanup } = makeCowDirs();
+    try {
+      const resp = rpcCow(src, dst, 'echo ok');
+      assert.equal(resp.exit_code, 0);
+      const parent  = path.dirname(dst);
+      const name    = path.basename(dst);
+      const workdir = path.join(parent, '.boxsh', name);
+      assert.ok(fs.existsSync(workdir),
+        `expected workdir at ${workdir}`);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('stale workdir is cleaned up when sibling dst is removed', () => {
+    const base = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-cow-'));
+    const src  = path.join(base, 'src');
+    const dst1 = path.join(base, 'dst1');
+    const dst2 = path.join(base, 'dst2');
+    fs.mkdirSync(src);
+    fs.mkdirSync(dst1);
+    fs.mkdirSync(dst2);
+    const cleanup = () => {
+      spawnSync('chmod', ['-R', 'u+rwx', base]);
+      spawnSync('rm', ['-rf', base]);
+    };
+    try {
+      // Run a COW on dst1 to create its workdir.
+      rpcCow(src, dst1, 'echo ok');
+      const workdir1 = path.join(base, '.boxsh', 'dst1');
+      assert.ok(fs.existsSync(workdir1), 'workdir1 should exist after first run');
+
+      // Remove dst1 (simulating user cleanup), but leave stale .boxsh/dst1.
+      spawnSync('chmod', ['-R', 'u+rwx', dst1]);
+      fs.rmSync(dst1, { recursive: true, force: true });
+      assert.ok(fs.existsSync(workdir1), 'stale workdir1 still present before cleanup');
+
+      // Run a COW on dst2 in the same parent — triggers lazy cleanup.
+      rpcCow(src, dst2, 'echo ok');
+
+      // Stale workdir1 should have been removed.
+      assert.ok(!fs.existsSync(workdir1),
+        'stale workdir1 should be cleaned up');
+      // dst2 workdir should exist.
+      assert.ok(fs.existsSync(path.join(base, '.boxsh', 'dst2')),
+        'workdir2 should exist');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('workdir is deterministic and reused across runs', () => {
+    const { src, dst, cleanup } = makeCowDirs();
+    try {
+      // First run.
+      rpcCow(src, dst, 'echo first');
+      const parent  = path.dirname(dst);
+      const name    = path.basename(dst);
+      const workdir = path.join(parent, '.boxsh', name);
+      assert.ok(fs.existsSync(workdir), 'workdir should exist after first run');
+
+      // Second run reuses the same workdir path (no random suffix).
+      rpcCow(src, dst, 'echo second');
+      assert.ok(fs.existsSync(workdir), 'workdir should still exist after second run');
+
+      // No stale random-suffix workdirs should appear.
+      const siblings = fs.readdirSync(parent).filter(e => e.startsWith('.boxsh-ovl-'));
+      assert.equal(siblings.length, 0,
+        `no random workdirs should exist, got: [${siblings}]`);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('.boxsh dir is removed when all workdirs are cleaned up', () => {
+    const base = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-cow-'));
+    const src  = path.join(base, 'src');
+    const dst  = path.join(base, 'only');
+    fs.mkdirSync(src);
+    fs.mkdirSync(dst);
+    const cleanup = () => {
+      spawnSync('chmod', ['-R', 'u+rwx', base]);
+      spawnSync('rm', ['-rf', base]);
+    };
+    try {
+      // Create a workdir for "only".
+      rpcCow(src, dst, 'echo ok');
+      const dotboxsh = path.join(base, '.boxsh');
+      assert.ok(fs.existsSync(dotboxsh), '.boxsh should exist');
+
+      // Remove dst, leaving stale .boxsh/only.
+      spawnSync('chmod', ['-R', 'u+rwx', dst]);
+      fs.rmSync(dst, { recursive: true, force: true });
+
+      // Create a new dst2 to trigger cleanup in the same parent.
+      const dst2 = path.join(base, 'dst2');
+      fs.mkdirSync(dst2);
+      rpcCow(src, dst2, 'echo ok');
+
+      // Stale "only" workdir should be gone.
+      assert.ok(!fs.existsSync(path.join(dotboxsh, 'only')),
+        'stale workdir should be removed');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // CWD inside the COW src directory
 //
 // When the process CWD is within the COW src, sandbox_apply() redirects CWD
