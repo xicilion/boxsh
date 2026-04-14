@@ -14,7 +14,7 @@ namespace boxsh {
 // ---------------------------------------------------------------------------
 
 enum class ToolKind { None, Read, Write, Edit,
-    TerminalRun, TerminalSend, TerminalKill, TerminalList };
+    TerminalRun, TerminalSend, TerminalOutput, TerminalKill, TerminalList };
 
 struct EditOp {
     std::string old_text;

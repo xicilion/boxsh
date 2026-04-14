@@ -51,9 +51,14 @@ export interface RunInTerminalOptions {
     rows?: number;
 }
 
-export interface RunInTerminalResult {
-    id: string;
+export interface TerminalOutputResult {
     output: string;
+    exited: boolean;
+    exitCode: number | null;
+}
+
+export interface RunInTerminalResult extends TerminalOutputResult {
+    id: string;
 }
 
 export interface Change {
@@ -68,7 +73,8 @@ export class BoxshClient {
     write(filePath: string, content: string): Promise<void>;
     edit(filePath: string, edits: EditOperation[]): Promise<EditResult>;
     runInTerminal(command: string, opts?: RunInTerminalOptions): Promise<RunInTerminalResult>;
-    sendToTerminal(id: string, command: string): Promise<void>;
+    sendToTerminal(id: string, command: string): Promise<TerminalOutputResult>;
+    getTerminalOutput(id: string): Promise<TerminalOutputResult>;
     killTerminal(id: string): Promise<string>;
     listTerminals(): Promise<TerminalSession[]>;
     close(): Promise<void>;

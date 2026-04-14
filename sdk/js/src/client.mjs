@@ -240,7 +240,7 @@ export class BoxshClient {
      * @param {string} [opts.goal]         What you intend to accomplish
      * @param {number} [opts.cols]         Terminal columns (default: 220)
      * @param {number} [opts.rows]         Terminal rows (default: 50)
-     * @returns {Promise<{ id: string, output: string }>}
+     * @returns {Promise<{ id: string, output: string, exited: boolean, exitCode: number|null }>}
      */
     async runInTerminal(command, opts = {}) {
         const args = { command };
@@ -255,15 +255,21 @@ export class BoxshClient {
         });
         this.#checkToolError(result);
         const sc = result.structuredContent ?? {};
-        return { id: sc.id ?? '', output: sc.output ?? '' };
+        return {
+            id:       sc.id ?? '',
+            output:   sc.output ?? '',
+            exited:   sc.exited ?? false,
+            exitCode: sc.exit_code ?? null,
+        };
     }
 
     /**
-     * Send text to a terminal session's PTY stdin.
+     * Send text to a terminal session's PTY stdin, then wait up to 500ms for
+     * new output.
      *
      * @param {string} id        Session id
      * @param {string} command   Text to write (append \n for execution)
-     * @returns {Promise<void>}
+     * @returns {Promise<{ output: string, exited: boolean, exitCode: number|null }>}
      */
     async sendToTerminal(id, command) {
         const result = await this.#send({
@@ -271,6 +277,32 @@ export class BoxshClient {
             params: { name: 'send_to_terminal', arguments: { id, command } },
         });
         this.#checkToolError(result);
+        const sc = result.structuredContent ?? {};
+        return {
+            output:   sc.output ?? '',
+            exited:   sc.exited ?? false,
+            exitCode: sc.exit_code ?? null,
+        };
+    }
+
+    /**
+     * Wait up to 500ms for new output from a terminal session.
+     *
+     * @param {string} id   Session id
+     * @returns {Promise<{ output: string, exited: boolean, exitCode: number|null }>}
+     */
+    async getTerminalOutput(id) {
+        const result = await this.#send({
+            method: 'tools/call',
+            params: { name: 'get_terminal_output', arguments: { id } },
+        });
+        this.#checkToolError(result);
+        const sc = result.structuredContent ?? {};
+        return {
+            output:   sc.output ?? '',
+            exited:   sc.exited ?? false,
+            exitCode: sc.exit_code ?? null,
+        };
     }
 
     /**

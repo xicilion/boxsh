@@ -155,10 +155,17 @@ static void reader_thread_fn(std::shared_ptr<TerminalSession> s) {
         ssize_t n = read(s->fd_master, buf, sizeof(buf));
         if (n <= 0) {
             // PTY master closed (child exited or error).
+            // Reclaim system resources immediately regardless of how the
+            // process ended (natural exit or SIGHUP from terminal_kill).
             int status = 0;
             waitpid(s->child_pid, &status, 0);
             {
                 std::lock_guard<std::mutex> lk(s->mu);
+                // Guard: terminal_kill may have already closed fd_master.
+                if (s->fd_master >= 0) {
+                    close(s->fd_master);
+                    s->fd_master = -1;
+                }
                 s->exited    = true;
                 s->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
                 s->generation++;
@@ -264,10 +271,9 @@ TerminalCreateResult terminal_create(const std::string &command,
     s->reader_thread = std::thread(reader_thread_fn, s);
     s->reader_thread.detach();
 
-    // Wait briefly for initial output.
-    std::string initial = wait_for_output(s, initial_wait_ms);
-
-    return {s->id, initial};
+    // Wait briefly for initial output, then return full status.
+    auto out = terminal_output(s->id, initial_wait_ms);
+    return {s->id, out.output, out.exited, out.exit_code};
 }
 
 void terminal_send(const std::string &id, const std::string &text) {
@@ -287,14 +293,29 @@ void terminal_send(const std::string &id, const std::string &text) {
     }
 }
 
+TerminalOutputResult terminal_output(const std::string &id, int wait_ms) {
+    auto s = TerminalManager::instance().get(id);
+    if (!s) throw std::runtime_error("unknown terminal session: " + id);
+    std::string snap = wait_for_output(s, wait_ms);
+    std::lock_guard<std::mutex> lk(s->mu);
+    return {snap, s->exited, s->exit_code};
+}
+
 std::string terminal_kill(const std::string &id) {
     auto s = TerminalManager::instance().get(id);
     if (!s) throw std::runtime_error("unknown terminal session: " + id);
 
-    // Signal and close PTY master to trigger EOF in reader thread.
+    // Signal the child, then close fd_master to force EOF in the reader
+    // thread (guards against the child ignoring SIGHUP).  The reader thread
+    // may have already closed fd_master if the child exited naturally first.
     kill(s->child_pid, SIGHUP);
-    close(s->fd_master);
-    s->fd_master = -1;
+    {
+        std::lock_guard<std::mutex> lk(s->mu);
+        if (s->fd_master >= 0) {
+            close(s->fd_master);
+            s->fd_master = -1;
+        }
+    }
 
     // Wait for reader thread to mark exited.
     {

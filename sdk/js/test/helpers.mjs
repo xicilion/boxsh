@@ -12,8 +12,8 @@ const __dir = path.dirname(fileURLToPath(import.meta.url));
  * Resolution order: BOXSH env var → build/boxsh.
  */
 function findBoxsh() {
-    if (process.env['BOXSH']) return process.env['BOXSH'];
-    return path.resolve(__dir, '../../../build/boxsh');
+    const p = process.env['BOXSH'] ?? path.join(__dir, '../../../build/boxsh');
+    return path.resolve(p);
 }
 
 export const BOXSH = findBoxsh();

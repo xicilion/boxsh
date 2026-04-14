@@ -15,8 +15,9 @@ import { fileURLToPath } from 'node:url';
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 
 /** Absolute path to the boxsh binary. Override with BOXSH env-var. */
-export const BOXSH =
-  process.env.BOXSH ?? path.resolve(__dir, '../build/boxsh');
+export const BOXSH = path.resolve(
+  process.env.BOXSH ?? path.join(__dir, '../build/boxsh'),
+);
 
 /**
  * Workspace temp dir — lives under $HOME on the same XFS volume, so newly

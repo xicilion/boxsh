@@ -3,7 +3,7 @@
  *
  * Reads fixture files via boxsh `read` tool and asserts the returned
  * `mime_type` matches expected values.  Fixture files come from the
- * npm `file-type` project and live in temp/fixture/.
+ * npm `file-type` project and live in ./fixture/.
  *
  * Only formats that file_type.cpp actually detects are tested here.
  * Unsupported formats are expected to return "application/octet-stream".
@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { rpc } from './helpers.mjs';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
-const FIXTURE = path.resolve(__dir, '../temp/fixture');
+const FIXTURE = path.resolve(__dir, 'fixture');
 
 // -----------------------------------------------------------------------
 // Mapping: fixture file → expected MIME type

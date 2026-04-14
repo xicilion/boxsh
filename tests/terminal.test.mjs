@@ -114,12 +114,16 @@ describe('terminal — run_in_terminal', () => {
     }
   });
 
-  test('returns initial output string', async () => {
+  test('returns initial output string and exit status', async () => {
     const s = new BoxshSession();
     try {
       const resp = await s.call('run_in_terminal', { command: 'echo ready' });
       const sc = BoxshSession.sc(resp);
       assert.equal(typeof sc.output, 'string', 'output should be a string');
+      assert.equal(typeof sc.exited, 'boolean', 'exited should be a boolean');
+      // exit_code is a number when exited, null otherwise
+      assert.ok(sc.exited ? typeof sc.exit_code === 'number' : sc.exit_code === null,
+        'exit_code should be number when exited, null otherwise');
     } finally {
       await s.close();
     }
@@ -142,7 +146,7 @@ describe('terminal — run_in_terminal', () => {
 // ---------------------------------------------------------------------------
 
 describe('terminal — send + kill', () => {
-  test('send_to_terminal succeeds for live session', async () => {
+  test('send_to_terminal returns output/exited/exit_code', async () => {
     const s = new BoxshSession();
     try {
       const runResp = await s.call('run_in_terminal', { command: 'bash' });
@@ -150,7 +154,10 @@ describe('terminal — send + kill', () => {
 
       const sendResp = await s.call('send_to_terminal', { id, command: 'echo hi\n' });
       const sc = BoxshSession.sc(sendResp);
-      assert.equal(sc.ok, true);
+      assert.equal(typeof sc.output, 'string', 'output should be a string');
+      assert.equal(typeof sc.exited, 'boolean', 'exited should be a boolean');
+      assert.ok(sc.exited ? typeof sc.exit_code === 'number' : sc.exit_code === null,
+        'exit_code should be number when exited, null otherwise');
 
       await s.call('kill_terminal', { id });
     } finally {
@@ -190,6 +197,59 @@ describe('terminal — send + kill', () => {
       const resp = await s.call('send_to_terminal', {
         id: '00000000-0000-4000-8000-000000000000',
         command: 'echo x\n',
+      });
+      assert.ok(resp.result?.isError, 'expected isError for unknown session');
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// get_terminal_output
+// ---------------------------------------------------------------------------
+
+describe('terminal — get_terminal_output', () => {
+  test('returns output/exited/exit_code for live session', async () => {
+    const s = new BoxshSession();
+    try {
+      const { id } = BoxshSession.sc(await s.call('run_in_terminal', { command: 'bash' }));
+      const sc = BoxshSession.sc(await s.call('get_terminal_output', { id }));
+      assert.equal(typeof sc.output, 'string');
+      assert.equal(sc.exited, false);
+      assert.strictEqual(sc.exit_code, null);
+      await s.call('kill_terminal', { id });
+    } finally {
+      await s.close();
+    }
+  });
+
+  test('reflects exited=true after process exits', async () => {
+    const s = new BoxshSession();
+    try {
+      const { id } = BoxshSession.sc(
+        await s.call('run_in_terminal', { command: 'true' })
+      );
+      // Poll until exited or give up after several attempts
+      let sc;
+      for (let i = 0; i < 10; i++) {
+        sc = BoxshSession.sc(await s.call('get_terminal_output', { id }));
+        if (sc.exited) break;
+      }
+      assert.ok(sc.exited, 'process should have exited');
+      assert.equal(typeof sc.exit_code, 'number');
+      assert.equal(sc.exit_code, 0);
+      await s.call('kill_terminal', { id });
+    } finally {
+      await s.close();
+    }
+  });
+
+  test('on unknown id returns isError', async () => {
+    const s = new BoxshSession();
+    try {
+      const resp = await s.call('get_terminal_output', {
+        id: '00000000-0000-4000-8000-000000000000',
       });
       assert.ok(resp.result?.isError, 'expected isError for unknown session');
     } finally {

@@ -23,10 +23,13 @@ describe('BoxshClient — terminal tools', () => {
         await client.close();
     });
 
-    it('runInTerminal returns id and output', async () => {
-        const { id, output } = await client.runInTerminal('echo sdk_test_123');
+    it('runInTerminal returns id, output, exited, exitCode', async () => {
+        const { id, output, exited, exitCode } = await client.runInTerminal('echo sdk_test_123');
         assert.match(id, UUID_RE, `id should be UUID v4: ${id}`);
         assert.equal(typeof output, 'string');
+        assert.equal(typeof exited, 'boolean');
+        assert.ok(exited ? typeof exitCode === 'number' : exitCode === null,
+            'exitCode should be number when exited, null otherwise');
     });
 
     it('listTerminals returns active session after runInTerminal', async () => {
@@ -45,14 +48,55 @@ describe('BoxshClient — terminal tools', () => {
         }
     });
 
-    it('sendToTerminal writes to PTY stdin', async () => {
+    it('sendToTerminal returns output/exited/exitCode', async () => {
         const { id } = await client.runInTerminal('bash');
         try {
-            // Should not throw
-            await client.sendToTerminal(id, 'echo hello\n');
+            const result = await client.sendToTerminal(id, 'echo hello\n');
+            assert.equal(typeof result.output, 'string');
+            assert.equal(typeof result.exited, 'boolean');
+            assert.ok(result.exited ? typeof result.exitCode === 'number' : result.exitCode === null,
+                'exitCode should be number when exited, null otherwise');
         } finally {
             await client.killTerminal(id);
         }
+    });
+
+    it('getTerminalOutput returns output/exited/exitCode for live session', async () => {
+        const { id } = await client.runInTerminal('bash');
+        try {
+            const result = await client.getTerminalOutput(id);
+            assert.equal(typeof result.output, 'string');
+            assert.equal(result.exited, false);
+            assert.strictEqual(result.exitCode, null);
+        } finally {
+            await client.killTerminal(id);
+        }
+    });
+
+    it('getTerminalOutput reflects exited=true after process exits', async () => {
+        const { id } = await client.runInTerminal('true');
+        try {
+            let result;
+            for (let i = 0; i < 10; i++) {
+                result = await client.getTerminalOutput(id);
+                if (result.exited) break;
+            }
+            assert.ok(result.exited, 'process should have exited');
+            assert.equal(result.exitCode, 0);
+        } finally {
+            await client.killTerminal(id);
+        }
+    });
+
+    it('getTerminalOutput on unknown id throws', async () => {
+        await assert.rejects(
+            () => client.getTerminalOutput('00000000-0000-4000-8000-000000000000'),
+            (err) => {
+                assert.ok(err instanceof Error);
+                assert.match(err.message, /unknown/i);
+                return true;
+            },
+        );
     });
 
     it('killTerminal returns final snapshot', async () => {
