@@ -819,8 +819,8 @@ boxsh supports two transports, auto-detected from the first bytes:
 |---|---|
 | `initialize` | Returns server capabilities and protocol version |
 | `notifications/initialized` | Acknowledged silently (no response) |
-| `tools/list` | Returns the four tools with `inputSchema`, `outputSchema`, and `annotations` |
-| `tools/call` | Dispatches to a named tool: `bash`, `read`, `write`, `edit` |
+| `tools/list` | Returns all nine tools with `inputSchema` and `annotations` |
+| `tools/call` | Dispatches to a named tool: `bash`, `read`, `write`, `edit`, `run_in_terminal`, `send_to_terminal`, `get_terminal_output`, `kill_terminal`, `list_terminals` |
 
 #### Shell Commands
 
@@ -857,7 +857,7 @@ echo '{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"bash","a
 
 Three file-operation tools are available via `tools/call`. They run on background threads and do not occupy a worker slot.
 
-**`read`** — Read a file, optionally restricting to a line range.
+**`read`** — Read a file. Text files support `offset`/`limit` for slicing. Binary files are automatically detected and returned as base64 with MIME type.
 
 ```sh
 # Read entire file
@@ -869,12 +869,12 @@ echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"read","a
 
 | Argument | Type | Default | Description |
 |---|---|---|---|
-| `offset` | number | 1 | 1-based start line |
-| `limit` | number | unlimited | Maximum lines to return |
+| `offset` | number | 1 | 1-based start line (text only) |
+| `limit` | number | unlimited | Maximum lines to return (text only) |
 
-`structuredContent` includes truncation info: `{"truncation": {"truncated": false, "line_count": 24}}`.
+`structuredContent` includes: `content`, `encoding` (`"text"` or `"base64"`), `mime_type`, and `truncated`/`line_count` (text) or `size` (binary).
 
-**`write`** — Create or overwrite a file.
+**`write`** — Create or overwrite a file. Parent directories are created automatically.
 
 ```sh
 echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"write","arguments":{"path":"/tmp/hello.txt","content":"hello\n"}}}' | boxsh --rpc
@@ -930,6 +930,33 @@ Output (fast completes first):
 ```
 
 Tool requests and shell commands can be interleaved — tools do not occupy a worker.
+
+#### Terminal Tools
+
+Five terminal tools manage persistent PTY sessions. They run on background threads and do not occupy a worker slot.
+
+**`run_in_terminal`** — Start a PTY session.
+
+```sh
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"run_in_terminal","arguments":{"command":"bash"}}}' | boxsh --rpc
+# → structuredContent: { id: "<session-id>", output: "...", exited: false, exit_code: null }
+```
+
+**`send_to_terminal`** — Write to stdin and get updated screen output.
+
+```sh
+echo '{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"send_to_terminal","arguments":{"id":"<id>","command":"ls -la\n"}}}' | boxsh --rpc
+```
+
+**`get_terminal_output`** — Poll for new output (up to 500 ms).
+
+```sh
+echo '{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"get_terminal_output","arguments":{"id":"<id>"}}}' | boxsh --rpc
+```
+
+**`kill_terminal`** — Terminate session and free resources.
+
+**`list_terminals`** — List all active sessions.
 
 #### Timeout
 
@@ -1125,8 +1152,8 @@ const client = new BoxshClient({
 // Run commands inside the sandbox
 await client.exec('npm install', dst);
 
-// Read/write files via built-in tools (no shell round-trip)
-const pkg = await client.read(`${dst}/package.json`);
+# Read/write files via built-in tools (no shell round-trip)
+const { content } = await client.read(`${dst}/package.json`);
 await client.write(`${dst}/notes.txt`, 'done\n');
 
 // Edit files with search-and-replace
@@ -1178,9 +1205,14 @@ await client.close();
 | Method | Returns | Description |
 |---|---|---|
 | `exec(cmd, cwd?, timeout?)` | `{ exitCode, stdout, stderr }` | Run a shell command |
-| `read(path, offset?, limit?)` | `string` | Read file content |
-| `write(path, content)` | `void` | Write/overwrite a file |
+| `read(path, offset?, limit?)` | `ReadResult` | Read file content (text or binary) |
+| `write(path, content)` | `void` | Create or overwrite a file |
 | `edit(path, edits)` | `{ diff, firstChangedLine }` | Search-and-replace edit |
+| `runInTerminal(cmd, opts?)` | `{ id, output, exited, exitCode }` | Start a PTY session |
+| `sendToTerminal(id, cmd)` | `{ output, exited, exitCode }` | Send to PTY and get screen |
+| `getTerminalOutput(id)` | `{ output, exited, exitCode }` | Poll PTY output |
+| `killTerminal(id)` | `string` | Kill session, return final screen |
+| `listTerminals()` | `TerminalSession[]` | List active sessions |
 | `close()` | `void` | Graceful shutdown |
 | `terminate()` | `void` | Kill immediately |
 

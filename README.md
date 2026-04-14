@@ -19,10 +19,10 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 
 | Feature | Details |
 |---|---|
-| **MCP server** | Implements MCP (Model Context Protocol) over stdio with Content-Length framing or newline-delimited JSON. Four tools: `bash`, `read`, `write`, `edit` — each with `inputSchema`, `outputSchema`, and `annotations`. |
-| **OS-native sandbox** | Linux: user/mount/network namespaces via direct syscalls; macOS: Seatbelt (sandbox_init) + SBPL profiles — no external tools required |
+| **MCP server** | Implements MCP (Model Context Protocol) over stdio with Content-Length framing or newline-delimited JSON. Nine tools: `bash`, `read`, `write`, `edit`, `run_in_terminal`, `send_to_terminal`, `get_terminal_output`, `kill_terminal`, `list_terminals` — each with `inputSchema` and `annotations`. |
+| **OS-native sandbox** | Linux: user/mount/PID/network namespaces via direct syscalls + seccomp syscall filtering; macOS: Seatbelt (sandbox_init) + SBPL profiles — no external tools required |
 | **Overlay filesystem** | Copy-on-write workspace over any read-only base; writes accumulate in a caller-managed destination directory and persist between commands |
-| **Built-in file tools** | `read` (with offset/limit), `write`, and `edit` (multi-replacement with unified diff) run on background threads — the event loop is never blocked |
+| **Built-in file tools** | `read` (text with offset/limit, binary as base64 with MIME detection), `write` (create or overwrite, auto-creates parent dirs), and `edit` (multi-replacement with unified diff) run on background threads — the event loop is never blocked |
 | **JSON-RPC 2.0** | Dual transport: Content-Length framed (LSP-style) or newline-delimited JSON over stdin/stdout |
 | **Pre-forked worker pool** | Configurable number of workers (`--workers N`); each worker is forked once and reused across requests |
 | **Crash recovery** | If a worker is killed (timeout, segfault, OOM), the coordinator detects `POLLHUP`, returns an error response, and immediately respawns a replacement |
@@ -149,7 +149,7 @@ boxsh supports two JSON-RPC 2.0 transports, auto-detected from the first bytes:
 |---|---|
 | `initialize` | Returns server capabilities and protocol version |
 | `notifications/initialized` | Acknowledged silently (no response) |
-| `tools/list` | Returns the four tools with `inputSchema`, `outputSchema`, and `annotations` |
+| `tools/list` | Returns all nine tools with `inputSchema` and `annotations` |
 | `tools/call` | Dispatches to a named tool: `bash`, `read`, `write`, `edit` |
 
 ### Tools
@@ -181,16 +181,16 @@ Response (MCP `CallToolResult` format):
  "params":{"name":"read", "arguments":{"path":"/etc/hostname", "offset":1, "limit":10}}}
 ```
 
-`offset` (1-indexed start line) and `limit` (max lines) are optional. `structuredContent` includes `truncation: {truncated, line_count}`.
+`offset` (1-indexed start line) and `limit` (max lines) are optional for text files. Binary files are automatically detected and returned as base64 with `encoding: "base64"` and a `mime_type` field. `structuredContent` includes `truncated` and `line_count` (text) or `size` (binary).
 
-#### `write` — Create a new file
+#### `write` — Create or overwrite a file
 
 ```json
 {"jsonrpc":"2.0", "id":"3", "method":"tools/call",
  "params":{"name":"write", "arguments":{"path":"/tmp/hello.txt", "content":"hello\n"}}}
 ```
 
-Returns an error if the file already exists — use the `edit` tool to modify existing files.
+Creates or overwrites the file. Parent directories are created automatically if needed.
 
 #### `edit` — Search-and-replace edit
 
@@ -201,6 +201,51 @@ Returns an error if the file already exists — use the `edit` tool to modify ex
 ```
 
 Each `oldText` must appear exactly once in the original file. Edits must not overlap. `structuredContent` includes `diff` (unified diff) and `firstChangedLine`.
+
+#### `run_in_terminal` — Start a persistent PTY session
+
+```json
+{"jsonrpc":"2.0", "id":"5", "method":"tools/call",
+ "params":{"name":"run_in_terminal", "arguments":{"command":"bash"}}}
+```
+
+Starts a PTY session running the given command. Returns `{ id, output, exited, exit_code }` — `id` is used by the other terminal tools.
+
+#### `send_to_terminal` — Send input to a PTY session
+
+```json
+{"jsonrpc":"2.0", "id":"6", "method":"tools/call",
+ "params":{"name":"send_to_terminal", "arguments":{"id":"<session-id>", "command":"ls -la\n"}}}
+```
+
+Writes text to the session's stdin, waits up to 500 ms, and returns the updated screen snapshot with `{ output, exited, exit_code }`.
+
+#### `get_terminal_output` — Poll for new output
+
+```json
+{"jsonrpc":"2.0", "id":"7", "method":"tools/call",
+ "params":{"name":"get_terminal_output", "arguments":{"id":"<session-id>"}}}
+```
+
+Waits up to 500 ms for new output, then returns the current screen snapshot. Use this to poll long-running commands until `exited` is `true`.
+
+#### `kill_terminal` — Terminate a PTY session
+
+```json
+{"jsonrpc":"2.0", "id":"8", "method":"tools/call",
+ "params":{"name":"kill_terminal", "arguments":{"id":"<session-id>"}}}
+```
+
+Sends SIGHUP, drains output, and frees resources. Returns the final screen snapshot.
+
+#### `list_terminals` — List active sessions
+
+```json
+{"jsonrpc":"2.0", "id":"9", "method":"tools/call",
+ "params":{"name":"list_terminals", "arguments":{}}}
+```
+
+Returns metadata for all live and recently-exited sessions.
 
 ### Error model
 
@@ -325,7 +370,7 @@ printf '%s\n' \
 # "fast" response arrives first, then "slow"
 ```
 
-File tool requests (`read`, `write`, `edit`) run on background threads and do not occupy a worker slot.
+File tool requests (`read`, `write`, `edit`) and terminal tool requests run on background threads and do not occupy a worker slot.
 
 ---
 
@@ -385,7 +430,7 @@ boxsh --sandbox --bind wr:/data -c 'ls /'
 
 | Platform | Sandbox mechanism | COW mechanism |
 |---|---|---|
-| Linux | User/mount namespaces (`unshare`, `pivot_root`) | overlayfs (kernel ≥ 5.11 for user-ns) |
+| Linux | User/mount/PID namespaces + seccomp syscall filter | overlayfs (kernel ≥ 5.11 for user-ns) |
 | macOS | Seatbelt (`sandbox_init` + SBPL) | `clonefile(2)` on APFS |
 
 No external tools such as `bwrap` or `newuidmap` are required on any platform.
@@ -457,13 +502,18 @@ boxsh/
 │   ├── rpc.h / rpc.cpp       JSON-RPC 2.0 protocol, MCP handlers, built-in tools, poll(2) event loop
 │   ├── worker_pool.h / .cpp  Worker lifecycle, IPC, shell command execution
 │   ├── sandbox.h              Platform-neutral sandbox interface
-│   ├── sandbox.cpp            Linux implementation (namespaces/overlayfs)
-│   └── sandbox_darwin.cpp     macOS implementation (Seatbelt/clonefile)
+│   ├── sandbox.cpp            Linux implementation (namespaces/overlayfs/seccomp)
+│   ├── sandbox_darwin.cpp     macOS implementation (Seatbelt/clonefile)
+│   ├── terminal.h / .cpp     PTY session management (libvterm-backed)
+│   ├── file_type.h / .cpp    Binary file type detection
+│   └── image_resize.h / .cpp Image resizing for binary read responses
 └── third_party/
     ├── dash-0.5.12/          Vendored dash (compiled as a static library;
     │                         dash_main() called directly in shell mode)
     ├── nlohmann/json.hpp     nlohmann/json v3.11.3 (header-only, MIT)
-    └── libedit/              libedit headers + .so symlink (line editing)
+    ├── libedit/              libedit headers + .so symlink (line editing)
+    ├── libvterm/             libvterm (PTY screen model for terminal tools)
+    └── stb/                  stb_image / stb_image_resize (image processing)
 ```
 
 ---

@@ -64,11 +64,20 @@ const [a, b, c] = await Promise.all([
 boxsh has three built-in file tools — `read`, `write`, and `edit`. They run on background threads and never block the RPC event loop.
 
 ```js
-// Read a file — optionally specify a start line and line limit
-const content = await client.read('/workspace/src/main.cpp');
+// Read a text file — returns { content, encoding, mime_type, ... }
+const result = await client.read('/workspace/src/main.cpp');
+console.log(result.content); // file text
+console.log(result.mime_type); // e.g. "text/x-c++"
+
+// Read a slice (1-indexed start line + line limit)
 const first50 = await client.read('/workspace/src/main.cpp', 1, 50);
 
-// Write a file — full replacement
+// Binary files are returned as base64
+const img = await client.read('/workspace/logo.png');
+console.log(img.encoding);  // "base64"
+console.log(img.mime_type); // "image/png"
+
+// Write a file — creates or overwrites; parent dirs are created automatically
 await client.write('/workspace/output.txt', 'hello\n');
 
 // Edit a file — search-and-replace; each oldText must appear exactly once
@@ -76,6 +85,37 @@ const { diff, firstChangedLine } = await client.edit('/workspace/output.txt', [
     { oldText: 'hello', newText: 'world' },
 ]);
 console.log(diff);  // unified diff format
+```
+
+---
+
+## Terminal sessions
+
+The terminal tools manage persistent PTY sessions. Commands start an interactive process; you can send input and poll for output asynchronously.
+
+```js
+// Start a bash session
+const { id, output } = await client.runInTerminal('bash');
+console.log(output); // initial screen snapshot
+
+// Send a command and get the updated screen
+const result = await client.sendToTerminal(id, 'ls -la\n');
+console.log(result.output);
+
+// Poll until a long-running command finishes
+let out;
+do {
+    out = await client.getTerminalOutput(id);
+    process.stdout.write(out.output);
+} while (!out.exited);
+console.log('exit code:', out.exitCode);
+
+// Terminate the session and free resources
+const finalOutput = await client.killTerminal(id);
+
+// List all active sessions
+const sessions = await client.listTerminals();
+// [{ id, command, alive, cols, rows }, ...]
 ```
 
 ---
@@ -192,17 +232,37 @@ await client.exec(`echo ${shellQuote(userInput)}`);
 
 Execute a shell command. `timeout` is in seconds.
 
-### `client.read(path, offset?, limit?) → Promise<string>`
+### `client.read(path, offset?, limit?) → Promise<ReadResult>`
 
-Read file contents. `offset` is the 1-based start line; `limit` is the maximum number of lines.
+Read file contents. For text files, `offset` is the 1-based start line and `limit` is the maximum number of lines. Binary files are returned as base64. `ReadResult` has fields: `content`, `encoding` (`"text"` or `"base64"`), `mime_type`, and optionally `line_count`, `truncated` (text) or `size` (binary).
 
 ### `client.write(path, content) → Promise<void>`
 
-Create a new file. Fails if the file already exists — use `edit` to modify existing files.
+Create or overwrite a file. Parent directories are created automatically if needed.
 
 ### `client.edit(path, edits) → Promise<{ diff, firstChangedLine }>`
 
 Apply search-and-replace edits. `edits` is an array of `{ oldText, newText }`. Each `oldText` must appear exactly once in the file. All edits match against the original file content (not the result of a previous edit). Returns a unified diff and the first changed line number.
+
+### `client.runInTerminal(command, opts?) → Promise<RunInTerminalResult>`
+
+Start a PTY session running `command`. Returns `{ id, output, exited, exitCode }`. `opts` may include `explanation`, `goal`, `cols`, `rows`.
+
+### `client.sendToTerminal(id, command) → Promise<TerminalOutputResult>`
+
+Write text to a session's stdin, wait up to 500 ms, and return the updated screen snapshot `{ output, exited, exitCode }`. Append `\n` to execute as a shell command.
+
+### `client.getTerminalOutput(id) → Promise<TerminalOutputResult>`
+
+Wait up to 500 ms for new output and return the current screen snapshot. Use this to poll long-running commands until `exited` is `true`.
+
+### `client.killTerminal(id) → Promise<string>`
+
+Terminate the session and free resources. Returns the final screen snapshot.
+
+### `client.listTerminals() → Promise<TerminalSession[]>`
+
+Return metadata for all active and recently-exited sessions.
 
 ### `client.close() → Promise<void>`
 
