@@ -504,10 +504,25 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
                 std::string sandbox_path = new_root + host_path;
                 struct stat st;
                 if (stat(sandbox_path.c_str(), &st) == 0) {
-                    // Re-bind as read-only on top of the existing mount.
+                    // File exists — re-bind as read-only on top.
                     bind_mount(host_path, sandbox_path, /*readonly=*/true, res.error);
-                    // Ignore errors: file may not exist on host.
                     res.error.clear();
+                } else if (stat((new_root + home).c_str(), &st) == 0) {
+                    // Home dir is mounted but file doesn't exist — create a
+                    // 0-byte mount-point placeholder and re-bind it RO on top.
+                    // The placeholder leaks to the host via the wr bind as a
+                    // harmless empty file.  We intentionally do NOT clean it
+                    // up: multiple boxsh instances may share the same $HOME
+                    // concurrently, so removing the placeholder could break
+                    // another sandbox's bind mount.
+                    int fd = open(sandbox_path.c_str(),
+                                  O_CREAT | O_WRONLY | O_CLOEXEC, 0444);
+                    if (fd >= 0) {
+                        close(fd);
+                        bind_mount(host_path, sandbox_path,
+                                   /*readonly=*/true, res.error);
+                        res.error.clear();
+                    }
                 }
             }
         }

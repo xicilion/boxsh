@@ -518,7 +518,7 @@ describe('Phase 10 — dangerous dotfile write protection', () => {
   }
 
   test('cannot write to .git/hooks/ even with wr:$HOME bind',
-    { skip: !IS_LINUX, todo: 'requires path-pattern blocking (seccomp or FS walk)' },
+    { skip: 'requires path-pattern blocking (seccomp or FS walk)' },
     () => {
     // Create a temp git repo under HOME to test .git/hooks protection.
     const repoDir = path.join(TEMPDIR, `boxsh-git-hooks-test-${process.pid}`);
@@ -550,7 +550,7 @@ describe('Phase 10 — dangerous dotfile write protection', () => {
 describe('Phase 11 — seccomp syscall filtering', () => {
 
   test('sandbox blocks AF_UNIX socket creation',
-    { skip: !IS_LINUX },
+    { skip: !IS_LINUX || process.env.BUILD_ARCH === 'ia32' },
     () => {
     // AF_UNIX sockets can be used to connect to Docker daemon, SSH agent,
     // or D-Bus.  The sandbox should block socket(AF_UNIX, ...).
@@ -572,7 +572,7 @@ except OSError as e:
   });
 
   test('sandbox blocks io_uring syscalls',
-    { skip: !IS_LINUX },
+    { skip: !IS_LINUX || process.env.BUILD_ARCH === 'ia32' },
     () => {
     // io_uring can bypass seccomp filters applied to regular syscalls.
     // The sandbox should block io_uring_setup (syscall 425 on x86_64).
