@@ -1,4 +1,5 @@
 #include "worker_pool.h"
+#include "io_utils.h"
 
 #include <nlohmann/json.hpp>
 
@@ -26,6 +27,12 @@ extern "C" int dash_main(int argc, char **argv);
 
 namespace boxsh {
 
+namespace {
+
+constexpr uint32_t kMaxWireMessageBytes = 64u * 1024u * 1024u;
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // Simple wire protocol over the socketpair:
 //
@@ -39,32 +46,30 @@ namespace boxsh {
 static bool write_msg(int fd, const std::string &msg) {
     uint32_t len = (uint32_t)msg.size();
     // Write length prefix.
-    if (write(fd, &len, 4) != 4) return false;
-    if (write(fd, msg.c_str(), len) != (ssize_t)len) return false;
+    if (!write_all(fd, &len, sizeof(len))) return false;
+    if (!write_all(fd, msg.data(), len)) return false;
     return true;
 }
 
 static bool read_msg(int fd, std::string &out, int timeout_ms = -1) {
     // Poll for data with optional timeout.
     if (timeout_ms >= 0) {
-        struct pollfd pfd = {fd, POLLIN, 0};
-        int r = poll(&pfd, 1, timeout_ms);
-        if (r <= 0) return false; // timeout or error
+        while (true) {
+            struct pollfd pfd = {fd, POLLIN, 0};
+            int r = poll(&pfd, 1, timeout_ms);
+            if (r > 0) break;
+            if (r == 0) return false;
+            if (errno == EINTR) continue;
+            return false;
+        }
     }
 
     uint32_t len = 0;
-    ssize_t n = read(fd, &len, 4);
-    if (n != 4) return false;
-    if (len == 0 || len > 64u * 1024 * 1024) return false; // sanity guard
+    if (!read_all(fd, &len, sizeof(len))) return false;
+    if (len == 0 || len > kMaxWireMessageBytes) return false; // sanity guard
 
     out.resize(len);
-    size_t received = 0;
-    while (received < len) {
-        n = read(fd, &out[received], len - received);
-        if (n <= 0) return false;
-        received += (size_t)n;
-    }
-    return true;
+    return read_all(fd, &out[0], len);
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +480,15 @@ RpcResponse WorkerPool::collect(size_t idx) {
         // Worker crashed: respawn and return an error.
         nlohmann::json inflight = w.inflight_id;
         close(w.fd);
-        waitpid(w.pid, nullptr, WNOHANG);
+        if (w.pid > 0) {
+            if (kill(w.pid, SIGKILL) != 0 && errno != ESRCH) {
+                // Best effort: waitpid below still handles already-exited workers.
+            }
+            while (waitpid(w.pid, nullptr, 0) < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+        }
         w = Worker{};
         spawn_worker(w);
 

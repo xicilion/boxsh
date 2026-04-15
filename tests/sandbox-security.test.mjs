@@ -36,6 +36,17 @@ function tryRun(cwd, cmd, timeout_ms = 8000) {
   });
 }
 
+function runSandboxWithHome(homeDir, cmd, timeout_ms = 8000) {
+  return spawnSync(BOXSH, [
+    '--sandbox', '--bind', `wr:${homeDir}`, '-c', cmd,
+  ], {
+    encoding: 'utf8',
+    cwd: homeDir,
+    timeout: timeout_ms,
+    env: { ...process.env, HOME: homeDir },
+  });
+}
+
 // ============================================================================
 // Phase 1 — Symlink-based escape attempts
 // ============================================================================
@@ -488,48 +499,52 @@ describe('Phase 10 — dangerous dotfile write protection', () => {
     '.profile',
     '.zshrc',
     '.gitconfig',
+    '.npmrc',
   ];
 
   for (const dotfile of dangerousFiles) {
     test(`cannot write to ~/${dotfile} even with wr:$HOME bind`,
       () => {
+      const fakeHome = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-home-'));
       const marker = `BOXSH_PROBE_${Date.now()}`;
-      const r = spawnSync(BOXSH, [
-        '--sandbox', '--bind', `wr:${HOME}`, '-c',
-        `echo ${marker} >> ~/${dotfile} 2>&1; echo STATUS=$?`,
-      ], { encoding: 'utf8', timeout: 8000, cwd: TEMPDIR });
-      assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
+      try {
+        const r = runSandboxWithHome(fakeHome,
+          `echo ${marker} >> ~/${dotfile} 2>&1; echo STATUS=$?`);
+        assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
 
-      // The write must have been denied.
-      assert.ok(
-        r.stdout.includes('Read-only') || r.stdout.includes('Permission denied') ||
-        r.stdout.includes('Operation not permitted') || r.stdout.includes('STATUS=1') ||
-        r.stdout.includes('STATUS=2'),
-        `SECURITY BUG: sandbox allowed write to ~/${dotfile}!\n${r.stdout}`);
+        // The write must have been denied.
+        assert.ok(
+          r.stdout.includes('Read-only') || r.stdout.includes('Permission denied') ||
+          r.stdout.includes('Operation not permitted') || r.stdout.includes('STATUS=1') ||
+          r.stdout.includes('STATUS=2'),
+          `SECURITY BUG: sandbox allowed write to ~/${dotfile}!\n${r.stdout}`);
 
-      // Double-check: the marker must NOT appear in the real host file.
-      const hostFile = path.join(HOME, dotfile);
-      if (fs.existsSync(hostFile)) {
-        const content = fs.readFileSync(hostFile, 'utf8');
-        assert.ok(!content.includes(marker),
-          `SECURITY BUG: marker written to real host ~/${dotfile}!`);
+        // Double-check: the marker must NOT appear in the fake host HOME.
+        const hostFile = path.join(fakeHome, dotfile);
+        if (fs.existsSync(hostFile)) {
+          const content = fs.readFileSync(hostFile, 'utf8');
+          assert.ok(!content.includes(marker),
+            `SECURITY BUG: marker written to fake host ~/${dotfile}!`);
+        }
+      } finally {
+        fs.rmSync(fakeHome, { recursive: true, force: true });
       }
     });
   }
 
   test('cannot write to .git/hooks/ even with wr:$HOME bind',
-    { skip: 'requires path-pattern blocking (seccomp or FS walk)' },
+    { skip: !IS_LINUX },
     () => {
-    // Create a temp git repo under HOME to test .git/hooks protection.
-    const repoDir = path.join(TEMPDIR, `boxsh-git-hooks-test-${process.pid}`);
+    const fakeHome = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-home-'));
+    const repoDir = path.join(fakeHome, 'repo');
     try {
-      spawnSync('git', ['init', repoDir], { encoding: 'utf8' });
+      const init = spawnSync('git', ['init', repoDir], { encoding: 'utf8' });
+      assert.equal(init.status, 0, `git init failed: ${init.stderr}`);
       const marker = `BOXSH_HOOK_PROBE_${Date.now()}`;
       const hookPath = path.join(repoDir, '.git/hooks/pre-commit');
-      const r = spawnSync(BOXSH, [
-        '--sandbox', '--bind', `wr:${HOME}`, '-c',
+      const r = runSandboxWithHome(fakeHome,
         `echo '#!/bin/sh\necho ${marker}' > ${hookPath} 2>&1; echo STATUS=$?`,
-      ], { encoding: 'utf8', timeout: 8000, cwd: TEMPDIR });
+      );
       assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
 
       assert.ok(
@@ -537,8 +552,43 @@ describe('Phase 10 — dangerous dotfile write protection', () => {
         r.stdout.includes('Operation not permitted') || r.stdout.includes('STATUS=1') ||
         r.stdout.includes('STATUS=2'),
         `SECURITY BUG: sandbox allowed write to .git/hooks/!\n${r.stdout}`);
+
+      assert.ok(
+        !fs.existsSync(hookPath) || !fs.readFileSync(hookPath, 'utf8').includes(marker),
+        'SECURITY BUG: marker written to real host .git/hooks/pre-commit!',
+      );
     } finally {
-      fs.rmSync(repoDir, { recursive: true, force: true });
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  test('cannot write to ~/.ssh/authorized_keys even with wr:$HOME bind',
+    { skip: !IS_LINUX },
+    () => {
+    const fakeHome = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-home-'));
+    const sshDir = path.join(fakeHome, '.ssh');
+    const authKeys = path.join(sshDir, 'authorized_keys');
+    try {
+      fs.mkdirSync(sshDir, { recursive: true });
+      fs.writeFileSync(authKeys, 'ssh-ed25519 AAAATEST existing\n');
+
+      const marker = `BOXSH_AUTHKEY_${Date.now()}`;
+      const r = runSandboxWithHome(fakeHome,
+        `echo ${marker} >> ~/.ssh/authorized_keys 2>&1; echo STATUS=$?`);
+      assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
+
+      assert.ok(
+        r.stdout.includes('Read-only') || r.stdout.includes('Permission denied') ||
+        r.stdout.includes('Operation not permitted') || r.stdout.includes('STATUS=1') ||
+        r.stdout.includes('STATUS=2'),
+        `SECURITY BUG: sandbox allowed write to ~/.ssh/authorized_keys!\n${r.stdout}`,
+      );
+
+      const content = fs.readFileSync(authKeys, 'utf8');
+      assert.ok(!content.includes(marker),
+        'SECURITY BUG: marker written to real host ~/.ssh/authorized_keys!');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
     }
   });
 });

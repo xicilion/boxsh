@@ -1,6 +1,7 @@
 #include "rpc.h"
 #include "file_type.h"
 #include "image_resize.h"
+#include "io_utils.h"
 #include "terminal.h"
 #include "worker_pool.h"
 
@@ -30,6 +31,12 @@
 using json = nlohmann::json;
 
 namespace boxsh {
+
+namespace {
+
+constexpr uint32_t kMaxTransportMessageBytes = 64u * 1024u * 1024u;
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -1185,10 +1192,16 @@ public:
         while (true) {
             ssize_t n = read(fd_, tmp, sizeof(tmp));
             if (n > 0) {
+                if (buf_.size() + (size_t)n > kMaxBufferedInputBytes) {
+                    overflowed_ = true;
+                    eof_ = true;
+                    return false;
+                }
                 buf_.append(tmp, (size_t)n);
                 continue;
             }
             if (n == 0) { eof_ = true; return false; }
+            if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
             return false;
         }
@@ -1209,13 +1222,17 @@ public:
     bool eof()    const { return eof_; }
     int  fd()     const { return fd_; }
     bool framed() const { return framed_; }
+    bool overflowed() const { return overflowed_; }
 
 private:
+    static constexpr size_t kMaxBufferedInputBytes = kMaxTransportMessageBytes;
+
     int         fd_;
     std::string buf_;
     bool        eof_       = false;
     bool        framed_    = false;
     bool        detected_  = false;
+    bool        overflowed_ = false;
 
     void detect_mode() {
         if (detected_ || buf_.empty()) return;
@@ -1398,8 +1415,8 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
             }
             std::string payload = direct_payload + '\n';
             uint32_t len = (uint32_t)payload.size();
-            (void)write(write_fd, &len, 4);
-            (void)write(write_fd, payload.c_str(), len);
+            (void)write_all(write_fd, &len, sizeof(len));
+            (void)write_all(write_fd, payload.data(), len);
             close(write_fd);
         }).detach();
 
@@ -1489,8 +1506,15 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
 
         size_t pfd_off = 0;
         if (poll_stdin) {
-            if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR))
-                reader.fill();
+            if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+                if (!reader.fill() && reader.overflowed()) {
+                    RpcResponse err;
+                    err.id = nullptr;
+                    err.error = "parse_error: request buffer exceeded 64 MiB";
+                    err.is_protocol_error = true;
+                    write_resp(err);
+                }
+            }
             pfd_off = 1;
         }
 
@@ -1510,16 +1534,10 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
                 continue;
             int tfd = pending_tools[i].fd;
             uint32_t len = 0;
-            ssize_t n = read(tfd, &len, 4);
-            if (n == 4 && len > 0 && len <= 64u * 1024 * 1024) {
+            if (read_all(tfd, &len, sizeof(len)) &&
+                len > 0 && len <= kMaxTransportMessageBytes) {
                 std::string payload(len, '\0');
-                size_t received = 0;
-                while (received < len) {
-                    n = read(tfd, &payload[received], len - received);
-                    if (n <= 0) break;
-                    received += (size_t)n;
-                }
-                if (received == len) {
+                if (read_all(tfd, &payload[0], len)) {
                     // payload includes trailing '\n' from the serializer;
                     // strip it so write_msg can apply the correct framing.
                     std::string body = payload;

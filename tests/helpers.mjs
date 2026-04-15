@@ -14,6 +14,14 @@ import { fileURLToPath } from 'node:url';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 
+// Keep child-process output deterministic across direct and aggregated test
+// runs. Some runners/terminals export FORCE_COLOR, which makes nested Node
+// invocations print ANSI-colored numbers (for example console.log(42)).
+delete process.env.FORCE_COLOR;
+delete process.env.CLICOLOR_FORCE;
+process.env.NO_COLOR = '1';
+process.env.NODE_DISABLE_COLORS = '1';
+
 /** Absolute path to the boxsh binary. Override with BOXSH env-var. */
 export const BOXSH = path.resolve(
   process.env.BOXSH ?? path.join(__dir, '../build/boxsh'),

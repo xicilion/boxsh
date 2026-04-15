@@ -28,6 +28,10 @@ namespace boxsh {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+static std::string path_parent(const std::string &p);
+static bool bind_mount(const std::string &src, const std::string &dst,
+                       bool readonly, std::string &err);
+
 static std::string errno_str(const char *context) {
     return std::string(context) + ": " + std::strerror(errno);
 }
@@ -53,6 +57,104 @@ static bool write_file(const char *path, const char *content) {
     ssize_t n = write(fd, content, std::strlen(content));
     close(fd);
     return n == (ssize_t)std::strlen(content);
+}
+
+static bool path_exists(const std::string &path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+static bool ensure_file_mountpoint(const std::string &path, std::string &err) {
+    int fd = open(path.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0444);
+    if (fd < 0 && errno != EEXIST) {
+        err = errno_str(("create protected file mountpoint: " + path).c_str());
+        return false;
+    }
+    if (fd >= 0) close(fd);
+    return true;
+}
+
+static bool protect_path_readonly(const std::string &host_path,
+                                  const std::string &new_root,
+                                  bool is_dir,
+                                  std::string &err) {
+    std::string sandbox_path = new_root + host_path;
+    if (is_dir) {
+        if (!mkdir_p(sandbox_path, 0755, err)) return false;
+    } else {
+        std::string parent = path_parent(sandbox_path);
+        if (!mkdir_p(parent, 0755, err)) return false;
+        if (!ensure_file_mountpoint(sandbox_path, err)) return false;
+    }
+    return bind_mount(host_path, sandbox_path, /*readonly=*/true, err);
+}
+
+static bool protect_existing_git_hook_dirs(const std::string &home,
+                                           const std::string &new_root,
+                                           std::string &err) {
+    std::vector<std::string> stack;
+    stack.push_back(home);
+
+    while (!stack.empty()) {
+        std::string dir = stack.back();
+        stack.pop_back();
+
+        DIR *d = opendir(dir.c_str());
+        if (!d) continue;
+
+        struct dirent *ent;
+        while ((ent = readdir(d)) != nullptr) {
+            if (std::strcmp(ent->d_name, ".") == 0 ||
+                std::strcmp(ent->d_name, "..") == 0) {
+                continue;
+            }
+
+            std::string child = dir + "/" + ent->d_name;
+            struct stat st;
+            if (lstat(child.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+                continue;
+            }
+
+            if (std::strcmp(ent->d_name, ".git") == 0) {
+                std::string hooks = child + "/hooks";
+                struct stat hooks_st;
+                if (stat(hooks.c_str(), &hooks_st) == 0 && S_ISDIR(hooks_st.st_mode)) {
+                    if (!protect_path_readonly(hooks, new_root, /*is_dir=*/true, err)) {
+                        closedir(d);
+                        return false;
+                    }
+                }
+                continue;
+            }
+
+            stack.push_back(child);
+        }
+
+        closedir(d);
+    }
+
+    return true;
+}
+
+static bool path_intersects(const std::string &path,
+                            const std::string &other) {
+    auto is_under = [](const std::string &candidate,
+                       const std::string &prefix) {
+        return candidate == prefix ||
+               (candidate.size() > prefix.size() &&
+                candidate[prefix.size()] == '/' &&
+                candidate.compare(0, prefix.size(), prefix) == 0);
+    };
+    return is_under(path, other) || is_under(other, path);
+}
+
+static bool path_writable_via_bind(const SandboxConfig &cfg,
+                                   const std::string &path) {
+    for (const auto &bm : cfg.bind_mounts) {
+        if (bm.mode != BindMount::Mode::RW) continue;
+        if (path_intersects(path, bm.dst)) return true;
+    }
+    return false;
 }
 
 // pivot_root(2) is not wrapped by glibc, call it directly.
@@ -128,12 +230,11 @@ static bool mount_overlay_at(const std::string &lowerdir,
     if (mount("overlay", dest.c_str(), "overlay", 0, opts.c_str()) == 0)
         return true;
 
-    // Only fall back to fuse-overlayfs for EINVAL, which is the specific
-    // error produced by XFS with large inodes in a user namespace ("failed
-    // to clone lowerpath").  Other errors (ENOENT, EPERM, …) indicate real
-    // configuration problems that fuse-overlayfs won't fix.
+    // Fall back to fuse-overlayfs for the two user-namespace failure modes we
+    // see in practice: EINVAL on XFS with large inodes and EPERM when nested
+    // containers block kernel overlay mounts without CAP_SYS_ADMIN.
     int saved_errno = errno;
-    if (saved_errno != EINVAL) {
+    if (saved_errno != EINVAL && saved_errno != EPERM) {
         err = errno_str(("mount overlay -> " + dest).c_str());
         return false;
     }
@@ -338,7 +439,10 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     // When called via unshare() (no separate fork) we write the map ourselves.
     {
         char self_setgroups[] = "/proc/self/setgroups";
-        write_file(self_setgroups, "deny");
+        if (!write_file(self_setgroups, "deny") && errno != ENOENT) {
+            res.error = errno_str("write setgroups deny");
+            return res;
+        }
 
         char uid_map_content[64];
         char gid_map_content[64];
@@ -487,42 +591,51 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
             return res;
     }
 
-    // --- 8. Protect dangerous dotfiles from writes ---
-    // Even when $HOME is exposed read-write, shell config files and tool
-    // config files must be read-only to prevent persistent backdoors that
-    // survive sandbox teardown (e.g. injecting commands into .bashrc).
+    // --- 8. Protect dangerous home paths from writes ---
+    // Even when $HOME is exposed read-write, high-value shell, credential,
+    // and VCS hook paths must stay read-only to prevent persistent backdoors
+    // that survive sandbox teardown.
     {
         const char *home_env = getenv("HOME");
         if (home_env && home_env[0] != '\0') {
-            static const char *const dangerous_files[] = {
-                ".bashrc", ".bash_profile", ".profile", ".zshrc", ".zprofile",
-                ".gitconfig", ".mcp.json", nullptr
-            };
             std::string home(home_env);
-            for (int i = 0; dangerous_files[i]; i++) {
-                std::string host_path = home + "/" + dangerous_files[i];
-                std::string sandbox_path = new_root + host_path;
-                struct stat st;
-                if (stat(sandbox_path.c_str(), &st) == 0) {
-                    // File exists — re-bind as read-only on top.
-                    bind_mount(host_path, sandbox_path, /*readonly=*/true, res.error);
-                    res.error.clear();
-                } else if (stat((new_root + home).c_str(), &st) == 0) {
-                    // Home dir is mounted but file doesn't exist — create a
-                    // 0-byte mount-point placeholder and re-bind it RO on top.
-                    // The placeholder leaks to the host via the wr bind as a
-                    // harmless empty file.  We intentionally do NOT clean it
-                    // up: multiple boxsh instances may share the same $HOME
-                    // concurrently, so removing the placeholder could break
-                    // another sandbox's bind mount.
-                    int fd = open(sandbox_path.c_str(),
-                                  O_CREAT | O_WRONLY | O_CLOEXEC, 0444);
-                    if (fd >= 0) {
-                        close(fd);
-                        bind_mount(host_path, sandbox_path,
-                                   /*readonly=*/true, res.error);
-                        res.error.clear();
+            if (path_exists(new_root + home) && path_writable_via_bind(cfg, home)) {
+                static const char *const dangerous_files[] = {
+                    ".bashrc", ".bash_profile", ".profile",
+                    ".zshrc", ".zprofile",
+                    ".gitconfig", ".mcp.json", ".npmrc",
+                    ".aws/credentials", ".pip/pip.conf",
+                    ".cargo/credentials.toml",
+                    nullptr
+                };
+                static const char *const dangerous_dirs[] = {
+                    ".ssh", ".gnupg", ".config/gcloud", nullptr
+                };
+
+                for (int i = 0; dangerous_files[i]; i++) {
+                    std::string protected_path = home + "/" + dangerous_files[i];
+                    if (!path_writable_via_bind(cfg, protected_path)) continue;
+                    if (!protect_path_readonly(protected_path,
+                                               new_root,
+                                               /*is_dir=*/false,
+                                               res.error)) {
+                        return res;
                     }
+                }
+                for (int i = 0; dangerous_dirs[i]; i++) {
+                    std::string protected_path = home + "/" + dangerous_dirs[i];
+                    if (!path_writable_via_bind(cfg, protected_path)) continue;
+                    if (!protect_path_readonly(protected_path,
+                                               new_root,
+                                               /*is_dir=*/true,
+                                               res.error)) {
+                        return res;
+                    }
+                }
+
+                if (path_writable_via_bind(cfg, home) &&
+                    !protect_existing_git_hook_dirs(home, new_root, res.error)) {
+                    return res;
                 }
             }
         }

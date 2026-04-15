@@ -202,6 +202,7 @@ target_compile_options(libvterm_static PRIVATE -w)
 
 add_executable(boxsh
     src/main.cpp
+    src/io_utils.cpp
     src/rpc.cpp
     src/file_type.cpp
     src/image_resize.cpp

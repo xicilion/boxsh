@@ -229,11 +229,21 @@ static std::string build_sbpl(const SandboxConfig &cfg) {
             static const char *const dangerous_files[] = {
                 ".bashrc", ".bash_profile", ".profile",
                 ".zshrc", ".zprofile",
-                ".gitconfig", ".mcp.json", nullptr
+                ".gitconfig", ".mcp.json", ".npmrc",
+                ".aws/credentials", ".pip/pip.conf",
+                ".cargo/credentials.toml", ".ssh/authorized_keys",
+                nullptr
+            };
+            static const char *const dangerous_dirs[] = {
+                ".config/gcloud", ".gnupg", nullptr
             };
             for (int i = 0; dangerous_files[i]; i++) {
                 p += "(deny file-write* (literal \""
                    + home + "/" + dangerous_files[i] + "\"))\n";
+            }
+            for (int i = 0; dangerous_dirs[i]; i++) {
+                p += "(deny file-write* (subpath \""
+                   + home + "/" + dangerous_dirs[i] + "\"))\n";
             }
         }
     }
