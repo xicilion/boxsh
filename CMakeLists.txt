@@ -66,10 +66,13 @@ set(DASH_SOURCES
     ${DASH_SRC_DIR}/syntax.c
 )
 
+set(LIBEDIT_INSTALL_DIR ${CMAKE_BINARY_DIR}/libedit-prefix)
+
 add_library(dash_static STATIC ${DASH_SOURCES})
 
 target_include_directories(dash_static
     PUBLIC
+        ${LIBEDIT_INSTALL_DIR}/include
         ${DASH_SRC_DIR}
         ${DASH_ROOT}       # for config.h
 )
@@ -255,6 +258,7 @@ if(APPLE)
 endif()
 
 add_dependencies(boxsh libedit_vendored)
+add_dependencies(dash_static libedit_vendored)
 
 
 # ---------------------------------------------------------------------------
