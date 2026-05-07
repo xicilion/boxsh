@@ -936,3 +936,29 @@ describe('Phase 12 — symlink TOCTOU attacks in sandbox mode', () => {
     }
   });
 });
+
+// ============================================================================
+// Phase 13 — macOS system trust evaluation
+// ============================================================================
+
+describe('Phase 13 — macOS system trust evaluation', () => {
+
+  test('sandbox preserves access to macOS system trust evaluation',
+    { skip: !IS_MACOS },
+    () => {
+    const trustUrl = 'https://example.com';
+
+    const hostVerify = spawnSync('/usr/bin/security', [
+      'verify-cert', '-q', trustUrl,
+    ], { encoding: 'utf8', timeout: 15000 });
+    assert.equal(hostVerify.status, 0,
+      `Host SSL trust evaluation failed:\nstdout: ${hostVerify.stdout}\nstderr: ${hostVerify.stderr}`);
+
+    const sandboxVerify = spawnSync(BOXSH, [
+      '--sandbox', '-c',
+      `/usr/bin/security verify-cert -q ${trustUrl}`,
+    ], { encoding: 'utf8', timeout: 15000, cwd: TEMPDIR });
+    assert.equal(sandboxVerify.status, 0,
+      `Sandboxed SSL trust evaluation failed:\nstdout: ${sandboxVerify.stdout}\nstderr: ${sandboxVerify.stderr}`);
+  });
+});

@@ -152,6 +152,10 @@ static std::string build_sbpl(const SandboxConfig &cfg) {
     p += "  (global-name \"com.apple.bsd.dirhelper\")\n";
     p += "  (global-name \"com.apple.securityd.xpc\")\n";
     p += "  (global-name \"com.apple.SecurityServer\")\n";
+    p += "  (global-name \"com.apple.communicationtrustd\")\n";
+    p += "  (global-name \"com.apple.trustd\")\n";
+    p += "  (global-name \"com.apple.trustd.agent\")\n";
+    p += "  (global-name \"com.apple.trustdFileHelper\")\n";
     p += ")\n";
 
     // POSIX IPC — only shared memory and semaphores.
