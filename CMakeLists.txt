@@ -171,6 +171,13 @@ ExternalProject_Add(libedit_vendored
     BUILD_BYPRODUCTS ${LIBEDIT_INSTALL_DIR}/lib/libedit.a
 )
 
+# dash's interactive editing sources include <histedit.h>, which is provided by
+# the vendored libedit install tree rather than the system headers on a clean
+# machine. Make that include path visible to dash_static and ensure libedit is
+# installed before dash compiles.
+target_include_directories(dash_static PRIVATE ${LIBEDIT_INSTALL_DIR}/include)
+add_dependencies(dash_static libedit_vendored)
+
 # ---------------------------------------------------------------------------
 # libvterm (vendored, pure-C VT220/xterm emulator used by Neovim)
 # ---------------------------------------------------------------------------
