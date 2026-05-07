@@ -40,6 +40,13 @@ describe('shell mode — basic invocation', () => {
     const r = run([], '');
     assert.equal(r.status, 0);
   });
+
+  test('--interactive forces interactive mode on non-tty stdin', () => {
+    const r = run(['--interactive'], 'echo "$-"\nexit\n');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /i/,
+      `expected interactive shell flags in stdout, got: ${JSON.stringify(r.stdout)}`);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -240,6 +247,19 @@ function makeCowDirs() {
   };
 }
 
+function runForcedInteractiveCow(src) {
+  return spawnSync(BOXSH, [
+    '--interactive',
+    '--sandbox',
+    '--bind', 'cow:./:../.test',
+  ], {
+    cwd: src,
+    input: 'pwd\nexit\n',
+    encoding: 'utf8',
+    timeout: 10000,
+  });
+}
+
 describe('shell mode — sandbox', () => {
   test('--sandbox --bind cow: src-layer file visible via -c', () => {
     const { src, dst, cleanup } = makeCowDirs();
@@ -283,6 +303,19 @@ describe('shell mode — sandbox', () => {
       assert.equal(r.status, 0);
       assert.equal(r.stdout, 'gone\n');
       assert.equal(fs.readFileSync(path.join(src, 'victim.txt'), 'utf8'), 'delete-me\n');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('forced interactive --sandbox --bind cow accepts input and exits', () => {
+    const { src, cleanup } = makeCowDirs();
+    try {
+      const r = runForcedInteractiveCow(src);
+      assert.equal(r.status, 0,
+        `forced interactive sandbox failed:\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+      assert.match(r.stdout, /\/(private\/)?(tmp|var\/folders)\//,
+        `forced interactive sandbox did not execute pwd:\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
     } finally {
       cleanup();
     }

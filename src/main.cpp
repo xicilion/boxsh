@@ -35,6 +35,7 @@ void print_usage(const char *prog) {
         "\n"
         "Modes:\n"
         "  (default)      Run as an ordinary POSIX shell (delegates to dash).\n"
+        "  --interactive  Force interactive shell mode even when stdin is not a tty.\n"
         "  --rpc          Read JSON-line requests from stdin, write responses to stdout.\n"
         "\n"
         "RPC options:\n"
@@ -65,6 +66,7 @@ void print_usage(const char *prog) {
 
 struct Cli {
     bool rpc_mode      = false;
+    bool force_interactive = false;
     bool try_mode      = false;  // --try: ephemeral COW shell on CWD
     int  num_workers   = 4;
     std::string shell_path = "/bin/sh";
@@ -107,6 +109,7 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
     Cli cli;
 
     static const struct option opts[] = {
+        {"interactive", no_argument,       nullptr, 'i'},
         {"rpc",         no_argument,       nullptr, 'R'},
         {"workers",     required_argument, nullptr, 'W'},
         {"shell",       required_argument, nullptr, 'S'},
@@ -127,6 +130,7 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
     while (!stop_parsing &&
            (c = getopt_long(argc, argv, "+h", opts, nullptr)) != -1) {
         switch (c) {
+        case 'i': cli.force_interactive = true; break;
         case 'R': cli.rpc_mode = true; break;
         case 'W': cli.num_workers = std::atoi(optarg); break;
         case 'S': cli.shell_path  = optarg; break;
@@ -290,7 +294,8 @@ int main(int argc, char **argv) {
             }
         }
 
-        bool interactive = (shell_argc == 0 && isatty(STDIN_FILENO));
+        bool interactive = cli.force_interactive ||
+                   (shell_argc == 0 && isatty(STDIN_FILENO));
 
         // Build a dash-friendly PS1 that mimics the user's bash prompt.
         // dash does not support bash PS1 escapes (\u, \h, \w), so we
@@ -332,6 +337,9 @@ int main(int argc, char **argv) {
         // Reconstruct argv for dash: argv[0] is the shell binary name.
         std::vector<char *> dash_args;
         dash_args.push_back(argv[0]);
+        static char interactive_flag[] = "-i";
+        if (cli.force_interactive)
+            dash_args.push_back(interactive_flag);
         // Enable emacs-mode line editing when running interactively.
         // Only inject -E when stdin is a terminal and the user has not
         // supplied their own -c / script file (i.e. truly interactive).
@@ -344,6 +352,13 @@ int main(int argc, char **argv) {
 
         // Without sandbox, run dash directly in the current process.
         if (!cli.sandbox.enabled) {
+            return dash_main((int)dash_args.size() - 1, dash_args.data());
+        }
+
+        // Interactive sandbox shells need to keep the existing terminal
+        // session/foreground ownership. Trying to hand off the TTY to a
+        // separate helper process is not reliable across macOS terminals.
+        if (interactive) {
             return dash_main((int)dash_args.size() - 1, dash_args.data());
         }
 
@@ -360,16 +375,12 @@ int main(int argc, char **argv) {
         if (child == 0) {
             // Child: create its own process group and run the shell.
             setpgid(0, 0);
-            if (interactive)
-                tcsetpgrp(STDIN_FILENO, getpid());
             signal(SIGTTOU, SIG_DFL);
             _exit(dash_main((int)dash_args.size() - 1, dash_args.data()));
         }
 
         // Parent: hand terminal to child, wait, then clean up.
         setpgid(child, child);  // race-free: both sides call setpgid
-        if (interactive)
-            tcsetpgrp(STDIN_FILENO, child);
 
         // Ignore job-control signals while the shell owns the terminal.
         signal(SIGINT,  SIG_IGN);
