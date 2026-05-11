@@ -232,7 +232,7 @@ describe('shell mode — POSIX features', () => {
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { BOXSH } from './helpers.mjs';
 
 /** Create src/dst dirs under a fresh temp base for COW testing. */
@@ -257,6 +257,42 @@ function runForcedInteractiveCow(src) {
     input: 'pwd\nexit\n',
     encoding: 'utf8',
     timeout: 10000,
+  });
+}
+
+function captureInteractiveTryPrompt(cwd) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('script', ['-q', '/dev/null', BOXSH, '--try'], {
+      cwd,
+      env: { ...process.env, BOXSH_DEBUG_TRY: '0' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let output = '';
+    let sawPrompt = false;
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      reject(new Error(`interactive --try prompt timed out:\n${output}`));
+    }, 10000);
+
+    const onChunk = chunk => {
+      output += chunk.toString('utf8');
+      if (!sawPrompt && output.includes('[boxsh:try] ')) {
+        sawPrompt = true;
+        proc.stdin.write('exit\n');
+      }
+    };
+
+    proc.stdout.on('data', onChunk);
+    proc.stderr.on('data', onChunk);
+    proc.on('error', err => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    proc.on('close', code => {
+      clearTimeout(timer);
+      resolve({ code, output, sawPrompt });
+    });
   });
 }
 
@@ -316,6 +352,20 @@ describe('shell mode — sandbox', () => {
         `forced interactive sandbox failed:\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
       assert.match(r.stdout, /\/(private\/)?(tmp|var\/folders)\//,
         `forced interactive sandbox did not execute pwd:\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('macOS --try interactive shell shows a prompt on a tty', {
+    skip: process.platform !== 'darwin' || !process.stdin.isTTY,
+  }, async () => {
+    const { src, cleanup } = makeCowDirs();
+    try {
+      const r = await captureInteractiveTryPrompt(src);
+      assert.equal(r.code, 0, r.output);
+      assert.equal(r.sawPrompt, true,
+        `interactive --try prompt was not shown:\n${r.output}`);
     } finally {
       cleanup();
     }

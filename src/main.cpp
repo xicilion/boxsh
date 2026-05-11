@@ -316,17 +316,14 @@ int main(int argc, char **argv) {
                 "*) echo \"$PWD\";; esac)";
 
             std::string ps1;
-            // Boxsh environment prefix
             if (cli.try_mode)
                 ps1 += "[boxsh:try] ";
             else
                 ps1 += "[boxsh] ";
-            // green bold user@host
             ps1 += esc_on; ps1 += green_bold; ps1 += esc_off;
             ps1 += prompt_user; ps1 += "@"; ps1 += prompt_host;
             ps1 += esc_on; ps1 += reset; ps1 += esc_off;
             ps1 += ":";
-            // blue bold path
             ps1 += esc_on; ps1 += blue_bold; ps1 += esc_off;
             ps1 += path_expr;
             ps1 += esc_on; ps1 += reset; ps1 += esc_off;
@@ -340,12 +337,6 @@ int main(int argc, char **argv) {
         static char interactive_flag[] = "-i";
         if (cli.force_interactive)
             dash_args.push_back(interactive_flag);
-        // Enable emacs-mode line editing when running interactively.
-        // Only inject -E when stdin is a terminal and the user has not
-        // supplied their own -c / script file (i.e. truly interactive).
-        static char emacs_flag[] = "-E";
-        if (interactive)
-            dash_args.push_back(emacs_flag);
         for (int i = 0; i < shell_argc; i++)
             dash_args.push_back(shell_argv[i]);
         dash_args.push_back(nullptr);
