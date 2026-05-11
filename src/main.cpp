@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -74,6 +75,24 @@ struct Cli {
     SandboxConfig sandbox;
 };
 
+static bool normalize_bind_path(std::string &path) {
+    if (path.empty()) return false;
+
+    std::filesystem::path fs_path(path);
+    if (fs_path.is_relative()) {
+        char *cwd_buf = getcwd(nullptr, 0);
+        if (!cwd_buf) return false;
+        fs_path = std::filesystem::path(cwd_buf) / fs_path;
+        free(cwd_buf);
+    }
+
+    path = fs_path.lexically_normal().string();
+    while (path.size() > 1 && path.back() == '/') {
+        path.pop_back();
+    }
+    return !path.empty();
+}
+
 // Parse --bind ro:PATH | wr:PATH | cow:SRC:DST
 static bool parse_bind(const char *arg, BindMount &bm) {
     std::string s(arg);
@@ -87,19 +106,19 @@ static bool parse_bind(const char *arg, BindMount &bm) {
         bm.mode = BindMount::Mode::RO;
         bm.src  = rest;
         bm.dst  = rest;
-        return !rest.empty();
+        return normalize_bind_path(bm.src) && normalize_bind_path(bm.dst);
     } else if (mode_str == "wr") {
         bm.mode = BindMount::Mode::RW;
         bm.src  = rest;
         bm.dst  = rest;
-        return !rest.empty();
+        return normalize_bind_path(bm.src) && normalize_bind_path(bm.dst);
     } else if (mode_str == "cow") {
         size_t p2 = rest.find(':');
         if (p2 == std::string::npos) return false;
         bm.mode = BindMount::Mode::COW;
         bm.src  = rest.substr(0, p2);
         bm.dst  = rest.substr(p2 + 1);
-        return !bm.src.empty() && !bm.dst.empty();
+        return normalize_bind_path(bm.src) && normalize_bind_path(bm.dst);
     }
     return false;
 }
@@ -294,8 +313,14 @@ int main(int argc, char **argv) {
             }
         }
 
-        bool interactive = cli.force_interactive ||
-                   (shell_argc == 0 && isatty(STDIN_FILENO));
+        bool stdin_is_tty = isatty(STDIN_FILENO);
+        // In sandbox mode with non-tty stdin, forcing dash -i can fail with
+        // tty process-group errors. Keep forced-interactive semantics for the
+        // normal shell path, but avoid -i in this sandboxed pipe case.
+        bool force_dash_interactive = cli.force_interactive &&
+                          (stdin_is_tty || !cli.sandbox.enabled);
+        bool interactive = force_dash_interactive ||
+               (shell_argc == 0 && stdin_is_tty);
 
         // Build a dash-friendly PS1 that mimics the user's bash prompt.
         // dash does not support bash PS1 escapes (\u, \h, \w), so we
@@ -335,7 +360,7 @@ int main(int argc, char **argv) {
         std::vector<char *> dash_args;
         dash_args.push_back(argv[0]);
         static char interactive_flag[] = "-i";
-        if (cli.force_interactive)
+        if (force_dash_interactive)
             dash_args.push_back(interactive_flag);
         for (int i = 0; i < shell_argc; i++)
             dash_args.push_back(shell_argv[i]);
