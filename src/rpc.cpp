@@ -1203,6 +1203,11 @@ public:
             if (n == 0) { eof_ = true; return false; }
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+            // Any other read error (EBADF, EIO, fd invalidated, etc.) — treat as EOF.
+            // Without this, callers see fill()==false but eof()==false and re-enter poll(),
+            // which on macOS keeps returning POLLNVAL for an invalid stdin (e.g. parent
+            // closed the pipe) → busy loop.
+            eof_ = true;
             return false;
         }
     }
@@ -1506,7 +1511,11 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
 
         size_t pfd_off = 0;
         if (poll_stdin) {
-            if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+            // POLLNVAL must be handled too: on macOS, poll() on a non-blocking fd that
+            // was redirected from /dev/null or whose pipe peer closed returns POLLNVAL.
+            // Treating it like other error/eof events lets reader.fill() set eof_ and
+            // breaks the busy loop.
+            if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
                 if (!reader.fill() && reader.overflowed()) {
                     RpcResponse err;
                     err.id = nullptr;
