@@ -1076,7 +1076,6 @@ static RpcResponse tool_edit(const RpcRequest &req) {
         // Try exact match first.
         size_t pos = content.find(old_normalized);
         size_t match_len = old_normalized.size();
-        bool fuzzy = false;
 
         if (pos == std::string::npos) {
             // Fuzzy: strip trailing whitespace from both, retry.
@@ -1099,7 +1098,6 @@ static RpcResponse tool_edit(const RpcRequest &req) {
             pos = pos_map[spos];
             size_t end_orig = pos_map[spos + stripped_old.size()];
             match_len = end_orig - pos;
-            fuzzy = true;
         } else {
             // Check uniqueness for exact match.
             if (content.find(old_normalized, pos + 1) != std::string::npos) {
@@ -1184,6 +1182,10 @@ class LineReader {
 public:
     explicit LineReader(int fd) : fd_(fd) {
         int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0) {
+            eof_ = true;
+            return;
+        }
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
 

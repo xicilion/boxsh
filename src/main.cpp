@@ -445,16 +445,27 @@ int main(int argc, char **argv) {
         }
     }
 
+    int rpc_fd_in = dup(STDIN_FILENO);
+    if (rpc_fd_in < 0 && errno != EBADF) {
+        std::fprintf(stderr, "boxsh: failed to duplicate stdin: %s\n",
+                     std::strerror(errno));
+        return 1;
+    }
+
     boxsh::WorkerPool pool(std::move(pool_cfg));
     std::string err;
     if (!pool.init(err)) {
+        if (rpc_fd_in >= 0)
+            close(rpc_fd_in);
         std::fprintf(stderr, "boxsh: failed to initialize worker pool: %s\n",
                      err.c_str());
         return 1;
     }
 
-    boxsh::rpc_run_loop(STDIN_FILENO, STDOUT_FILENO, pool);
+    boxsh::rpc_run_loop(rpc_fd_in, STDOUT_FILENO, pool);
 
     pool.shutdown();
+    if (rpc_fd_in >= 0)
+        close(rpc_fd_in);
     return 0;
 }

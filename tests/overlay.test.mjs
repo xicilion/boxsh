@@ -371,8 +371,10 @@ describe('sandbox — cow CWD redirect', () => {
         ['--sandbox', '--bind', `cow:${src}:${dst}`, '-c', `ls ${outsideDir}`],
         { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
       );
+      assert.equal(r.error, undefined, `ls failed to spawn: ${r.error?.message ?? ''}`);
+      assert.equal(r.signal, null, `ls was killed by signal ${r.signal}`);
       assert.notEqual(r.status, 0, 'ls should fail — outsideDir is not bound');
-      assert.ok(!r.stdout.includes('secret.txt'),
+      assert.ok(!(r.stdout ?? '').includes('secret.txt'),
         'secret.txt must not be visible');
     } finally {
       cleanup();
@@ -391,8 +393,10 @@ describe('sandbox — cow CWD redirect', () => {
         ['--sandbox', '-c', 'pwd'],
         { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
       );
+      assert.equal(rPwd.error, undefined, `pwd failed to spawn: ${rPwd.error?.message ?? ''}`);
+      assert.equal(rPwd.signal, null, `pwd was killed by signal ${rPwd.signal}`);
       assert.equal(rPwd.status, 0);
-      assert.notEqual(rPwd.stdout.trim(), outsideDir,
+      assert.notEqual((rPwd.stdout ?? '').trim(), outsideDir,
         'CWD inside sandbox must not be the host CWD');
 
       // Writing via absolute path should fail — CWD directory not bound.
@@ -411,8 +415,10 @@ describe('sandbox — cow CWD redirect', () => {
         ['--sandbox', '-c', `cat ${outsideDir}/marker.txt`],
         { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
       );
+      assert.equal(rCat.error, undefined, `cat failed to spawn: ${rCat.error?.message ?? ''}`);
+      assert.equal(rCat.signal, null, `cat was killed by signal ${rCat.signal}`);
       assert.notEqual(rCat.status, 0, 'cat should fail — CWD not bound');
-      assert.ok(!rCat.stdout.includes('host-cwd'),
+      assert.ok(!(rCat.stdout ?? '').includes('host-cwd'),
         'marker.txt content must not be visible');
     } finally {
       spawnSync('rm', ['-rf', outsideDir]);
@@ -444,8 +450,10 @@ describe('sandbox — cow CWD redirect', () => {
         ['--sandbox', '-c', `ls ${outsideDir}`],
         { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
       );
+      assert.equal(r.error, undefined, `ls failed to spawn: ${r.error?.message ?? ''}`);
+      assert.equal(r.signal, null, `ls was killed by signal ${r.signal}`);
       assert.notEqual(r.status, 0, 'ls should fail — no bind mounts');
-      assert.ok(!r.stdout.includes('secret.txt'),
+      assert.ok(!(r.stdout ?? '').includes('secret.txt'),
         'secret.txt must not be visible');
     } finally {
       spawnSync('rm', ['-rf', outsideDir]);

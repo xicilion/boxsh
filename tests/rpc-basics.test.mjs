@@ -7,7 +7,43 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { run, rpc, rpcMany, byId, toJsonRpc, fromJsonRpc } from './helpers.mjs';
+import { spawn } from 'node:child_process';
+import { BOXSH, run, rpc, rpcMany, byId, toJsonRpc, fromJsonRpc } from './helpers.mjs';
+
+function waitForExit(proc, timeout_ms = 1500) {
+  return new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    proc.stdout?.on('data', chunk => {
+      stdout += chunk;
+    });
+    proc.stderr?.on('data', chunk => {
+      stderr += chunk;
+    });
+    proc.on('error', err => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      proc.kill('SIGKILL');
+      resolve({ status: null, signal: 'SIGKILL', stdout, stderr, timedOut: true });
+    }, timeout_ms);
+
+    proc.on('exit', (status, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status, signal, stdout, stderr, timedOut: false });
+    });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Response shape
@@ -280,6 +316,60 @@ describe('rpc — protocol robustness', () => {
     const r = run(['--rpc', '--workers', '1'], '');
     assert.equal(r.signal, null);
     assert.equal(r.status, 0);
+  });
+
+  test('stdin redirected from /dev/null exits cleanly', {
+    skip: process.platform !== 'darwin' ? 'macOS-specific regression' : false,
+  }, async () => {
+    const proc = spawn('sh', [
+      '-c',
+      'exec </dev/null; exec "$1" --rpc --workers 1',
+      'sh',
+      BOXSH,
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const r = await waitForExit(proc);
+    assert.equal(r.timedOut, false,
+      `boxsh hung with stdin from /dev/null\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.signal, null,
+      `boxsh was killed by signal ${r.signal}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.status, 0,
+      `boxsh exited non-zero\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+  });
+
+  test('closing stdin pipe after startup exits cleanly', async () => {
+    const proc = spawn(BOXSH, ['--rpc', '--workers', '1'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    setTimeout(() => proc.stdin.end(), 100);
+    const r = await waitForExit(proc);
+    assert.equal(r.timedOut, false,
+      `boxsh hung after stdin pipe closed\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.signal, null,
+      `boxsh was killed by signal ${r.signal}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.status, 0,
+      `boxsh exited non-zero\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+  });
+
+  test('closed stdin fd before exec exits cleanly', {
+    skip: process.platform !== 'darwin' ? 'macOS-specific regression' : false,
+  }, async () => {
+    const proc = spawn('sh', [
+      '-c',
+      'exec 0<&-; exec "$1" --rpc --workers 1',
+      'sh',
+      BOXSH,
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const r = await waitForExit(proc, 1200);
+    assert.equal(r.timedOut, false,
+      `boxsh hung with fd 0 closed before exec\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.signal, null,
+      `boxsh was killed by signal ${r.signal}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.status, 0,
+      `boxsh exited non-zero\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
   });
 });
 
