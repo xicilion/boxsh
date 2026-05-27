@@ -198,7 +198,7 @@ console.log(formatChanges(changes));
 // A	result.txt
 ```
 
-Deletions are tracked via whiteout files (`.wh.<name>`), which `getChanges` detects automatically.
+On Linux overlay workspaces, deletions are tracked via whiteout files (`.wh.<name>`). On macOS clone-based workspaces, `getChanges` uses the COW snapshot manifest to report deletions and to avoid flagging untouched cloned files as modified.
 
 ---
 

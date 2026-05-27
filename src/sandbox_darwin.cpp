@@ -8,10 +8,13 @@
 #include <climits>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/clonefile.h>
 
@@ -27,8 +30,109 @@ extern "C" {
 
 namespace boxsh {
 
+namespace fs = std::filesystem;
+
 static std::string errno_str(const char *context) {
     return std::string(context) + ": " + std::strerror(errno);
+}
+
+static std::string cow_manifest_path(const std::string &dst) {
+    fs::path dst_path(dst);
+    return (dst_path.parent_path() / ".boxsh" /
+            (dst_path.filename().string() + ".manifest")).string();
+}
+
+static bool path_exists(const std::string &path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+static bool write_cow_manifest(const std::string &src,
+                               const std::string &dst,
+                               std::string &error) {
+    fs::path src_path(src);
+    fs::path manifest_path(cow_manifest_path(dst));
+
+    std::error_code ec;
+    fs::create_directories(manifest_path.parent_path(), ec);
+    if (ec) {
+        error = "create manifest parent: " + manifest_path.parent_path().string()
+              + ": " + ec.message();
+        return false;
+    }
+
+    std::ofstream manifest(manifest_path, std::ios::out | std::ios::trunc);
+    if (!manifest) {
+        error = errno_str(("open manifest: " + manifest_path.string()).c_str());
+        return false;
+    }
+
+    fs::recursive_directory_iterator it(
+        src_path,
+        fs::directory_options::skip_permission_denied,
+        ec
+    );
+    fs::recursive_directory_iterator end;
+    if (ec) {
+        error = "scan manifest source: " + src + ": " + ec.message();
+        return false;
+    }
+
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            error = "scan manifest source: " + src + ": " + ec.message();
+            return false;
+        }
+
+        std::error_code rel_ec;
+        fs::path rel = fs::relative(it->path(), src_path, rel_ec);
+        if (rel_ec) {
+            error = "relative manifest path: " + it->path().string()
+                  + ": " + rel_ec.message();
+            return false;
+        }
+
+        std::string rel_str = rel.generic_string();
+        if (!rel_str.empty()) manifest << rel_str << '\n';
+        if (!manifest) {
+            error = "write manifest: " + manifest_path.string();
+            return false;
+        }
+    }
+
+    manifest.close();
+    if (!manifest) {
+        error = "close manifest: " + manifest_path.string();
+        return false;
+    }
+
+    return true;
+}
+
+static bool directory_is_empty(const std::string &path, std::string &error) {
+    DIR *dir = opendir(path.c_str());
+    if (!dir) {
+        error = errno_str(("opendir: " + path).c_str());
+        return false;
+    }
+
+    bool empty = true;
+    while (struct dirent *entry = readdir(dir)) {
+        if (std::strcmp(entry->d_name, ".") == 0 ||
+            std::strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        empty = false;
+        break;
+    }
+
+    int close_rc = closedir(dir);
+    if (close_rc != 0) {
+        error = errno_str(("closedir: " + path).c_str());
+        return false;
+    }
+
+    return empty;
 }
 
 // ---------------------------------------------------------------------------
@@ -304,23 +408,43 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     }
 
     // ── 1. COW: clonefile(src, dst) ──────────────────────────────────────
-    // clonefile(2) creates an instant APFS COW snapshot of src at dst.
-    // dst must not already exist.  main() pre-creates an empty directory
-    // for Linux overlayfs compatibility; remove it before clonefile.
+    // clonefile(2) creates an instant APFS COW snapshot of src at dst for the
+    // initial workspace materialization.  If dst already contains data, treat
+    // it as an existing workspace and reuse it across sessions.
     for (const auto &bm : cfg.bind_mounts) {
         if (bm.mode != BindMount::Mode::COW) continue;
 
+        bool should_clone = true;
         struct stat st;
         if (stat(bm.dst.c_str(), &st) == 0) {
             if (!S_ISDIR(st.st_mode)) {
                 res.error = "COW dst exists and is not a directory: " + bm.dst;
                 return res;
             }
-            if (rmdir(bm.dst.c_str()) != 0) {
-                res.error = errno_str(("rmdir pre-existing dst: " + bm.dst).c_str());
+
+            std::string dir_error;
+            bool is_empty = directory_is_empty(bm.dst, dir_error);
+            if (!dir_error.empty()) {
+                res.error = dir_error;
                 return res;
             }
+
+            if (is_empty) {
+                if (rmdir(bm.dst.c_str()) != 0) {
+                    res.error = errno_str(("rmdir pre-existing dst: " + bm.dst).c_str());
+                    return res;
+                }
+            } else {
+                std::string manifest_path = cow_manifest_path(bm.dst);
+                if (!path_exists(manifest_path) &&
+                    !write_cow_manifest(bm.src, bm.dst, res.error)) {
+                    return res;
+                }
+                should_clone = false;
+            }
         }
+
+        if (!should_clone) continue;
 
         // Show a spinner with elapsed time on stderr so the user knows
         // the clone is in progress.  The spinner only appears after a
@@ -370,6 +494,8 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
             }
             return res;
         }
+
+        if (!write_cow_manifest(bm.src, bm.dst, res.error)) return res;
     }
 
     // ── 2. Apply Seatbelt profile ─────────────────────────────────────────

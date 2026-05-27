@@ -21,7 +21,7 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 |---|---|
 | **MCP server** | Implements MCP (Model Context Protocol) over stdio with Content-Length framing or newline-delimited JSON. Nine tools: `bash`, `read`, `write`, `edit`, `run_in_terminal`, `send_to_terminal`, `get_terminal_output`, `kill_terminal`, `list_terminals` — each with `inputSchema` and `annotations`. |
 | **OS-native sandbox** | Linux: user/mount/PID/network namespaces via direct syscalls + seccomp syscall filtering; macOS: Seatbelt (sandbox_init) + SBPL profiles — no external tools required |
-| **Overlay filesystem** | Copy-on-write workspace over any read-only base; writes accumulate in a caller-managed destination directory and persist between commands |
+| **Copy-on-write workspace** | Copy-on-write workspace over any read-only base; writes accumulate in a caller-managed destination directory, persist between commands, and can be resumed across sessions |
 | **Built-in file tools** | `read` (text with offset/limit, binary as base64 with MIME detection), `write` (create or overwrite, auto-creates parent dirs), and `edit` (multi-replacement with unified diff) run on background threads — the event loop is never blocked |
 | **JSON-RPC 2.0** | Dual transport: Content-Length framed (LSP-style) or newline-delimited JSON over stdin/stdout |
 | **Pre-forked worker pool** | Configurable number of workers (`--workers N`); each worker is forked once and reused across requests |
@@ -101,7 +101,7 @@ $ exit
 $ ls important-file.txt   # still here on the host
 important-file.txt
 $ ls /tmp/boxsh-try-abc123/work/
-.wh.important-file.txt   # the whiteout lives here, not in your directory
+# host-side representation is platform-specific; inspect with getChanges() for a portable diff
 ```
 
 The temp directory persists after exit so you can inspect or archive exactly what changed. `--try` is shorthand for `--sandbox --bind cow:CWD:<tmpdir>/work` with auto-managed directories. See [Quick-try Mode](docs/usage.md#quick-try-mode) for the full reference.
@@ -392,9 +392,9 @@ Sandbox options (applied in both shell mode and RPC mode):
   --new-net-ns         Create a new network namespace (loopback only).
   --bind ro:PATH       Expose PATH read-only inside the sandbox.
   --bind wr:PATH       Expose PATH read-write inside the sandbox.
-  --bind cow:SRC:DST   Mount an overlayfs at DST with SRC as the read-only
-                       base.  Writes go to DST (the upper layer); SRC is
-                       never modified.  DST must exist before launch.
+  --bind cow:SRC:DST   Create a copy-on-write workspace at DST with SRC as the
+                       read-only base. Writes go to DST; SRC is never modified.
+                       Existing DST contents are reused.
 
 Quick-try mode:
   --try                Launch a sandboxed shell on the current directory.

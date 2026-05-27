@@ -30,6 +30,34 @@ class BoxshChangesTests(unittest.TestCase):
             )
             self.assertEqual(format_changes(changes), "D\tdeleted.txt\nM\tsrc/keep.txt\nA\tsrc/new.txt\n")
 
+    def test_get_changes_formats_clone_snapshot_delta(self) -> None:
+        with TemporaryDirectory(prefix="boxsh-py-upper-") as upper_raw, TemporaryDirectory(prefix="boxsh-py-base-") as base_raw:
+            upper = Path(upper_raw)
+            base = Path(base_raw)
+
+            (base / "src").mkdir(parents=True)
+            (upper / "src").mkdir(parents=True)
+            (upper.parent / ".boxsh").mkdir(parents=True)
+
+            (base / "README.md").write_text("base\n", encoding="utf-8")
+            (base / "src" / "keep.txt").write_text("keep\n", encoding="utf-8")
+            (base / "src" / "old.txt").write_text("old\n", encoding="utf-8")
+
+            (upper / "README.md").write_text("patched\n", encoding="utf-8")
+            (upper / "src" / "keep.txt").write_text("keep\n", encoding="utf-8")
+            (upper / "src" / "new.txt").write_text("new\n", encoding="utf-8")
+
+            (upper.parent / ".boxsh" / f"{upper.name}.manifest").write_text(
+                "README.md\nsrc\nsrc/keep.txt\nsrc/old.txt\n",
+                encoding="utf-8",
+            )
+
+            changes = get_changes(upper=str(upper), base=str(base))
+            self.assertEqual(
+                [(change.path, change.type) for change in changes],
+                [("README.md", "modified"), ("src/new.txt", "added"), ("src/old.txt", "deleted")],
+            )
+
 
 class BoxshOverlayParityTests(unittest.TestCase):
     def setUp(self) -> None:

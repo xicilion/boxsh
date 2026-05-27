@@ -9,7 +9,9 @@ namespace boxsh {
 //   RO  — read-only:  host path exposed inside sandbox, writes denied.
 //   RW  — read-write: host path exposed inside sandbox, writes allowed.
 //   COW — copy-on-write: src is the read-only base; dst captures writes.
-//         On Linux this uses overlayfs; on macOS it uses clonefile(2).
+//         The COW workspace semantics are consistent across platforms even
+//         though the host-side implementation differs (overlayfs on Linux,
+//         clone snapshots + manifest tracking on macOS).
 //         sandbox_apply() auto-creates any transient directories needed.
 struct BindMount {
     enum class Mode { RO, RW, COW };

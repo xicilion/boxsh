@@ -12,6 +12,7 @@ import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { run, BOXSH, TEMPDIR, toJsonRpc, fromJsonRpc } from './helpers.mjs';
+import { getChanges } from '../sdk/js/src/changes.mjs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -109,6 +110,51 @@ describe('sandbox — cow mounts', () => {
     }
   });
 
+  test('existing dst can be reused across sessions', () => {
+    const { src, dst, cleanup } = makeCowDirs();
+    try {
+      fs.writeFileSync(path.join(src, 'base.txt'), 'from-src\n');
+
+      const first = rpcCow(src, dst, `echo first > ${dst}/persist.txt`);
+      assert.equal(first.exit_code, 0);
+
+      const second = rpcCow(
+        src,
+        dst,
+        `cat ${dst}/persist.txt && echo second > ${dst}/second.txt`,
+      );
+      assert.equal(second.exit_code, 0);
+      assert.equal(second.stdout, 'first\n');
+      assert.equal(
+        fs.readFileSync(path.join(dst, 'persist.txt'), 'utf8'), 'first\n',
+      );
+      assert.equal(
+        fs.readFileSync(path.join(dst, 'second.txt'), 'utf8'), 'second\n',
+      );
+      assert.equal(
+        fs.readFileSync(path.join(src, 'base.txt'), 'utf8'), 'from-src\n',
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('getChanges reports no false positives for untouched base files', () => {
+    const { src, dst, cleanup } = makeCowDirs();
+    try {
+      fs.writeFileSync(path.join(src, 'base.txt'), 'original\n');
+      fs.mkdirSync(path.join(src, 'nested'));
+      fs.writeFileSync(path.join(src, 'nested', 'keep.txt'), 'keep\n');
+
+      const resp = rpcCow(src, dst, 'true');
+      assert.equal(resp.exit_code, 0);
+
+      assert.deepEqual(getChanges({ upper: dst, base: src }), []);
+    } finally {
+      cleanup();
+    }
+  });
+
   test('src is read-only: writes are not reflected in src', () => {
     const { src, dst, cleanup } = makeCowDirs();
     try {
@@ -141,6 +187,21 @@ describe('sandbox — cow mounts', () => {
       assert.equal(
         fs.readFileSync(path.join(src, 'victim.txt'), 'utf8'), 'delete-me\n',
       );
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('getChanges reports deleted src-layer files', () => {
+    const { src, dst, cleanup } = makeCowDirs();
+    try {
+      fs.writeFileSync(path.join(src, 'ghost.txt'), 'ghost\n');
+      const resp = rpcCow(src, dst, `rm ${dst}/ghost.txt`);
+      assert.equal(resp.exit_code, 0);
+
+      assert.deepEqual(getChanges({ upper: dst, base: src }), [
+        { path: 'ghost.txt', type: 'deleted' },
+      ]);
     } finally {
       cleanup();
     }

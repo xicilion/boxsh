@@ -12,7 +12,7 @@ This guide walks through the core scenarios boxsh is built for, with concrete ex
 
 - [How it Works](#how-it-works)
   - [Namespace Sandbox](#namespace-sandbox)
-  - [Overlayfs Copy-on-Write](#overlayfs-copy-on-write)
+  - [Copy-on-Write Workspace](#copy-on-write-workspace)
   - [Two Modes](#two-modes)
 - [Scenario 1: AI Agent Command Sandbox](#scenario-1-ai-agent-command-sandbox)
 - [Scenario 2: Zero-cost Directory Forking](#scenario-2-zero-cost-directory-forking)
@@ -72,13 +72,13 @@ flowchart TB
     MNT --> RootFS
 ```
 
-### Overlayfs Copy-on-Write
+### Copy-on-Write Workspace
 
-The `--bind cow:` flag mounts a directory with copy-on-write semantics. Your original files serve as a read-only base layer. A separate destination directory captures all modifications:
+The `--bind cow:` flag creates a directory workspace with copy-on-write semantics. Your original files serve as a read-only base layer. A separate destination directory captures all modifications:
 
 - **Reads** go straight to the original files — zero copy, zero overhead.
 - **Writes** are automatically redirected to the destination directory. The original file is never touched.
-- **Deletes** create a marker (whiteout) in the destination directory. The original file remains intact.
+- **Deletes** are tracked in the destination workspace without touching the original files. On Linux this is an overlay whiteout; on macOS `getChanges()` derives deletions from the snapshot metadata.
 
 ```mermaid
 flowchart LR
@@ -89,9 +89,9 @@ flowchart LR
         F3["node_modules/ (new)"]
     end
 
-    subgraph Upper["dst/ (writable)"]
+    subgraph Upper["dst/ (writable workspace)"]
         U1["node_modules/"]
-        U2[".wh.temp.txt (whiteout)"]
+      U2["platform-specific delete tracking"]
     end
 
     subgraph Lower["src/ (read-only, original project)"]
@@ -106,7 +106,7 @@ flowchart LR
 
 No matter how many `npm install`, `make`, or `rm -rf` commands run inside the sandbox, the original directory never changes. All modifications accumulate in the destination directory — you can inspect them with `find dst/` or use the SDK's `getChanges()` to get a structured list of added, modified, and deleted files.
 
-Multiple lower layers are also supported — boxsh uses this to enable session branching (see Scenario 3).
+Session state can also be branched by reusing one destination directory as the base for a new COW workspace (see Scenario 3).
 
 ### Two Modes
 
@@ -329,7 +329,7 @@ This works for **any directory** — it's not limited to git repos. You can fork
 | `cp -a` the working directory | O(n) copy. For a 5 GB directory with 200K files, this takes minutes. Two branches = two full copies = 10 GB extra disk. |
 | Filesystem snapshot (btrfs/ZFS) | Fast, but requires a specific filesystem. Not available on ext4, xfs, or typical cloud VMs. |
 
-**Solution with boxsh.** overlayfs can be stacked. The current session's destination directory becomes the read-only source for the next level. The original session is untouched — you just create new overlays on top of it.
+**Solution with boxsh.** boxsh can branch a saved workspace state. The current session's destination directory becomes the read-only source for the next level. The original session is untouched — you just create new COW workspaces on top of it.
 
 ### How it works
 
@@ -628,7 +628,7 @@ cd /tmp/dev/dst
 npm install           # node_modules goes to dst, not your real project
 vim config.js         # edits land in dst
 make build            # build artifacts go to dst
-rm -rf src/           # original src/ is untouched — only a whiteout is created in dst
+rm -rf src/           # original src/ is untouched — deletion is tracked in dst
 ```
 
 When you exit the shell, inspect and decide:
