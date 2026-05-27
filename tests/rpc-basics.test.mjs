@@ -260,6 +260,33 @@ describe('rpc — duration_ms', () => {
 // ---------------------------------------------------------------------------
 
 describe('rpc — protocol robustness', () => {
+  test('single raw tools/call bash request exits cleanly', () => {
+    const input = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'raw-bash',
+      method: 'tools/call',
+      params: {
+        name: 'bash',
+        arguments: {
+          command: 'echo ok',
+        },
+      },
+    }) + '\n';
+
+    const r = run(['--rpc', '--workers', '1'], input);
+    assert.equal(r.signal, null,
+      `boxsh was killed by signal ${r.signal}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.status, 0,
+      `boxsh exited non-zero\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+
+    const resp = JSON.parse(r.stdout.trim());
+    const flat = fromJsonRpc(resp);
+    assert.equal(flat.id, 'raw-bash');
+    assert.equal(flat.exit_code, 0);
+    assert.equal(flat.stdout, 'ok\n');
+    assert.equal(flat.stderr, '');
+  });
+
   test('invalid JSON → error response (no crash)', () => {
     const r = run(['--rpc', '--workers', '1'], 'not json at all\n');
     const resp = JSON.parse(r.stdout.trim());

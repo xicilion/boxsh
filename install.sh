@@ -66,12 +66,32 @@ if ! curl -fSL -o "$TMP" "$URL"; then
 fi
 chmod +x "$TMP"
 
+resign_if_macos() {
+    target="$1"
+    if [ "$OS_TAG" != "darwin" ]; then
+        return 0
+    fi
+    if ! command -v codesign >/dev/null 2>&1; then
+        echo "Warning: codesign not found; installed binary may be rejected by macOS until re-signed manually." >&2
+        return 0
+    fi
+    if ! codesign -f -s - "$target" >/dev/null 2>&1; then
+        echo "Warning: failed to ad-hoc sign $target; macOS may refuse to launch it." >&2
+        return 0
+    fi
+}
+
 # Install
 if [ -w "$INSTALL_DIR" ]; then
     mv "$TMP" "${INSTALL_DIR}/boxsh"
+    resign_if_macos "${INSTALL_DIR}/boxsh"
 else
     echo "  (need sudo to write to ${INSTALL_DIR})"
     sudo mv "$TMP" "${INSTALL_DIR}/boxsh"
+    if [ "$OS_TAG" = "darwin" ]; then
+        sudo codesign -f -s - "${INSTALL_DIR}/boxsh" >/dev/null 2>&1 || \
+            echo "Warning: failed to ad-hoc sign ${INSTALL_DIR}/boxsh; macOS may refuse to launch it." >&2
+    fi
 fi
 
 echo "Done! Run 'boxsh --help' to get started."

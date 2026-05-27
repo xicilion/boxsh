@@ -67,6 +67,7 @@ elif [[ "${HOST_OS}" == "Darwin" ]]; then
     fi
     cmake -B ${BUILD_DIR} -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA}
     cmake --build ${BUILD_DIR} --parallel $(sysctl -n hw.logicalcpu)
+    codesign -f -s - ${BUILD_DIR}/boxsh
 fi
 
 # Package release
@@ -74,6 +75,7 @@ if [[ "${BUILD_TAG}" != "" ]]; then
     mkdir -p release
     if [[ "${HOST_OS}" == "Darwin" ]]; then
         cp ${BUILD_DIR}/boxsh release/boxsh-${BUILD_TAG}-darwin-${BUILD_ARCH}
+        codesign -f -s - release/boxsh-${BUILD_TAG}-darwin-${BUILD_ARCH}
     else
         cp ${BUILD_DIR}/boxsh release/boxsh-${BUILD_TAG}-linux-${BUILD_ARCH}
     fi
