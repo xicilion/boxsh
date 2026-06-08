@@ -224,6 +224,12 @@ else()
     target_sources(boxsh PRIVATE src/sandbox.cpp)
 endif()
 
+if(APPLE)
+    add_executable(power_probe_darwin
+        tests/power_probe_darwin.c
+    )
+endif()
+
 target_include_directories(boxsh
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -259,6 +265,10 @@ target_link_libraries(boxsh
 
 if(APPLE)
     target_link_libraries(boxsh PRIVATE "-framework CoreFoundation")
+    target_link_libraries(power_probe_darwin PRIVATE
+        "-framework CoreFoundation"
+        "-framework IOKit"
+    )
 endif()
 
 add_dependencies(boxsh libedit_vendored)

@@ -262,6 +262,12 @@ static std::string build_sbpl(const SandboxConfig &cfg) {
     p += "  (global-name \"com.apple.trustdFileHelper\")\n";
     p += ")\n";
 
+    // Power-management queries used by fibjs go through IOKit and open the
+    // RootDomain user client after the bootstrap lookup succeeds.
+    p += "(allow iokit-open\n";
+    p += "  (iokit-user-client-class \"RootDomainUserClient\")\n";
+    p += ")\n";
+
     // POSIX IPC — only shared memory and semaphores.
     p += "(allow ipc-posix-shm)\n";
     p += "(allow ipc-posix-sem)\n";
