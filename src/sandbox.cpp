@@ -1035,7 +1035,22 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         }
 
         if (!restore_path.empty() && chdir(restore_path.c_str()) != 0) {
-            chdir("/");
+            // The saved CWD may not exist inside the new root (e.g. /tmp is a
+            // fresh tmpfs not shared with the host).  Only auto-create the
+            // directory when it lives under a writable, sandbox-owned mount
+            // (currently only /tmp).  For paths outside any mount, we must
+            // NOT create them — that would leak a host path into the sandbox.
+            if (errno == ENOENT &&
+                (restore_path == "/tmp" ||
+                 restore_path.compare(0, 5, "/tmp/") == 0)) {
+                std::string ignored_err;
+                mkdir_p(restore_path, 0755, ignored_err);
+                if (chdir(restore_path.c_str()) != 0) {
+                    chdir("/");
+                }
+            } else {
+                chdir("/");
+            }
         }
     }
 

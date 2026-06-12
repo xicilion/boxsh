@@ -904,7 +904,7 @@ static RpcResponse tool_write(const RpcRequest &req) {
     std::string raw;
     if (req.encoding == "base64") {
         // Base64-decode req.content into raw.
-        static const char kDecodeTable[128] = {
+        static const signed char kDecodeTable[128] = {
             -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
             -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
             -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,62, -1,-1,-1,63,

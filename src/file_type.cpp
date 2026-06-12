@@ -24,18 +24,6 @@ static inline bool eq_str(const unsigned char *buf, size_t buflen,
     return eq(buf, buflen, s, strlen(s), off);
 }
 
-// Check a single byte at an offset.
-static inline bool byte_eq(const unsigned char *buf, size_t len,
-                            size_t off, unsigned char val) {
-    return off < len && buf[off] == val;
-}
-
-// Check a single byte with a mask.
-static inline bool byte_mask(const unsigned char *buf, size_t len,
-                              size_t off, unsigned char mask, unsigned char val) {
-    return off < len && (buf[off] & mask) == val;
-}
-
 // TAR header checksum validation (offset 148, 8 octal digits).
 static bool tar_checksum_valid(const unsigned char *buf, size_t len) {
     if (len < 512) return false;
