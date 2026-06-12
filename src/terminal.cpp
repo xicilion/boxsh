@@ -13,6 +13,8 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cerrno>
+#include <cstring>
 
 // POSIX PTY
 #include <stdlib.h>   // posix_openpt, grantpt, unlockpt, ptsname
@@ -210,10 +212,22 @@ TerminalCreateResult terminal_create(const std::string &command,
     // Open PTY master.
     int fdm = posix_openpt(O_RDWR | O_NOCTTY);
     if (fdm < 0) throw std::runtime_error("posix_openpt failed");
+
+#ifdef __APPLE__
+    // On macOS grantpt() is a no-op; both grantpt/unlockpt may fail in
+    // sandboxed environments (Seatbelt).  The slave device is still
+    // accessible via ptsname(), so treat failure as non-fatal.
     if (grantpt(fdm) < 0 || unlockpt(fdm) < 0) {
-        close(fdm);
-        throw std::runtime_error("grantpt/unlockpt failed");
+        // non-fatal on macOS — proceed with the PTY
     }
+#else
+    if (grantpt(fdm) < 0 || unlockpt(fdm) < 0) {
+        int e = errno;
+        close(fdm);
+        throw std::runtime_error(
+            std::string("grantpt/unlockpt failed: ") + std::strerror(e));
+    }
+#endif
 
     // Set PTY size.
     struct winsize ws{};

@@ -324,6 +324,12 @@ static std::string build_sbpl(const SandboxConfig &cfg) {
     p += "(allow file-ioctl (literal \"/dev/random\"))\n";
     p += "(allow file-ioctl (literal \"/dev/urandom\"))\n";
     p += "(allow file-ioctl (literal \"/dev/tty\"))\n";
+    // PTY master: posix_openpt() opens /dev/ptmx; grantpt()/unlockpt()
+    // issue ioctl on the master fd and may touch the slave device.
+    p += "(allow file-ioctl (literal \"/dev/ptmx\"))\n";
+    // The slave pseudo-terminal devices live under /dev/ttys*.
+    // grantpt() may need to chown/chmod these when the sandbox is active.
+    p += "(allow file-read* file-write* file-ioctl (regex \"^/dev/ttys[0-9a-f]+$\"))\n";
 
     // Allow reads and writes to /dev (e.g. /dev/null, /dev/zero, /dev/urandom).
     p += "(allow file-write* (subpath \"/dev\"))\n";

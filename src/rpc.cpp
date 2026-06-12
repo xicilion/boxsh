@@ -534,20 +534,25 @@ static std::string mcp_tools_list_response(const json &id) {
 // ---------------------------------------------------------------------------
 
 static std::string tool_terminal_run(const RpcRequest &req) {
-    auto result = terminal_create(req.terminal_command,
-                                  req.terminal_cols, req.terminal_rows);
     json j;
     j["jsonrpc"] = "2.0";
     j["id"] = req.id;
     json r;
-    json sc = {
-        {"id",        result.id},
-        {"output",    ensure_valid_utf8(result.output)},
-        {"exited",    result.exited},
-        {"exit_code", result.exited ? json(result.exit_code) : json(nullptr)},
-    };
-    r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
-    r["structuredContent"] = sc;
+    try {
+        auto result = terminal_create(req.terminal_command,
+                                      req.terminal_cols, req.terminal_rows);
+        json sc = {
+            {"id",        result.id},
+            {"output",    ensure_valid_utf8(result.output)},
+            {"exited",    result.exited},
+            {"exit_code", result.exited ? json(result.exit_code) : json(nullptr)},
+        };
+        r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
+        r["structuredContent"] = sc;
+    } catch (const std::exception &e) {
+        r["content"] = json::array({{{"type", "text"}, {"text", e.what()}}});
+        r["isError"] = true;
+    }
     j["result"] = r;
     return j.dump();
 }
