@@ -67,12 +67,6 @@ EditInput = Union[EditOperation, Tuple[str, str], Mapping[str, str]]
 
 
 @dataclass(frozen=True)
-class EditResult:
-    diff: str
-    first_changed_line: int
-
-
-@dataclass(frozen=True)
 class ReadResult:
     content: str
     encoding: str
@@ -318,18 +312,13 @@ class BoxshClient:
             self._send("tools/call", {"name": "write", "arguments": {"path": _path_str(file_path), "content": content}})
         )
 
-    def edit(self, file_path: PathLike, edits: Sequence[EditInput]) -> EditResult:
+    def edit(self, file_path: PathLike, edits: Sequence[EditInput]) -> None:
         serialized_edits = [_serialize_edit(edit) for edit in edits]
-        structured = self._tool_result(
+        self._tool_result(
             self._send(
                 "tools/call",
                 {"name": "edit", "arguments": {"path": _path_str(file_path), "edits": serialized_edits}},
             )
-        )
-        first_changed_line = structured.get("firstChangedLine")
-        return EditResult(
-            diff=str(structured.get("diff", "")),
-            first_changed_line=first_changed_line if isinstance(first_changed_line, int) else 0,
         )
 
     def run_in_terminal(self, command: str, opts: Optional[RunInTerminalOptions] = None) -> RunInTerminalResult:

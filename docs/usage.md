@@ -900,8 +900,6 @@ Rules:
 - Edits must not overlap
 - `oldText` must not be empty
 
-`structuredContent` includes `diff` (unified diff) and `firstChangedLine` (1-indexed line number of the first changed line).
-
 #### Error Model
 
 boxsh distinguishes two kinds of errors per the MCP spec:

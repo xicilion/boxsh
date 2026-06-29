@@ -200,7 +200,7 @@ Creates or overwrites the file. Parent directories are created automatically if 
    "edits":[{"oldText":"debug = false", "newText":"debug = true"}]}}}
 ```
 
-Each `oldText` must appear exactly once in the original file. Edits must not overlap. `structuredContent` includes `diff` (unified diff) and `firstChangedLine`.
+Each `oldText` must appear exactly once in the original file. Edits must not overlap.
 
 #### `run_in_terminal` — Start a persistent PTY session
 

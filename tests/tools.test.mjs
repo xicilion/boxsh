@@ -432,16 +432,13 @@ describe('tool — write', () => {
 // ---------------------------------------------------------------------------
 
 describe('tool — edit', () => {
-  test('single edit replaces text and confirms with diff', () => {
+  test('single edit replaces text', () => {
     const p = tmpFile('hello world\n');
     try {
       const resp = rpc({ id: '1', tool: 'edit', path: p,
         edits: [{ oldText: 'world', newText: 'earth' }] });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
       assert.equal(fs.readFileSync(p, 'utf8'), 'hello earth\n');
-      assert.ok(resp.diff?.includes('-hello world'), 'diff should show removed line');
-      assert.ok(resp.diff?.includes('+hello earth'), 'diff should show added line');
-      assert.equal(resp.firstChangedLine, 1);
     } finally { fs.rmSync(p, { force: true }); }
   });
 

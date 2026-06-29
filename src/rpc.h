@@ -76,10 +76,6 @@ struct RpcResponse {
     // Built-in tool result
     std::string tool_content; // read: file text; write: confirmation
 
-    // edit details
-    std::string diff;
-    int first_changed_line = 0;
-
     // Present on any failure (shell crash or tool error)
     int error_code = -32000; // JSON-RPC 2.0 error code
     std::string error;

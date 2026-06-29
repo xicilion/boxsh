@@ -118,10 +118,8 @@ describe('BoxshClient — tool error handling', () => {
     it('edit() succeeds on valid replacement', async () => {
         const p = path.join(tmpDir, 'edit-ok.txt');
         fs.writeFileSync(p, 'hello world\n');
-        const result = await client.edit(p, [{ oldText: 'world', newText: 'earth' }]);
+        await client.edit(p, [{ oldText: 'world', newText: 'earth' }]);
         assert.equal(fs.readFileSync(p, 'utf8'), 'hello earth\n');
-        assert.ok(result.diff.includes('-hello world'));
-        assert.ok(result.diff.includes('+hello earth'));
     });
 
     it('exec() does not throw on non-zero exit code', async () => {

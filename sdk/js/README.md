@@ -81,10 +81,9 @@ console.log(img.mime_type); // "image/png"
 await client.write('/workspace/output.txt', 'hello\n');
 
 // Edit a file — search-and-replace; each oldText must appear exactly once
-const { diff, firstChangedLine } = await client.edit('/workspace/output.txt', [
+await client.edit('/workspace/output.txt', [
     { oldText: 'hello', newText: 'world' },
 ]);
-console.log(diff);  // unified diff format
 ```
 
 ---
@@ -240,9 +239,9 @@ Read file contents. For text files, `offset` is the 1-based start line and `limi
 
 Create or overwrite a file. Parent directories are created automatically if needed.
 
-### `client.edit(path, edits) → Promise<{ diff, firstChangedLine }>`
+### `client.edit(path, edits) → Promise<void>`
 
-Apply search-and-replace edits. `edits` is an array of `{ oldText, newText }`. Each `oldText` must appear exactly once in the file. All edits match against the original file content (not the result of a previous edit). Returns a unified diff and the first changed line number.
+Apply search-and-replace edits. `edits` is an array of `{ oldText, newText }`. Each `oldText` must appear exactly once in the file. All edits match against the original file content (not the result of a previous edit).
 
 ### `client.runInTerminal(command, opts?) → Promise<RunInTerminalResult>`
 

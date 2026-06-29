@@ -52,8 +52,7 @@ with BoxshClient() as client:
 
     client.write(output, "hello\n")
 
-    diff = client.edit(output, [("hello", "world")])
-    print(diff.diff)
+    client.edit(output, [("hello", "world")])
 ```
 
 ## Terminal sessions

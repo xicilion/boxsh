@@ -212,7 +212,6 @@ export class BoxshClient {
      *
      * @param {string} filePath   Absolute path to the file
      * @param {Array<{ oldText: string, newText: string }>} edits
-     * @returns {Promise<{ diff: string, firstChangedLine: number }>}
      */
     async edit(filePath, edits) {
         const result = await this.#send({
@@ -220,11 +219,6 @@ export class BoxshClient {
             params: { name: 'edit', arguments: { path: filePath, edits } },
         });
         this.#checkToolError(result);
-        const sc = result.structuredContent ?? {};
-        return {
-            diff:             sc.diff ?? '',
-            firstChangedLine: sc.firstChangedLine ?? 0,
-        };
     }
 
     // -----------------------------------------------------------------

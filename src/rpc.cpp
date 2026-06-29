@@ -262,12 +262,6 @@ std::string rpc_serialize_response(const RpcResponse &resp) {
         } else if (resp.tool == ToolKind::Edit) {
             std::string text = is_error ? resp.error : "OK";
             result["content"] = json::array({{{"type", "text"}, {"text", text}}});
-            if (!is_error) {
-                result["structuredContent"] = {
-                    {"diff", resp.diff},
-                    {"firstChangedLine", resp.first_changed_line}
-                };
-            }
         }
 
         if (is_error)
@@ -417,11 +411,7 @@ static std::string mcp_tools_list_response(const json &id) {
         }},
         {"outputSchema", {
             {"type", "object"},
-            {"properties", {
-                {"diff", {{"type", "string"}, {"description", "Unified diff of the changes made"}}},
-                {"firstChangedLine", {{"type", "integer"}, {"description", "Line number of the first change (1-indexed)"}}}
-            }},
-            {"required", json::array({"diff", "firstChangedLine"})}
+            {"properties", json::object()}
         }},
         {"annotations", {
             {"title", "Edit File"},
@@ -968,47 +958,6 @@ static RpcResponse tool_write(const RpcRequest &req) {
     return resp;
 }
 
-// Generate a minimal unified diff (no context lines — sufficient for callers).
-static std::string make_diff(const std::string &path,
-                              const std::string &before,
-                              const std::string &after,
-                              int &first_changed_line) {
-    // Split both into lines.
-    auto split = [](const std::string &s) {
-        std::vector<std::string> v;
-        std::istringstream ss(s);
-        std::string ln;
-        while (std::getline(ss, ln)) v.push_back(ln);
-        return v;
-    };
-    auto blines = split(before);
-    auto alines = split(after);
-
-    // Find first differing line.
-    first_changed_line = 0;
-    size_t common_prefix = 0;
-    while (common_prefix < blines.size() && common_prefix < alines.size() &&
-           blines[common_prefix] == alines[common_prefix])
-        ++common_prefix;
-    if (common_prefix < blines.size() || common_prefix < alines.size())
-        first_changed_line = (int)common_prefix + 1;
-
-    // Simple hunk: output all removed lines then all added lines.
-    std::ostringstream d;
-    d << "--- a/" << path << "\n+++ b/" << path << "\n";
-    if (first_changed_line > 0) {
-        int b_count = (int)blines.size() - (int)common_prefix;
-        int a_count = (int)alines.size() - (int)common_prefix;
-        d << "@@ -" << first_changed_line << "," << b_count
-          << " +" << first_changed_line << "," << a_count << " @@\n";
-        for (size_t i = common_prefix; i < blines.size(); ++i)
-            d << "-" << blines[i] << "\n";
-        for (size_t i = common_prefix; i < alines.size(); ++i)
-            d << "+" << alines[i] << "\n";
-    }
-    return d.str();
-}
-
 static RpcResponse tool_edit(const RpcRequest &req) {
     RpcResponse resp;
     resp.id   = req.id;
@@ -1216,7 +1165,6 @@ static RpcResponse tool_edit(const RpcRequest &req) {
     fout << content;
     fout.close();
 
-    resp.diff = make_diff(resolved_path, original, content, resp.first_changed_line);
     return resp;
 }
 
