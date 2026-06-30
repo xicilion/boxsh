@@ -15,3 +15,4 @@ import './power-sandbox.test.mjs';
 import './terminal.test.mjs';
 import './terminal-sandbox.test.mjs';
 import './file-type.test.mjs';
+import './utf8-crash.test.mjs';

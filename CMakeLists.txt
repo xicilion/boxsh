@@ -243,7 +243,7 @@ target_include_directories(boxsh
 target_compile_definitions(boxsh
     PRIVATE
         _GNU_SOURCE
-        BOXSH_VERSION="3.3.1"
+        BOXSH_VERSION="3.4.0"
 )
 
 target_compile_options(boxsh

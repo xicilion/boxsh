@@ -224,11 +224,20 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
 std::string rpc_serialize_response(const RpcResponse &resp) {
     json j;
     j["jsonrpc"] = "2.0";
-    j["id"] = resp.id;
 
+    // Sanitize the id: if the request carried a string id with invalid
+    // UTF-8, nlohmann::json::dump() will throw type_error.316.
+    json safe_id = resp.id;
+    if (safe_id.is_string())
+        safe_id = ensure_valid_utf8(safe_id.get<std::string>());
+    j["id"] = safe_id;
+
+    // Guard every user-supplied string: nlohmann::json will throw type_error.316
+    // if any string contains invalid UTF-8, so we sanitize defensively.
     if (resp.is_protocol_error && !resp.error.empty()) {
         // JSON-RPC 2.0 protocol error (parse error, unknown method, etc.).
-        j["error"] = {{"code", resp.error_code}, {"message", resp.error}};
+        j["error"] = {{"code", resp.error_code},
+                        {"message", ensure_valid_utf8(resp.error)}};
     } else {
         // MCP CallToolResult format.
         json result;
@@ -237,7 +246,8 @@ std::string rpc_serialize_response(const RpcResponse &resp) {
         if (resp.tool == ToolKind::None) {
             // Bash command result.
             if (is_error) {
-                result["content"] = json::array({{{"type", "text"}, {"text", resp.error}}});
+                result["content"] = json::array({{{"type", "text"},
+                    {"text", ensure_valid_utf8(resp.error)}}});
             } else {
                 std::string safe_stdout = ensure_valid_utf8(resp.stdout_data);
                 std::string safe_stderr = ensure_valid_utf8(resp.stderr_data);
@@ -257,10 +267,11 @@ std::string rpc_serialize_response(const RpcResponse &resp) {
                     is_error = true;
             }
         } else if (resp.tool == ToolKind::Write) {
-            std::string text = is_error ? resp.error : resp.tool_content;
+            std::string text = is_error ? ensure_valid_utf8(resp.error)
+                                        : ensure_valid_utf8(resp.tool_content);
             result["content"] = json::array({{{"type", "text"}, {"text", text}}});
         } else if (resp.tool == ToolKind::Edit) {
-            std::string text = is_error ? resp.error : "OK";
+            std::string text = is_error ? ensure_valid_utf8(resp.error) : "OK";
             result["content"] = json::array({{{"type", "text"}, {"text", text}}});
         }
 
@@ -277,9 +288,15 @@ static std::string mcp_initialize_response(const json &id,
     // Echo the client's protocolVersion so the handshake succeeds.
     // Fall back to a known baseline if the client didn't supply one.
     std::string version = client_version.empty() ? "2024-11-05" : client_version;
+
+    // Sanitize id in case it contains invalid UTF-8.
+    json safe_id = id;
+    if (safe_id.is_string())
+        safe_id = ensure_valid_utf8(safe_id.get<std::string>());
+
     json j;
     j["jsonrpc"] = "2.0";
-    j["id"] = id;
+    j["id"] = safe_id;
     j["result"] = {
         {"protocolVersion", version},
         {"capabilities", {
@@ -522,9 +539,14 @@ static std::string mcp_tools_list_response(const json &id) {
         }}
     });
 
+    // Sanitize id in case it contains invalid UTF-8.
+    json safe_id = id;
+    if (safe_id.is_string())
+        safe_id = ensure_valid_utf8(safe_id.get<std::string>());
+
     json j;
     j["jsonrpc"] = "2.0";
-    j["id"] = id;
+    j["id"] = safe_id;
     j["result"] = {{"tools", tools}};
     return j.dump();
 }
@@ -550,7 +572,8 @@ static std::string tool_terminal_run(const RpcRequest &req) {
         r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
         r["structuredContent"] = sc;
     } catch (const std::exception &e) {
-        r["content"] = json::array({{{"type", "text"}, {"text", e.what()}}});
+        r["content"] = json::array({{{"type", "text"},
+            {"text", ensure_valid_utf8(e.what())}}});
         r["isError"] = true;
     }
     j["result"] = r;
@@ -573,7 +596,8 @@ static std::string tool_terminal_send(const RpcRequest &req) {
         r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
         r["structuredContent"] = sc;
     } catch (const std::exception &e) {
-        r["content"] = json::array({{{"type", "text"}, {"text", e.what()}}});
+        r["content"] = json::array({{{"type", "text"},
+            {"text", ensure_valid_utf8(e.what())}}});
         r["isError"] = true;
     }
     j["result"] = r;
@@ -595,7 +619,8 @@ static std::string tool_terminal_output(const RpcRequest &req) {
         r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
         r["structuredContent"] = sc;
     } catch (const std::exception &e) {
-        r["content"] = json::array({{{"type", "text"}, {"text", e.what()}}});
+        r["content"] = json::array({{{"type", "text"},
+            {"text", ensure_valid_utf8(e.what())}}});
         r["isError"] = true;
     }
     j["result"] = r;
@@ -613,7 +638,8 @@ static std::string tool_terminal_kill(const RpcRequest &req) {
         r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
         r["structuredContent"] = sc;
     } catch (const std::exception &e) {
-        r["content"] = json::array({{{"type", "text"}, {"text", e.what()}}});
+        r["content"] = json::array({{{"type", "text"},
+            {"text", ensure_valid_utf8(e.what())}}});
         r["isError"] = true;
     }
     j["result"] = r;
@@ -1374,25 +1400,33 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
         int sv[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
             // Extremely unlikely (fd exhaustion). Fall back to synchronous execution.
-            RpcResponse resp;
-            switch (req.tool) {
-                case ToolKind::Write: resp = tool_write(req); break;
-                case ToolKind::Edit:  resp = tool_edit(req);  break;
-                default: break;
+            try {
+                RpcResponse resp;
+                switch (req.tool) {
+                    case ToolKind::Write: resp = tool_write(req); break;
+                    case ToolKind::Edit:  resp = tool_edit(req);  break;
+                    default: break;
+                }
+                // Tools that produce pre-serialized JSON strings.
+                std::string direct_payload;
+                switch (req.tool) {
+                    case ToolKind::Read:           direct_payload = tool_read_json(req);       break;
+                    case ToolKind::TerminalRun:    direct_payload = tool_terminal_run(req);    break;
+                    case ToolKind::TerminalSend:   direct_payload = tool_terminal_send(req);   break;
+                    case ToolKind::TerminalOutput: direct_payload = tool_terminal_output(req); break;
+                    case ToolKind::TerminalKill:   direct_payload = tool_terminal_kill(req);   break;
+                    case ToolKind::TerminalList:   direct_payload = tool_terminal_list(req);   break;
+                    default: break;
+                }
+                if (!direct_payload.empty()) { write_msg(direct_payload); return; }
+                write_resp(resp);
+            } catch (...) {
+                RpcResponse err;
+                err.id = req.id;
+                err.error = "internal error: tool handler crashed";
+                err.is_protocol_error = true;
+                write_resp(err);
             }
-            // Tools that produce pre-serialized JSON strings.
-            std::string direct_payload;
-            switch (req.tool) {
-                case ToolKind::Read:           direct_payload = tool_read_json(req);       break;
-                case ToolKind::TerminalRun:    direct_payload = tool_terminal_run(req);    break;
-                case ToolKind::TerminalSend:   direct_payload = tool_terminal_send(req);   break;
-                case ToolKind::TerminalOutput: direct_payload = tool_terminal_output(req); break;
-                case ToolKind::TerminalKill:   direct_payload = tool_terminal_kill(req);   break;
-                case ToolKind::TerminalList:   direct_payload = tool_terminal_list(req);   break;
-                default: break;
-            }
-            if (!direct_payload.empty()) { write_msg(direct_payload); return; }
-            write_resp(resp);
             return;
         }
         fcntl(sv[0], F_SETFD, FD_CLOEXEC);
@@ -1400,30 +1434,43 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
 
         int write_fd = sv[1];
         std::thread([req, write_fd]() {
-            // Tools that produce pre-serialized JSON.
-            std::string direct_payload;
-            switch (req.tool) {
-                case ToolKind::Read:           direct_payload = tool_read_json(req);       break;
-                case ToolKind::TerminalRun:    direct_payload = tool_terminal_run(req);    break;
-                case ToolKind::TerminalSend:   direct_payload = tool_terminal_send(req);   break;
-                case ToolKind::TerminalOutput: direct_payload = tool_terminal_output(req); break;
-                case ToolKind::TerminalKill:   direct_payload = tool_terminal_kill(req);   break;
-                case ToolKind::TerminalList:   direct_payload = tool_terminal_list(req);   break;
-                default: break;
-            }
-            RpcResponse resp;
-            if (direct_payload.empty()) {
+            try {
+                // Tools that produce pre-serialized JSON.
+                std::string direct_payload;
                 switch (req.tool) {
-                    case ToolKind::Write: resp = tool_write(req); break;
-                    case ToolKind::Edit:  resp = tool_edit(req);  break;
+                    case ToolKind::Read:           direct_payload = tool_read_json(req);       break;
+                    case ToolKind::TerminalRun:    direct_payload = tool_terminal_run(req);    break;
+                    case ToolKind::TerminalSend:   direct_payload = tool_terminal_send(req);   break;
+                    case ToolKind::TerminalOutput: direct_payload = tool_terminal_output(req); break;
+                    case ToolKind::TerminalKill:   direct_payload = tool_terminal_kill(req);   break;
+                    case ToolKind::TerminalList:   direct_payload = tool_terminal_list(req);   break;
                     default: break;
                 }
-                direct_payload = rpc_serialize_response(resp);
+                RpcResponse resp;
+                if (direct_payload.empty()) {
+                    switch (req.tool) {
+                        case ToolKind::Write: resp = tool_write(req); break;
+                        case ToolKind::Edit:  resp = tool_edit(req);  break;
+                        default: break;
+                    }
+                    direct_payload = rpc_serialize_response(resp);
+                }
+                std::string payload = direct_payload + '\n';
+                uint32_t len = (uint32_t)payload.size();
+                (void)write_all(write_fd, &len, sizeof(len));
+                (void)write_all(write_fd, payload.data(), len);
+            } catch (...) {
+                // If anything above throws (e.g. nlohmann::json type_error),
+                // send a synthetic error so the event loop doesn't hang.
+                RpcResponse err;
+                err.id = req.id;
+                err.error = "internal error: tool handler crashed";
+                err.is_protocol_error = true;
+                std::string fallback = rpc_serialize_response(err) + '\n';
+                uint32_t len = (uint32_t)fallback.size();
+                (void)write_all(write_fd, &len, sizeof(len));
+                (void)write_all(write_fd, fallback.data(), len);
             }
-            std::string payload = direct_payload + '\n';
-            uint32_t len = (uint32_t)payload.size();
-            (void)write_all(write_fd, &len, sizeof(len));
-            (void)write_all(write_fd, payload.data(), len);
             close(write_fd);
         }).detach();
 
@@ -1432,7 +1479,8 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
     };
 
     while (true) {
-        // Dispatch a previously buffered cmd if a worker is now free.
+        try {
+            // Dispatch a previously buffered cmd if a worker is now free.
         if (buffered_cmd.has_value() && pool.idle_count() > 0) {
             pool.try_dispatch(*buffered_cmd);
             buffered_cmd.reset();
@@ -1564,6 +1612,29 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
         // Erase in reverse order so earlier indices remain valid.
         for (auto it = done_tool_indices.rbegin(); it != done_tool_indices.rend(); ++it)
             pending_tools.erase(pending_tools.begin() + (ptrdiff_t)*it);
+
+        } catch (...) {
+            // An unexpected exception (e.g. nlohmann::json type_error.316 from
+            // dump() on a malformed id or error string) should not kill the
+            // process.  Log and try to continue.
+            static bool once;
+            if (!once) {
+                once = true;
+                std::fprintf(stderr, "boxsh: unhandled exception in event loop"
+                                     " — attempting to continue\n");
+            }
+            // Drain any pending worker completions so we don't deadlock.
+            auto busy = pool.busy_entries();
+            for (auto &b : busy) {
+                pool.collect(b.idx);
+                in_flight--;
+            }
+            // Close pending tool fds.
+            for (auto &t : pending_tools) close(t.fd);
+            pending_tools.clear();
+            in_flight = 0;
+            buffered_cmd.reset();
+        }
     }
 
     fclose(fout);
