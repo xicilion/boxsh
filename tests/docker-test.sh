@@ -39,8 +39,8 @@ BINARY="$PROJECT_ROOT/build/boxsh"
 
 if [ ! -x "$BINARY" ]; then
     echo "==> Building boxsh on the host (build/boxsh not found)"
-    cmake -B "$PROJECT_ROOT/build" -S "$PROJECT_ROOT" -DCMAKE_BUILD_TYPE=Debug >/dev/null
-    cmake --build "$PROJECT_ROOT/build" --parallel "$(nproc)" >/dev/null
+    cmake -B "$PROJECT_ROOT/build" -S "$PROJECT_ROOT" -DCMAKE_BUILD_TYPE=Debug
+    cmake --build "$PROJECT_ROOT/build" --parallel "$(nproc)"
 fi
 echo "==> Using binary: $BINARY"
 
