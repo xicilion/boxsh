@@ -709,21 +709,30 @@ static bool bind_mount(const std::string &src, const std::string &dst,
 }
 
 // Conditionally bind a host path into new_root if the source exists.
-// System directories don't need MS_RDONLY: write access is controlled by
-// host Unix permissions (the sandbox maps to real uid, not kernel root).
-static bool try_bind(const std::string &src, const std::string &new_root,
-                     std::string &err) {
+static bool try_bind_ro(const std::string &src, const std::string &new_root,
+                        bool readonly, std::string &err) {
     struct stat st;
     if (stat(src.c_str(), &st) != 0) return true; // not present, skip
-    return bind_mount(src, new_root + src, /*readonly=*/false, err);
+    return bind_mount(src, new_root + src, readonly, err);
+}
+
+static bool try_bind(const std::string &src, const std::string &new_root,
+                     std::string &err) {
+    return try_bind_ro(src, new_root, /*readonly=*/false, err);
 }
 
 
 // Set up the automatic read-only system mounts that every sandbox gets.
 // These provide a working environment without exposing writable host paths.
 static bool setup_system_mounts(const std::string &new_root, std::string &err) {
+    // In the container engine the process is real root with no userns UID
+    // remapping, so Unix permission-based write protection does not apply.
+    // System mounts must be explicitly read-only to prevent one sandbox from
+    // modifying shared host state that other sandboxes also see.
+    const bool ro = running_in_container();
+
     // /usr — all system binaries and libraries.
-    if (!try_bind("/usr", new_root, err)) return false;
+    if (!try_bind_ro("/usr", new_root, ro, err)) return false;
 
     // On merged-usr distros /bin /sbin /lib /lib64 are symlinks to usr/*.
     // On non-merged distros they are real directories that need binding.
@@ -744,7 +753,7 @@ static bool setup_system_mounts(const std::string &new_root, std::string &err) {
             }
         } else {
             // Real directory — bind mount.
-            if (!try_bind(usr_compat[i], new_root, err)) return false;
+            if (!try_bind_ro(usr_compat[i], new_root, ro, err)) return false;
         }
     }
 
@@ -772,15 +781,15 @@ static bool setup_system_mounts(const std::string &new_root, std::string &err) {
 
     // /run — bind from host so symlink targets under /run (e.g. resolv.conf)
     // resolve correctly inside the sandbox.
-    if (!try_bind("/run", new_root, err)) return false;
+    if (!try_bind_ro("/run", new_root, ro, err)) return false;
 
     // /etc — bind entire host /etc. All files are world-readable by design;
     // write access is controlled by host Unix permissions (real uid).
-    if (!try_bind("/etc", new_root, err)) return false;
+    if (!try_bind_ro("/etc", new_root, ro, err)) return false;
 
     // /var — bind from host so package databases (dpkg, rpm) and other
     // system state are accessible inside the sandbox.
-    if (!try_bind("/var", new_root, err)) return false;
+    if (!try_bind_ro("/var", new_root, ro, err)) return false;
 
     return true;
 }

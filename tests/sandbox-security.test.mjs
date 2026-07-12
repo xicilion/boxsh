@@ -336,17 +336,51 @@ describe('Phase 5 — Privilege escalation prevention', () => {
       `Expected mknod to be denied, got: ${r.stdout}`);
   });
 
-  test('cannot write to /etc or other system directories',
-    { skip: IN_CONTAINER && 'container engine runs as root without CLONE_NEWUSER; /etc is writable by root (host engine relies on userns UID remapping for this protection)' },
+  test('cannot write to system directories (/etc, /var, /usr, /usr/local, /run)',
+    { skip: IN_CONTAINER && 'container engine runs as real root without CLONE_NEWUSER; system dirs are writable by root — host engine relies on userns UID remapping for this protection. Container mode RO is covered by docker.test.mjs' },
     () => {
-    const r = tryRun(TEMPDIR,
-      'touch /etc/boxsh_test 2>&1; echo EXIT=$?');
-    assert.ok(
-      r.stdout.includes('Permission denied') ||
-      r.stdout.includes('Read-only') ||
-      r.stdout.includes('Operation not permitted') ||
-      r.stdout.includes('EXIT=1'),
-      `Expected write to /etc to be denied, got: ${r.stdout}`);
+    // Host engine binds /usr, /etc, /var, /run as RW but relies on userns
+    // UID remapping: sandbox root maps to the calling (unprivileged) user, so
+    // Unix DAC denies writes to root-owned system directories (EACCES).  This
+    // test verifies that protection holds across all shared system dirs and
+    // that nothing leaks to the host filesystem.
+    const probes = [
+      '/etc/.boxsh_ro_probe',
+      '/var/.boxsh_ro_probe',
+      '/usr/.boxsh_ro_probe',
+      '/usr/local/.boxsh_ro_probe',
+      '/run/.boxsh_ro_probe',
+    ];
+
+    // Pre-condition: probes must not pre-exist on the host FS.
+    for (const p of probes) {
+      assert.ok(!fs.existsSync(p),
+        `pre-condition failed: ${p} already exists on host FS`);
+    }
+
+    try {
+      for (const p of probes) {
+        const r = tryRun(TEMPDIR, `touch ${p} 2>&1; echo EXIT=$?`);
+        assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
+        // touch must fail — userns UID remapping prevents writing to root-owned dirs.
+        assert.ok(
+          r.stdout.includes('Permission denied') ||
+          r.stdout.includes('Read-only') ||
+          r.stdout.includes('Operation not permitted') ||
+          r.stdout.includes('EXIT=1') ||
+          r.stdout.includes('EXIT=2'),
+          `Expected write to ${p} to be denied, got: ${r.stdout}`);
+        // CRITICAL: the write must NOT leak to the host FS.
+        assert.ok(!fs.existsSync(p),
+          `LEAK: ${p} was created on the host FS — ` +
+          `system dir is writable, violating inter-sandbox isolation`);
+      }
+    } finally {
+      // Defensive cleanup — should be a no-op on pass.
+      for (const p of probes) {
+        try { fs.unlinkSync(p); } catch { /* already absent */ }
+      }
+    }
   });
 });
 

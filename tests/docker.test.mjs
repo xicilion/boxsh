@@ -142,4 +142,48 @@ describe('docker — container engine', { skip }, () => {
     assert.ok(!fs.existsSync('/marker.flow'),
       'sandbox leaked a file to the host root');
   });
+
+  test('system mounts are read-only in container mode (no inter-sandbox leakage)', () => {
+    // Regression for the /var, /usr/local writable bug.  The container engine
+    // runs as real root with CAP_SYS_ADMIN but no CLONE_NEWUSER, so Unix
+    // permission-based protection (root-owned /usr, 0700 /root) does NOT
+    // apply.  System bind mounts (/usr, /etc, /var, /run) must be explicitly
+    // read-only, otherwise one sandbox can modify shared host state that other
+    // sandboxes also see — breaking inter-sandbox isolation.
+    const probes = [
+      '/var/.boxsh_ro_probe',
+      '/usr/local/.boxsh_ro_probe',
+      '/etc/.boxsh_ro_probe',
+      '/run/.boxsh_ro_probe',
+    ];
+
+    // Pre-condition: probes must not pre-exist on the container FS.
+    for (const p of probes) {
+      assert.ok(!fs.existsSync(p),
+        `pre-condition failed: ${p} already exists on container FS`);
+    }
+
+    try {
+      for (const p of probes) {
+        const r = run(['--sandbox', '-c', `touch ${p}`], '', 10000);
+        // touch must fail — the bind must be read-only.
+        assert.notEqual(r.status, 0,
+          `expected touch ${p} to fail inside sandbox, got status ${r.status}\n` +
+          `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+        // The error should mention read-only / EROFS.
+        const combined = `${r.stdout}\n${r.stderr}`;
+        assert.ok(/read-only|readonly|EROFS/i.test(combined),
+          `expected read-only error for ${p}, got: ${combined}`);
+        // CRITICAL: the write must NOT leak to the container FS.
+        assert.ok(!fs.existsSync(p),
+          `LEAK: ${p} was created on the container FS — ` +
+          `system mount is writable, violating inter-sandbox isolation`);
+      }
+    } finally {
+      // Defensive cleanup — should be a no-op on pass.
+      for (const p of probes) {
+        try { fs.unlinkSync(p); } catch { /* already absent */ }
+      }
+    }
+  });
 });
