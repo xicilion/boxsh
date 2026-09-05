@@ -750,25 +750,29 @@ The resulting binary is `build/boxsh`. Copy it anywhere on your `$PATH`.
 
 ### Docker Usage
 
-boxsh detects Docker/containerd/K8s containers automatically and switches to the **container sandbox engine** — no configuration needed. The container engine skips user namespaces (unnecessary and incompatible with rootless Docker) and uses fuse-overlayfs for COW (kernel overlay-on-overlay is unsupported on overlay2 root filesystems).
+boxsh detects Docker/containerd/K8s containers automatically and runs the **same unprivileged userns engine as on the host** — but the container must start as a non-root user:
 
-**Required container privileges.** Start the container with these four flags:
+- **`--user` container (required)** — boxsh runs natively unprivileged; identical userns engine, no drop involved.
+- **Root container (rejected)** — a root sandbox would have no isolation: in rootful Docker the container's real root is the host's root, so system files would be writable and RW bind mounts would accept root-owned setuid binaries that persist on the host. boxsh refuses every sandbox request (`--sandbox`, `--try`, `--rpc --sandbox`) with an actionable error before any namespace syscall; plain (non-sandbox) shells keep working.
 
 ```sh
-docker run --rm \
-  --cap-add SYS_ADMIN \                   # mount/pivot_root/unshare
-  --security-opt seccomp=unconfined \     # allow unshare/mount syscalls
-  --security-opt apparmor=unconfined \    # allow mount --make-rslave /
-  --device /dev/fuse \                    # fuse-overlayfs COW
-  your-image
+docker run --rm --user "$(id -u):$(id -g)" \
+  --security-opt seccomp=unconfined \
+  --security-opt apparmor=unconfined \
+  --device /dev/fuse \
+  -v "$PWD:/src" -w /src build/boxsh --sandbox --bind wr:"$PWD" -c 'ls /'
 ```
+
+No `--cap-add SYS_ADMIN` is needed: the user namespace provides the mount capability inside the sandbox. COW goes through the kernel overlay when the lower/upper live on a plain filesystem, and falls back to fuse-overlayfs (overlay-on-overlay rootfs, missing kernel support).
+
+Directories you bind-mount and want the sandbox to write must be writable by the `--user` uid. Root-owned mapped directories are the one case boxsh cannot paper over — it refuses rather than run an isolated-by-nothing root sandbox. If a previous root run left root-owned files, chown them once from a root shell (`docker run -u 0 ... chown -R "$(id -u):$(id -g)" <dir>`), then start the container with `--user`.
 
 | Flag | Purpose | Error if missing |
 |------|---------|-----------------|
-| `--cap-add SYS_ADMIN` | Allows `mount`, `pivot_root`, `unshare(CLONE_NEWNS)` | `unshare (container mode): Operation not permitted; boxsh inside Docker requires: --cap-add SYS_ADMIN ...` |
-| `--security-opt seccomp=unconfined` | Docker's default seccomp profile blocks `unshare` and `mount` | `unshare (container mode): Invalid argument` |
+| `--user "$(id -u):$(id -g)"` | Root containers are rejected (no isolation) | `boxsh inside Docker must run as a non-root user: a root sandbox would have no isolation ... Restart the container with --user "$(id -u):$(id -g)" ...` |
+| `--security-opt seccomp=unconfined` | Docker's default seccomp profile blocks `unshare` and `mount` | `unshare (container userns engine): ...; boxsh inside Docker needs unprivileged user namespaces ...` |
 | `--security-opt apparmor=unconfined` | Default AppArmor profile denies `mount --make-rslave /` | `mount --make-rslave /: Permission denied; container must be started with --security-opt apparmor=unconfined` |
-| `--device /dev/fuse` | fuse-overlayfs needs `/dev/fuse` for COW bind mounts | `container is missing /dev/fuse — start Docker with --device /dev/fuse` (only when using COW) |
+| `--device /dev/fuse` | fuse-overlayfs needs `/dev/fuse` for COW fallback | `container is missing /dev/fuse — start Docker with --device /dev/fuse` (only when using COW) |
 
 **Usage inside the container is identical to host mode.** All commands, flags, and tools work the same way:
 
@@ -781,8 +785,8 @@ boxsh --rpc --workers 4 --sandbox --bind cow:"/project:/tmp/dst"
 
 **Behavioral differences from host engine:**
 
-- The process runs as **actual root** inside the sandbox (no user-namespace UID remapping). This means system paths like `/etc` and `/usr` are writable — these are protected by mount-ns isolation (`pivot_root` to a fresh tmpfs), not by Unix permissions.
-- COW persistence behavior is identical — writes accumulate in the destination directory, survive across commands within the same session, and can be resumed across sessions.
+- Isolation is **identical to the host**: the sandbox is an unprivileged user namespace (the container's `--user` uid is remapped to 0 inside the sandbox), kernel DAC protects root-owned system files, and COW persistence behavior is identical — writes accumulate in the destination directory, survive across commands within the same session, and can be resumed across sessions.
+- `/proc` is a read-only bind of the container's `/proc` (fresh procfs mounts are refused inside a nested user namespace). Sibling processes in the same container are visible; host processes never are, and `/proc/sys` stays unwritable.
 - `--try` mode creates its temporary directory under the current working directory's filesystem (as on the host), and prints the save path to stderr on exit.
 
 **Testing inside Docker.** The project includes a dev/CI test runner:

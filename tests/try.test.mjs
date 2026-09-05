@@ -14,6 +14,12 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { BOXSH, TEMPDIR } from './helpers.mjs';
 
+// In containers the default HOME may not exist (e.g. /nonexistent for uid
+// 65534); fall back to TEMPDIR so the $HOME-sibling isolation tests run
+// identically on host and in containers.
+const HOMEDIR = os.homedir();
+const HOME_FALLBACK = fs.existsSync(HOMEDIR) ? HOMEDIR : TEMPDIR;
+
 // Container detection (mirrors src/sandbox.cpp running_in_container).
 // In a container, the process runs as root without CLONE_NEWUSER, so Unix
 // permission-based protections (e.g. /root 0700, /usr root-owned) do not
@@ -33,6 +39,9 @@ function tryRun(cwd, cmd, timeout_ms = 5000) {
     encoding: 'utf8',
     cwd,
     timeout: timeout_ms,
+    // --try binds $HOME read-only; make sure it points at a real directory
+    // even in containers (where the default HOME may not exist).
+    env: { ...process.env, HOME: HOME_FALLBACK },
   });
 }
 
@@ -242,7 +251,7 @@ describe('--try mode — sandbox isolation', () => {
   test('sibling directory under $HOME is readable inside sandbox (RO bind)', () => {
     // $HOME is bind-mounted read-only, so all directories under $HOME
     // (including siblings of CWD) are readable inside the sandbox.
-    const HOME    = os.homedir();
+    const HOME    = HOME_FALLBACK;
     const cwd     = fs.mkdtempSync(path.join(HOME, '.boxsh-test-cwd-'));
     const sibling = fs.mkdtempSync(path.join(HOME, '.boxsh-test-sib-'));
     fs.writeFileSync(path.join(sibling, 'visible.txt'), 'readable-in-sandbox');
@@ -261,7 +270,7 @@ describe('--try mode — sandbox isolation', () => {
   test('sandbox delete in $HOME sibling does not reach host (RO bind)', () => {
     // $HOME is bind-mounted read-only: deletes inside the sandbox are blocked
     // with EPERM; the real file on the host is untouched.
-    const HOME    = os.homedir();
+    const HOME    = HOME_FALLBACK;
     const cwd     = fs.mkdtempSync(path.join(HOME, '.boxsh-test-cwd-'));
     const sibling = fs.mkdtempSync(path.join(HOME, '.boxsh-test-sib-'));
     fs.writeFileSync(path.join(sibling, 'victim.txt'), 'important-data');
@@ -279,7 +288,7 @@ describe('--try mode — sandbox isolation', () => {
   test('sandbox create in $HOME sibling does not reach host (RO bind)', () => {
     // New files created in $HOME inside the sandbox are blocked with EPERM
     // (read-only bind); they do not appear on the host filesystem.
-    const HOME    = os.homedir();
+    const HOME    = HOME_FALLBACK;
     const cwd     = fs.mkdtempSync(path.join(HOME, '.boxsh-test-cwd-'));
     const sibling = fs.mkdtempSync(path.join(HOME, '.boxsh-test-sib-'));
     try {
@@ -296,7 +305,7 @@ describe('--try mode — sandbox isolation', () => {
   test('sandbox overwrite in $HOME sibling does not reach host (RO bind)', () => {
     // Overwrites in $HOME inside the sandbox are blocked with EPERM
     // (read-only bind); the original file on the host remains unchanged.
-    const HOME    = os.homedir();
+    const HOME    = HOME_FALLBACK;
     const cwd     = fs.mkdtempSync(path.join(HOME, '.boxsh-test-cwd-'));
     const sibling = fs.mkdtempSync(path.join(HOME, '.boxsh-test-sib-'));
     const victim  = path.join(sibling, 'config.txt');
@@ -430,7 +439,7 @@ describe('--try mode — sandbox isolation', () => {
     // so $HOME directories are readable inside the sandbox.
     if (!fs.existsSync('/home')) return; // not on host — skip
     const cwd     = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
-    const homeDir = fs.mkdtempSync(path.join(os.homedir(), '.boxsh-test-'));
+    const homeDir = fs.mkdtempSync(path.join(HOME_FALLBACK, '.boxsh-test-'));
     fs.writeFileSync(path.join(homeDir, 'marker.txt'), 'visible-via-overlay');
     try {
       const r = tryRun(cwd, `cat "${path.join(homeDir, 'marker.txt')}" 2>&1; echo exit:$?`);

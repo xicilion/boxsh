@@ -1,10 +1,12 @@
 /**
  * docker-negative.test.mjs — error-reporting contract for the container engine.
  *
- * Run ONLY inside a container that lacks /dev/fuse (the second invocation in
- * tests/docker-test.sh).  It asserts that a COW request fails with an
- * actionable error mentioning --device /dev/fuse, rather than a bare
- * exit-status or a silent crash.
+ * Run ONLY inside a --user 65534 container that lacks /dev/fuse (the
+ * negative-path invocation in tests/docker-test.sh).  It asserts that a COW
+ * request fails with an actionable error mentioning --device /dev/fuse,
+ * rather than a bare exit-status or a silent crash.  (Root containers never
+ * reach the COW step — they are rejected up front; see
+ * docker-root-reject.test.mjs.)
  *
  * Not registered in tests/index.test.mjs: the normal CI container provides
  * /dev/fuse, so this would skip there anyway.  Kept as a standalone file so
@@ -27,7 +29,14 @@ const IN_CONTAINER =
 const HAS_DEV_FUSE = fs.existsSync('/dev/fuse');
 
 function makeCowDirs() {
-  const base = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-docker-neg-'));
+  // Deliberately create the COW dirs on the container's OWN root filesystem
+  // (overlay2): the kernel overlay mount fails there (overlay-on-overlay),
+  // forcing the fuse-overlayfs path — which is what this test must exercise
+  // without /dev/fuse.  On a plain host bind (e.g. /src/temp) the kernel
+  // overlay would succeed and the test would not be testing anything.  The
+  // suite runs as --user 65534, so /tmp (overlay rootfs, world-writable)
+  // is usable without any chown.
+  const base = fs.mkdtempSync('/tmp/boxsh-docker-neg-');
   const src = path.join(base, 'src');
   const dst = path.join(base, 'dst');
   fs.mkdirSync(src);

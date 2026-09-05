@@ -95,11 +95,14 @@ jobs:
           tag: ${{ github.ref }}
           overwrite: true
 
-  # Exercises boxsh's container sandbox engine: build + run the full test suite
-  # inside a Docker container that grants SYS_ADMIN, seccomp=unconfined, and
-  # /dev/fuse.  Verifies Docker self-adaptation (CLONE_NEWNS+NEWPID without
-  # NEWUSER, fuse-overlayfs COW for overlay-on-overlay) and that the existing
-  # capability suite still passes in that environment.
+  # Exercises boxsh's Docker support with the host-built binary:
+  #   * ROOT container (no --user) — boxsh must refuse every sandbox request
+  #     with an actionable error (a root sandbox has no isolation): the
+  #     root-rejection suite.
+  #   * --user 65534 container — the container engine contract, the full
+  #     host-style suites (index + SDK), and the COW negative path (no
+  #     /dev/fuse), matching host semantics.
+  # Both volume modes (bind-mount and tmpfs) are covered by docker-test.sh.
   docker-test:
     needs: build
     if: ${{ !cancelled() }}

@@ -26,7 +26,13 @@ import { BOXSH, TEMPDIR } from './helpers.mjs';
 
 const IS_MACOS = process.platform === 'darwin';
 const IS_LINUX = process.platform === 'linux';
-const HOME = os.homedir();
+
+// Tests create temp dirs under "HOME".  In containers HOME may point at a
+// non-existent path (e.g. /nonexistent for uid 65534); fall back to TEMPDIR
+// (a writable workspace dir) so the suite runs identically on host and in
+// containers.
+const HOMEDIR = os.homedir();
+const HOME = fs.existsSync(HOMEDIR) ? HOMEDIR : TEMPDIR;
 
 // Container detection (mirrors src/sandbox.cpp running_in_container).
 // In a container, COW uses fuse-overlayfs, which deadlocks on cross-filesystem
@@ -42,6 +48,9 @@ function tryRun(cwd, cmd, timeout_ms = 8000) {
     encoding: 'utf8',
     cwd,
     timeout: timeout_ms,
+    // --try binds $HOME read-only; make sure it points at a real directory
+    // even in containers (where the default HOME may not exist).
+    env: { ...process.env, HOME },
   });
 }
 
@@ -478,7 +487,9 @@ describe('Phase 7 — /proc information leakage', () => {
   });
 
   test('sandbox cannot read host process cmdline',
-    { skip: !IS_LINUX },
+    { skip: !IS_LINUX || (IN_CONTAINER &&
+      'container userns engine binds the container /proc read-only — ' +
+      'sibling container processes are visible by design (host processes never are)') },
     () => {
     const hostPid = process.pid;
     const r = spawnSync(BOXSH, ['--sandbox', '-c',

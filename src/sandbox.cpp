@@ -10,6 +10,7 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <grp.h>
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
@@ -78,10 +79,13 @@ static bool path_lexists(const std::string &path) {
 }
 
 // Detect whether boxsh is running inside a container (Docker/containerd/K8s).
-// Result is computed once and cached.  Used to switch sandbox_apply() to the
-// "container engine": skip CLONE_NEWUSER (unnecessary + fails to nest under
-// userns-remapped/rootless Docker) and route COW through fuse-overlayfs
-// (kernel overlay-on-overlay is unsupported on overlay2 root filesystems).
+// Result is computed once and cached.  Container detection drives two
+// differences from host mode: root containers are rejected (a root sandbox
+// would have no isolation — see sandbox_apply()), and the engine details
+// adapt to a nested user namespace: /proc is bound read-only (fresh procfs
+// mounts are refused in a nested userns) and COW routes through
+// fuse-overlayfs (kernel overlay-on-overlay is unsupported on overlay2 root
+// filesystems).
 //
 // Detection signals (any one is sufficient):
 //   - /.dockerenv                  (Docker creates this in every container)
@@ -591,14 +595,17 @@ static bool mount_overlay_at(const std::string &lowerdir,
                                std::string &err) {
     if (!mkdir_p(dest, 0755, err)) return false;
 
-    // Inside a container the root filesystem is typically overlay2, and the
-    // kernel refuses to stack an overlay on top of overlayfs paths
-    // (overlay-on-overlay).  Skip the doomed kernel attempt and go straight
-    // to fuse-overlayfs, which is userspace and unaffected by this limit.
-    if (!running_in_container()) {
-        // xino=off: disable cross-inode-number encoding between lower and upper
-        // layers.  Without this, overlayfs copy-up fails with EOVERFLOW when the
-        // lower filesystem has inode numbers that exceed the representable range.
+    // Try the kernel overlay first (xino=off: disable cross-inode-number
+    // encoding between lower and upper layers — without this, overlayfs
+    // copy-up fails with EOVERFLOW when the lower filesystem has inode
+    // numbers that exceed the representable range).  This works on the
+    // host, and inside containers too when the lower/upper live on a plain
+    // filesystem (e.g. a host bind mount in the container userns engine).
+    // It fails with EINVAL/EPERM/ENOTSUP in the user-namespace failure
+    // modes (XFS with large inodes, missing CAP_SYS_ADMIN, overlay-on-
+    // overlay on an overlay2 rootfs) — those fall back to fuse-overlayfs,
+    // which is userspace and unaffected by these limits.
+    {
         std::string opts = "lowerdir=" + lowerdir +
                            ",upperdir=" + upper +
                            ",workdir="  + work +
@@ -606,10 +613,6 @@ static bool mount_overlay_at(const std::string &lowerdir,
         if (mount("overlay", dest.c_str(), "overlay", 0, opts.c_str()) == 0)
             return true;
 
-        // Fall back to fuse-overlayfs for the user-namespace failure modes we
-        // see in practice: EINVAL on XFS with large inodes, EPERM when nested
-        // containers block kernel overlay mounts without CAP_SYS_ADMIN, and
-        // ENOTSUP for overlay-on-overlay.
         int saved_errno = errno;
         if (saved_errno != EINVAL && saved_errno != EPERM &&
             saved_errno != ENOTSUP) {
@@ -669,6 +672,48 @@ static bool mount_tmpfs_at(const std::string &path,
     return true;
 }
 
+// Return the nosuid/nodev/noexec mount flags of the filesystem containing
+// 'path', by scanning /proc/self/mountinfo for the deepest mountpoint that
+// contains it.  Needed for read-only remounts of bind mounts: the kernel
+// locks the source mount's flags on cross-user-namespace bind copies
+// (lock_mnt_tree), and the remount must repeat the locked flags or it is
+// rejected with EPERM.
+static unsigned long host_mount_flags(const std::string &path) {
+    unsigned long result = 0;
+    FILE *f = fopen("/proc/self/mountinfo", "re");
+    if (!f) return 0;
+
+    char line[4096];
+    std::string best;
+    while (fgets(line, sizeof(line), f)) {
+        // Format: <id> <parent> <major:minor> <root> <mountpoint> <options> ...
+        char *save = nullptr;
+        char *tok = strtok_r(line, " ", &save);
+        char *mountpoint = nullptr;
+        char *options = nullptr;
+        for (int field = 0; tok && field < 6; ++field) {
+            if (field == 4) mountpoint = tok;
+            else if (field == 5) options = tok;
+            tok = strtok_r(nullptr, " ", &save);
+        }
+        if (!mountpoint || !options) continue;
+        std::string mp(mountpoint);
+        if (!path_is_under(path, mp)) continue;
+        if (mp.size() <= best.size()) continue;
+        best = mp;
+        result = 0;
+        char *osave = nullptr;
+        for (char *o = strtok_r(options, ",", &osave); o;
+             o = strtok_r(nullptr, ",", &osave)) {
+            if (std::strcmp(o, "nosuid") == 0) result |= MS_NOSUID;
+            else if (std::strcmp(o, "nodev") == 0) result |= MS_NODEV;
+            else if (std::strcmp(o, "noexec") == 0) result |= MS_NOEXEC;
+        }
+    }
+    fclose(f);
+    return result;
+}
+
 // Recursively bind-mount 'src' to 'dst', creating 'dst' if needed.
 static bool bind_mount(const std::string &src, const std::string &dst,
                        bool readonly, std::string &err) {
@@ -700,6 +745,12 @@ static bool bind_mount(const std::string &src, const std::string &dst,
     if (readonly) {
         // A second remount is required to actually apply MS_RDONLY on a bind mount.
         flags |= MS_REMOUNT | MS_RDONLY;
+        // Cross-userns bind copies get the source mount's flags locked by the
+        // kernel (lock_mnt_tree); the remount must repeat flags the source
+        // already has (nosuid/nodev/noexec) or it is rejected with EPERM.
+        // Only flags the source already has are repeated — never new ones,
+        // which would break setuid binaries and executables on plain mounts.
+        flags |= host_mount_flags(src) & (MS_NOSUID | MS_NODEV | MS_NOEXEC);
         if (mount(src.c_str(), dst.c_str(), nullptr, flags, nullptr) != 0) {
             err = errno_str(("bind mount remount rdonly: " + dst).c_str());
             return false;
@@ -724,12 +775,14 @@ static bool try_bind(const std::string &src, const std::string &new_root,
 
 // Set up the automatic read-only system mounts that every sandbox gets.
 // These provide a working environment without exposing writable host paths.
-static bool setup_system_mounts(const std::string &new_root, std::string &err) {
-    // In the container engine the process is real root with no userns UID
-    // remapping, so Unix permission-based write protection does not apply.
-    // System mounts must be explicitly read-only to prevent one sandbox from
-    // modifying shared host state that other sandboxes also see.
-    const bool ro = running_in_container();
+static bool setup_system_mounts(const std::string &new_root,
+                                bool in_container,
+                                std::string &err) {
+    // Inside a container the system mounts are pinned explicitly read-only
+    // as defense in depth (kernel DAC already protects them — the sandbox is
+    // an unprivileged userns process — but read-only also stops accidental
+    // cross-sandbox state changes).
+    const bool ro = in_container;
 
     // /usr — all system binaries and libraries.
     if (!try_bind_ro("/usr", new_root, ro, err)) return false;
@@ -757,16 +810,34 @@ static bool setup_system_mounts(const std::string &new_root, std::string &err) {
         }
     }
 
-    // /proc — mount a fresh procfs that only shows processes in our PID
-    // namespace.  This prevents leaking host process information (cmdline,
-    // environ, memory maps) which would be exposed by a bind-mount of the
-    // host's /proc.
+    // /proc — read-only in every engine.  A fresh procfs is mounted so only
+    // processes in our PID namespace are visible.  In the container userns
+    // engine (docker run --user) the kernel refuses fresh procfs mounts from
+    // inside a nested user namespace, so the container's own /proc is bound
+    // read-only instead — the container is already PID-isolated from the
+    // host, so this only exposes sibling processes in the same container,
+    // never host processes.  Read-only keeps /proc/sys and other proc knobs
+    // unwritable everywhere (kernel parameters are not namespaced).
     if (mkdir((new_root + "/proc").c_str(), 0755) != 0 && errno != EEXIST) {
         err = errno_str("mkdir /proc");
         return false;
     }
-    if (mount("proc", (new_root + "/proc").c_str(), "proc",
-              MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0) {
+    if (in_container) {
+        // Container userns engine (docker run --user): bind the container's
+        // /proc read-only.  bind_mount() repeats the source's
+        // nosuid/nodev/noexec flags so the remount passes the kernel's
+        // cross-userns lock check.
+        if (!bind_mount("/proc", new_root + "/proc",
+                        /*readonly=*/true, err)) {
+            return false;
+        }
+        std::fprintf(stderr,
+            "boxsh: container userns engine: /proc is a read-only bind of "
+            "the container's /proc (fresh procfs mounts are refused inside "
+            "a nested user namespace)\n");
+    } else if (mount("proc", (new_root + "/proc").c_str(), "proc",
+                     MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RDONLY,
+                     nullptr) != 0) {
         err = errno_str("mount proc");
         return false;
     }
@@ -794,6 +865,133 @@ static bool setup_system_mounts(const std::string &new_root, std::string &err) {
     return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// Preflight — surface bind-mount access problems as actionable errors before
+// any namespace work, instead of EACCES/EROFS deep inside the sandbox.  This
+// is the common failure in --user containers: the container user (e.g.
+// uid 65534 from `docker run --user`) does not own the mapped directories,
+// or a previous root run left root-owned stragglers.  Checks run as the
+// caller's real uid — the same kuid the sandbox will run as after the
+// userns remap, so the result is identical inside and outside namespaces.
+// ---------------------------------------------------------------------------
+
+// Nearest existing ancestor of path (path itself when it exists).  COW dst
+// paths are auto-created by mkdir_p, so an unwritable *ancestor* is what
+// blocks creation.
+static std::string nearest_existing_ancestor(std::string p) {
+    struct stat st;
+    while (stat(p.c_str(), &st) != 0) {
+        std::string parent = path_parent(p);
+        if (parent == p) break; // reached "/" (must exist)
+        p = parent;
+    }
+    return p;
+}
+
+// Returns false when the configuration cannot work (hard failure, err set);
+// recoverable problems (a wr: bind the user will hit with EACCES later, an
+// unreachable cwd) are emitted as stderr warnings so boxsh still runs.
+static bool preflight_bind_access(const SandboxConfig &cfg,
+                                  const std::string &saved_cwd,
+                                  uint32_t uid,
+                                  bool in_container,
+                                  std::string &err) {
+    const std::string chown_advice =
+        "make it writable by uid " + std::to_string(uid) +
+        " (chown -R " + std::to_string(uid) + ":" + std::to_string(uid) +
+        " <path> as root)" +
+        (in_container
+             ? ", or start the container with --user "
+               "\"$(id -u):$(id -g)\" matching the directory owner"
+             : "");
+
+    for (const auto &bm : cfg.bind_mounts) {
+        if (bm.mode == BindMount::Mode::COW) {
+            // The source is the read-only lower layer of the overlay.
+            if (access(bm.src.c_str(), R_OK) != 0) {
+                err = "COW source " + bm.src +
+                      " is not readable by uid " + std::to_string(uid) +
+                      "; " + chown_advice;
+                return false;
+            }
+            // The destination is the writable upper layer.  It is created by
+            // mkdir_p when missing, so an unwritable nearest existing
+            // ancestor blocks creation too.  A missing destination must not
+            // hard-fail by itself: access() below would fail with ENOENT and
+            // misreport a creatable path (writable ancestor) as unwritable.
+            struct stat dst_st;
+            if (stat(bm.dst.c_str(), &dst_st) != 0) {
+                // Missing destination — mkdir_p creates it, but only when
+                // the nearest existing ancestor is a writable *directory*.
+                // A file in the path (e.g. dst "a/file/c" where "a/file" is
+                // a regular file) makes creation impossible, and access(W_OK)
+                // on that file would pass, hiding the problem until the
+                // mkdir_p ENOTDIR inside the namespace.
+                std::string anchor = nearest_existing_ancestor(bm.dst);
+                struct stat anchor_st;
+                if (stat(anchor.c_str(), &anchor_st) != 0 ||
+                    !S_ISDIR(anchor_st.st_mode)) {
+                    err = "COW destination " + bm.dst +
+                          " cannot be created: " + anchor +
+                          " is not a directory; remove it or choose a "
+                          "different destination path";
+                    return false;
+                }
+                if (access(anchor.c_str(), W_OK) != 0) {
+                    err = "COW destination " + bm.dst +
+                          " cannot be created: " + anchor +
+                          " is not writable by uid " +
+                          std::to_string(uid) + "; " + chown_advice;
+                    return false;
+                }
+            } else if (!S_ISDIR(dst_st.st_mode)) {
+                // Existing non-directory (regular file / symlink target):
+                // overlay upper layers must be directories — the mount
+                // would fail deep inside the engine, so surface it now.
+                err = "COW destination " + bm.dst +
+                      " exists but is not a directory; remove it or choose "
+                      "a different destination path";
+                return false;
+            } else if (access(bm.dst.c_str(), W_OK) != 0) {
+                err = "COW destination " + bm.dst +
+                      " is not writable by uid " +
+                      std::to_string(uid) + "; " + chown_advice;
+                return false;
+            }
+        } else if (bm.mode == BindMount::Mode::RW) {
+            struct stat st;
+            if (stat(bm.src.c_str(), &st) == 0 &&
+                access(bm.src.c_str(), W_OK) != 0) {
+                std::fprintf(stderr,
+                    "boxsh: warning: writable bind %s is not writable by "
+                    "uid %u — writes there will fail with EACCES; %s\n",
+                    bm.src.c_str(), uid, chown_advice.c_str());
+            }
+        }
+        // RO binds need no preflight: they are read-only by definition.
+    }
+
+    // The sandbox restores the working directory after pivot_root (falling
+    // back to "/" when it cannot be entered).  Warn instead of silently
+    // starting somewhere else.  Cwd under a COW source is remapped to the
+    // destination path, so the host-side access check does not apply there.
+    bool cwd_remapped = false;
+    for (const auto &bm : cfg.bind_mounts) {
+        if (bm.mode == BindMount::Mode::COW &&
+            path_is_under(saved_cwd, bm.src)) {
+            cwd_remapped = true;
+            break;
+        }
+    }
+    if (!cwd_remapped && access(saved_cwd.c_str(), X_OK) != 0) {
+        std::fprintf(stderr,
+            "boxsh: warning: working directory %s is not accessible to "
+            "uid %u inside the sandbox — the shell will start in / instead\n",
+            saved_cwd.c_str(), uid);
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -824,29 +1022,48 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     // PID 1 in a new PID namespace.  Host processes are invisible, and signals
     // cannot escape the namespace boundary.
     //
-    // Two engines:
-    //   * host engine      — CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID.
-    //     NEWUSER lets an unprivileged user gain the mount capability needed
-    //     for CLONE_NEWNS without sudo.
-    //   * container engine — CLONE_NEWNS | CLONE_NEWPID only.  Inside a Docker
-    //     container that already grants CAP_SYS_ADMIN, NEWUSER is unnecessary
-    //     and harmful: it fails to nest under userns-remapped/rootless Docker
-    //     and is blocked by the default seccomp profile.  The container's own
-    //     uid context is reused.
+    // Single engine everywhere: CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID,
+    // mapping 0 -> our own uid.  Used on the host and inside containers that
+    // run as a non-root user (docker run --user "$(id -u):$(id -g)").  The
+    // process is unprivileged, so the kernel's DAC checks protect root-owned
+    // system files — host-equivalent isolation.
+    //
+    // Root containers are rejected up front: in rootful Docker the container's
+    // real root is the host's root, and a sandbox left as root would have no
+    // isolation (RW mounts would accept root-owned setuid binaries, system
+    // files would be writable).  boxsh never runs a root sandbox.
     const bool in_container = running_in_container();
-    int unshare_flags;
-    if (in_container) {
-        unshare_flags = CLONE_NEWNS | CLONE_NEWPID;
-    } else {
-        unshare_flags = CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWPID;
+
+    if (in_container && host_uid == 0) {
+        res.error =
+            "boxsh inside Docker must run as a non-root user: a root sandbox "
+            "would have no isolation (container root == host root in "
+            "rootful Docker).  Restart the container with --user "
+            "\"$(id -u):$(id -g)\" and make the mapped directories writable "
+            "by that user (from a root shell: chown -R "
+            "\"$(id -u):$(id -g)\" <mapped-dir>)";
+        return res;
     }
+
+    // Preflight: catch unwritable/read-inaccessible bind targets now, with
+    // actionable diagnostics, instead of EACCES/EROFS deep inside the sandbox
+    // (the typical --user container misconfiguration: mapped dirs owned by
+    // another uid, root-owned stragglers, COW uppers on read-only parents).
+    if (!preflight_bind_access(cfg, saved_cwd, host_uid, in_container,
+                               res.error)) {
+        return res;
+    }
+
+    int unshare_flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUSER;
     if (cfg.new_net_ns)  unshare_flags |= CLONE_NEWNET;
 
     if (unshare(unshare_flags) != 0) {
         if (in_container) {
-            res.error = errno_str("unshare (container mode)") +
-                "; boxsh inside Docker requires: "
-                "--cap-add SYS_ADMIN "
+            res.error = errno_str("unshare (container userns engine)") +
+                "; boxsh inside Docker needs unprivileged user namespaces "
+                "enabled on the host kernel "
+                "(kernel.unprivileged_userns_clone=1 / "
+                "kernel.apparmor_restrict_unprivileged_userns=0) and "
                 "--security-opt seccomp=unconfined "
                 "--security-opt apparmor=unconfined"
                 + (has_cow_bind(cfg) ? " --device /dev/fuse" : "");
@@ -856,19 +1073,19 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         return res;
     }
 
-    // Container engine switched successfully — announce it once so users can
-    // confirm the engine change (and that COW is going through fuse-overlayfs).
+    // Announce the active engine so users can confirm the switch (and that
+    // COW is going through fuse-overlayfs).
     if (in_container) {
         std::fprintf(stderr,
-            "boxsh: container detected, using container sandbox engine"
-            " (fuse-overlayfs COW)\n");
+            "boxsh: container detected, running as unprivileged uid %u "
+            "(host-equivalent userns engine)%s\n", host_uid,
+            has_cow_bind(cfg) ? "; COW via fuse-overlayfs" : "");
     }
 
     // --- 2. Write uid/gid mapping ---
-    // Only needed with CLONE_NEWUSER: the map makes the caller appear as root
-    // inside the new user namespace.  The container engine skips NEWUSER, so
-    // it reuses the container's existing ids and must not write these maps.
-    if (!in_container) {
+    // The map makes the caller appear as root inside the new user namespace.
+    // It always maps our own uid, which is the permitted unprivileged form.
+    {
         // When called via unshare() (no separate fork) we write the map ourselves.
         char self_setgroups[] = "/proc/self/setgroups";
         if (!write_file(self_setgroups, "deny") && errno != ENOENT) {
@@ -982,7 +1199,8 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     }
 
     // --- 5. Automatic read-only system mounts ---
-    if (!setup_system_mounts(new_root, res.error)) return res;
+    if (!setup_system_mounts(new_root, in_container, res.error))
+        return res;
 
     // --- 6. User-specified RO/RW bind mounts ---
     for (const auto &bm : cfg.bind_mounts) {

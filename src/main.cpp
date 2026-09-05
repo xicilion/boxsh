@@ -23,6 +23,7 @@
 extern "C" int dash_main(int argc, char **argv);
 
 namespace boxsh {
+
 namespace {
 
 void print_version() {
@@ -272,7 +273,18 @@ int main(int argc, char **argv) {
         }
 
         // $HOME: bind-mount read-only so it is accessible inside the sandbox
-        // without exposing writes to the host.
+        // without exposing writes to the host.  Skip it when the directory
+        // does not exist (e.g. HOME=/nonexistent in some containers) — an
+        // auto-configured bind must never hard-fail the sandbox.
+        if (!home_dir.empty()) {
+            struct stat st;
+            if (stat(home_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+                std::fprintf(stderr,
+                    "boxsh: $HOME (%s) does not exist, skipping its "
+                    "read-only bind\n", home_dir.c_str());
+                home_dir.clear();
+            }
+        }
         if (!home_dir.empty()) {
             boxsh::BindMount hbm;
             hbm.mode = boxsh::BindMount::Mode::RO;

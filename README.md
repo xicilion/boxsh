@@ -432,30 +432,33 @@ boxsh --sandbox --bind wr:/data -c 'ls /'
 |---|---|---|
 | Linux | User/mount/PID namespaces + seccomp syscall filter | overlayfs (kernel ≥ 5.11 for user-ns) |
 | macOS | Seatbelt (`sandbox_init` + SBPL) | `clonefile(2)` on APFS |
-| Linux (Docker) | Mount/PID namespaces + seccomp (auto-detected, skips userns) | fuse-overlayfs |
+| Linux (Docker) | Same as Linux (requires `--user`) | fuse-overlayfs |
 
 No external tools such as `bwrap` or `newuidmap` are required on any platform.
 
 ### Docker support
 
-boxsh automatically detects Docker/containerd/K8s containers and switches to the **container sandbox engine**: it skips user namespaces (unnecessary in a pre-isolated container, and incompatible with rootless/userns-remapped Docker) and routes COW through fuse-overlayfs to avoid overlay-on-overlay kernel restrictions.
+boxsh automatically detects Docker/containerd/K8s containers and runs the same unprivileged userns engine as on the host — but the container **must start as a non-root user**:
 
-**Container startup flags required:**
+- **`--user` container (required)** — boxsh runs natively unprivileged; identical userns engine, no drop involved.
+- **Root container (rejected)** — a root sandbox would have no isolation: in rootful Docker the container's real root is the host's root, so system files would be writable and RW bind mounts would accept root-owned setuid binaries that persist on the host. boxsh refuses every sandbox request with an actionable error; plain (non-sandbox) shells keep working.
 
 ```sh
-docker run \
-  --cap-add SYS_ADMIN \                   # mount/pivot_root/unshare
+docker run --user "$(id -u):$(id -g)" \
   --security-opt seccomp=unconfined \     # allow unshare/mount syscalls
   --security-opt apparmor=unconfined \    # allow mount --make-rslave /
   --device /dev/fuse                      # fuse-overlayfs COW
 ```
 
-If any flag is missing, boxsh reports an actionable error:
-- Missing `SYS_ADMIN` or `seccomp=unconfined` → `unshare (container mode): ...; boxsh inside Docker requires: --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined`
+No `--cap-add SYS_ADMIN` is required: the user namespace provides the mount capability inside the sandbox. Directories you bind-mount and want the sandbox to write must be writable by the `--user` uid — if a previous root run left root-owned files, chown them once from a root shell (`chown -R "$(id -u):$(id -g)" <dir>`). Root-owned mapped directories are the one case boxsh cannot paper over: it refuses rather than run an isolated-by-nothing root sandbox.
+
+If a flag is missing, boxsh reports an actionable error:
+- Running as root → `boxsh inside Docker must run as a non-root user: a root sandbox would have no isolation ... Restart the container with --user "$(id -u):$(id -g)" ...`
+- Unprivileged userns blocked → `unshare (container userns engine): ...; boxsh inside Docker needs unprivileged user namespaces ...`
 - Missing `apparmor=unconfined` → `mount --make-rslave /: ...; container must be started with --security-opt apparmor=unconfined`
 - Missing `/dev/fuse` → `...container is missing /dev/fuse — start Docker with --device /dev/fuse`
 
-The container engine preserves full sandbox isolation: mount/PID namespaces, pivot_root to a clean tmpfs, seccomp syscall filtering, and RO/WR/COW bind mounts. The only difference from the host engine is the absence of user-namespace UID remapping (the process runs as actual root, not a mapped unprivileged user). See [Docker Usage](docs/usage.md#docker-usage) for end-to-end examples.
+The sandbox always preserves full namespace isolation: mount/PID namespaces, pivot_root to a clean tmpfs, seccomp syscall filtering, and RO/WR/COW bind mounts. Inside a container, `/proc` is a read-only bind of the container's `/proc` (fresh procfs mounts are refused in a nested user namespace) — sibling processes in the same container are visible, host processes never are. See [Docker Usage](docs/usage.md#docker-usage) for end-to-end examples.
 
 ---
 
