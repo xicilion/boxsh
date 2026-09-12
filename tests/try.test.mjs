@@ -166,10 +166,18 @@ describe('--try mode', () => {
         fs.readFileSync(path.join(cwd, 'victim.txt'), 'utf8'),
         'delete me\n',
       );
-      // Whiteout in dst (upper layer).
+      // Whiteout in dst (upper layer): char-device (0,0) with the kernel
+      // overlay, or an OCI `.wh.<name>` marker with the fuse-overlayfs
+      // fallback used when the host filesystem cannot store overlay metadata.
       const tmpdir = parseTmpdir(r.stderr);
-      const wh = fs.statSync(path.join(tmpdir, 'victim.txt'));
-      assert.ok(wh.isCharacterDevice() && wh.rdev === 0, 'expected whiteout entry');
+      const marker = path.join(tmpdir, 'victim.txt');
+      if (fs.existsSync(marker)) {
+        const wh = fs.statSync(marker);
+        assert.ok(wh.isCharacterDevice() && wh.rdev === 0, 'expected whiteout entry');
+      } else {
+        assert.ok(fs.existsSync(path.join(tmpdir, '.wh.victim.txt')),
+          'expected a whiteout entry (char device or .wh. marker)');
+      }
     } finally {
       spawnSync('rm', ['-rf', cwd]);
     }

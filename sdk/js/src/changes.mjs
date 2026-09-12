@@ -8,13 +8,24 @@
  *   - Deleted  files (whiteout markers in upper)
  *
  * Supports both host-side whiteout format (.wh.<name> files) and
- * kernel overlay whiteout format (char device 0/0).
+ * kernel overlay whiteout format (char device 0/0), including the reserved
+ * `.wh..wh.*` metadata (opaque-dir markers, hardlink index) fuse-overlayfs
+ * writes — it is the COW engine used on host mounts that cannot store kernel
+ * overlay metadata (macOS/Docker virtiofs).
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 
 const WH_PREFIX = '.wh.';
+// Reserved OCI/fuse-overlayfs metadata namespace: `.wh..wh..opq` (opaque
+// directory marker) and `.wh..wh.plnk` (hardlink index).  These are never
+// user-visible entries — treating them as whiteouts for a file named `.wh.opq`
+// / `.wh.plnk` produced phantom deletions on the fuse-overlayfs path (the COW
+// engine boxsh falls back to when the kernel overlay cannot store overlay
+// metadata, e.g. macOS/Docker virtiofs host mounts).
+const WH_META_PREFIX = '.wh..wh.';
+const WH_OPAQUE = '.wh..wh..opq';
 const MANIFEST_DIR = '.boxsh';
 const MANIFEST_SUFFIX = '.manifest';
 
@@ -64,6 +75,17 @@ function _scanChanges(upperRoot, baseRoot, rel, changes) {
         const childRel  = rel === '.' ? name : path.join(rel, name);
         const upperPath = path.join(upperRoot, childRel);
 
+        // fuse-overlayfs metadata (opaque marker, hardlink index): never a
+        // change entry of its own.  An opaque marker hides the lower content
+        // of this directory, so the lower entries missing from the upper are
+        // genuine deletions.
+        if (name.startsWith(WH_META_PREFIX)) {
+            if (name === WH_OPAQUE) {
+                _collectOpaqueDeletions(upperRoot, baseRoot, rel, changes);
+            }
+            continue;
+        }
+
         // Host-side whiteout (.wh.<name>)
         if (name.startsWith(WH_PREFIX)) {
             const targetName = name.slice(WH_PREFIX.length);
@@ -101,6 +123,13 @@ function _scanCloneSnapshotChanges(upperRoot, baseRoot, rel, changes) {
         const childRel = rel === '.' ? name : path.join(rel, name);
         const upperPath = path.join(upperRoot, childRel);
 
+        if (name.startsWith(WH_META_PREFIX)) {
+            if (name === WH_OPAQUE) {
+                _collectOpaqueDeletions(upperRoot, baseRoot, rel, changes);
+            }
+            continue;
+        }
+
         if (name.startsWith(WH_PREFIX)) {
             const targetName = name.slice(WH_PREFIX.length);
             const targetRel = rel === '.' ? targetName : path.join(rel, targetName);
@@ -132,6 +161,35 @@ function _scanCloneSnapshotChanges(upperRoot, baseRoot, rel, changes) {
         if (_pathsDiffer(upperPath, basePath)) {
             changes.push({ path: childRel, type: 'modified' });
         }
+    }
+}
+
+/**
+ * An opaque directory marker (`.wh..wh..opq`) hides every lower entry of the
+ * directory it lives in.  Report the lower entries the upper layer does not
+ * contain — neither directly nor as a whiteout — as deleted.
+ *
+ * @param {string} upperRoot
+ * @param {string} baseRoot
+ * @param {string} rel   directory holding the marker, relative to the roots
+ * @param {Array<object>} changes
+ */
+function _collectOpaqueDeletions(upperRoot, baseRoot, rel, changes) {
+    const upperDir = path.join(upperRoot, rel);
+    let lowerNames;
+    try {
+        lowerNames = fs.readdirSync(path.join(baseRoot, rel));
+    } catch {
+        return;   // no lower counterpart — nothing is hidden
+    }
+
+    for (const lowerName of lowerNames) {
+        if (fs.existsSync(path.join(upperDir, lowerName))) continue;
+        if (fs.existsSync(path.join(upperDir, WH_PREFIX + lowerName))) continue;
+        changes.push({
+            path: rel === '.' ? lowerName : path.join(rel, lowerName),
+            type: 'deleted',
+        });
     }
 }
 

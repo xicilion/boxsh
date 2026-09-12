@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(boxsh LANGUAGES C CXX)
 
+# Version reported by `boxsh --version` (BOXSH_VERSION define).  Overridable so
+# dev builds can identify themselves: cmake -DBOXSH_VERSION=5.0.0-dev+abc1234.
+set(BOXSH_VERSION "5.0.0" CACHE STRING "boxsh version string")
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -243,7 +247,7 @@ target_include_directories(boxsh
 target_compile_definitions(boxsh
     PRIVATE
         _GNU_SOURCE
-        BOXSH_VERSION="5.0.0"
+        BOXSH_VERSION="${BOXSH_VERSION}"
 )
 
 target_compile_options(boxsh

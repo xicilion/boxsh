@@ -24,6 +24,7 @@
 #include <linux/audit.h>
 #include <linux/magic.h>
 #include <sys/vfs.h>
+#include <sys/statvfs.h>
 #include <stddef.h>
 
 namespace boxsh {
@@ -587,6 +588,35 @@ static bool create_cleanup_file(int &fd, std::string &err) {
     return true;
 }
 
+// Whether the filesystem mounted at 'path' is read-only.  Used to detect the
+// kernel's silent read-only overlay fallback: when the upper filesystem cannot
+// store the overlay metadata overlayfs needs (e.g. virtiofs without trusted.*
+// xattr support inside a user namespace), mount("overlay") *succeeds* but the
+// superblock is marked read-only and every write below it fails with EROFS.
+// fuse-overlayfs keeps its metadata in userspace and works there, so the
+// caller treats a read-only result as a failure and falls back.
+static bool mount_is_readonly(const std::string &path) {
+    struct statvfs sv;
+    if (statvfs(path.c_str(), &sv) != 0) return false;
+    return (sv.f_flag & ST_RDONLY) != 0;
+}
+
+// The kernel overlay creates an internal 'work' subdirectory (mode 000) inside
+// the workdir it is given; it stays behind when the (read-only) mount is
+// abandoned.  fuse-overlayfs cannot do copy-up on a workdir containing that
+// leftover, so remove it before handing the workdir to the fuse fallback.
+static void remove_kernel_overlay_workdir_entry(const std::string &work) {
+    std::string inner = work + "/work";
+    struct stat st;
+    if (stat(inner.c_str(), &st) != 0) return;
+    chmod(inner.c_str(), 0700);   // kernel created it mode 000 — make it removable
+    if (rmdir(inner.c_str()) != 0) {
+        std::fprintf(stderr,
+            "boxsh: warning: could not remove stale overlay workdir %s: %s\n",
+            inner.c_str(), std::strerror(errno));
+    }
+}
+
 static bool mount_overlay_at(const std::string &lowerdir,
                                const std::string &dest,
                                const std::string &upper,
@@ -610,19 +640,31 @@ static bool mount_overlay_at(const std::string &lowerdir,
                            ",upperdir=" + upper +
                            ",workdir="  + work +
                            ",xino=off";
-        if (mount("overlay", dest.c_str(), "overlay", 0, opts.c_str()) == 0)
-            return true;
+        if (mount("overlay", dest.c_str(), "overlay", 0, opts.c_str()) == 0) {
+            // The kernel can silently return a *read-only* overlay when the
+            // upper filesystem cannot hold the overlay metadata it needs
+            // (typical for virtiofs / FS without trusted.* xattr support
+            // inside a user namespace): the mount "succeeds", but every write
+            // below it fails with EROFS.  Detect that and fall back to
+            // fuse-overlayfs, which keeps its metadata in userspace.
+            if (!mount_is_readonly(dest)) return true;
+            umount2(dest.c_str(), MNT_DETACH);
+            remove_kernel_overlay_workdir_entry(work);
+            std::fprintf(stderr,
+                "boxsh: kernel overlay mounted read-only (upper filesystem "
+                "cannot store overlay metadata), trying fuse-overlayfs...\n");
+        } else {
+            int saved_errno = errno;
+            if (saved_errno != EINVAL && saved_errno != EPERM &&
+                saved_errno != ENOTSUP) {
+                err = errno_str(("mount overlay -> " + dest).c_str());
+                return false;
+            }
 
-        int saved_errno = errno;
-        if (saved_errno != EINVAL && saved_errno != EPERM &&
-            saved_errno != ENOTSUP) {
-            err = errno_str(("mount overlay -> " + dest).c_str());
-            return false;
+            std::fprintf(stderr,
+                "boxsh: kernel overlay mount failed (%s), trying fuse-overlayfs...\n",
+                std::strerror(saved_errno));
         }
-
-        std::fprintf(stderr,
-            "boxsh: kernel overlay mount failed (%s), trying fuse-overlayfs...\n",
-            std::strerror(saved_errno));
     }
 
     if (try_fuse_overlayfs(lowerdir, dest, upper, work, err))

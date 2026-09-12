@@ -3,6 +3,14 @@ set -ev
 
 HOST_OS=$(uname)
 
+# `boxsh --version` reports the BOXSH_VERSION define (CMake defaults it to 5.0.0
+# for plain dev builds).  Release binaries must report the tag they were cut
+# from, so pass the tag through when this is a tag build.
+VERSION_ARG=""
+if [[ "${BUILD_TAG}" != "" ]]; then
+    VERSION_ARG="-DBOXSH_VERSION=${BUILD_TAG#v}"
+fi
+
 get_target_triple() {
     case "$1" in
         x64)     echo "x86_64-linux-gnu" ;;
@@ -27,6 +35,7 @@ if [[ "${HOST_OS}" == "Linux" ]]; then
             bash -c "cd ${CUR} && \
                 cmake -B ${BUILD_DIR} \
                     -DCMAKE_BUILD_TYPE=Release \
+                    ${VERSION_ARG} \
                     -DCMAKE_C_COMPILER=clang-18 \
                     -DCMAKE_CXX_COMPILER=clang++-18 && \
                 cmake --build ${BUILD_DIR} --parallel 2"
@@ -36,6 +45,7 @@ if [[ "${HOST_OS}" == "Linux" ]]; then
             bash -c "cd ${CUR} && \
                 cmake -B ${BUILD_DIR} \
                     -DCMAKE_BUILD_TYPE=Release \
+                    ${VERSION_ARG} \
                     -DCMAKE_SYSTEM_NAME=Linux \
                     -DCMAKE_C_COMPILER_TARGET=loongarch64-unknown-linux-gnu \
                     -DCMAKE_FIND_ROOT_PATH=/usr/cross-tools/target && \
@@ -47,6 +57,7 @@ if [[ "${HOST_OS}" == "Linux" ]]; then
                 GCC_VER=\$(gcc -dumpversion) && \
                 cmake -B ${BUILD_DIR} \
                     -DCMAKE_BUILD_TYPE=Release \
+                    ${VERSION_ARG} \
                     -DCMAKE_SYSTEM_NAME=Linux \
                     -DCMAKE_C_COMPILER=clang-18 \
                     -DCMAKE_CXX_COMPILER=clang++-18 \
@@ -65,7 +76,7 @@ elif [[ "${HOST_OS}" == "Darwin" ]]; then
     if [[ "${BUILD_ARCH}" == "x86_64" ]]; then
         CMAKE_EXTRA="-DCMAKE_OSX_ARCHITECTURES=x86_64"
     fi
-    cmake -B ${BUILD_DIR} -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA}
+    cmake -B ${BUILD_DIR} -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} ${VERSION_ARG}
     cmake --build ${BUILD_DIR} --parallel $(sysctl -n hw.logicalcpu)
     codesign -f -s - ${BUILD_DIR}/boxsh
 fi

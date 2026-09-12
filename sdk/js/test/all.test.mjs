@@ -4,3 +4,4 @@
 
 import './session.test.mjs';
 import './terminal.test.mjs';
+import './changes.test.mjs';

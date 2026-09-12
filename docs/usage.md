@@ -763,7 +763,7 @@ docker run --rm --user "$(id -u):$(id -g)" \
   -v "$PWD:/src" -w /src build/boxsh --sandbox --bind wr:"$PWD" -c 'ls /'
 ```
 
-No `--cap-add SYS_ADMIN` is needed: the user namespace provides the mount capability inside the sandbox. COW goes through the kernel overlay when the lower/upper live on a plain filesystem, and falls back to fuse-overlayfs (overlay-on-overlay rootfs, missing kernel support).
+No `--cap-add SYS_ADMIN` is needed: the user namespace provides the mount capability inside the sandbox. COW goes through the kernel overlay when the lower/upper live on a plain filesystem, and falls back to fuse-overlayfs (overlay-on-overlay rootfs, missing kernel support). The fallback also covers the *silently read-only* kernel mount: when the upper filesystem cannot store overlay metadata inside the user namespace (macOS/Docker host bind mounts come in through virtiofs, a FUSE filesystem), the kernel returns a mount whose superblock is read-only instead of failing — boxsh detects that, unmounts it and uses fuse-overlayfs, so writes keep working instead of failing with `Read-only file system`.
 
 Directories you bind-mount and want the sandbox to write must be writable by the `--user` uid. Root-owned mapped directories are the one case boxsh cannot paper over — it refuses rather than run an isolated-by-nothing root sandbox. If a previous root run left root-owned files, chown them once from a root shell (`docker run -u 0 ... chown -R "$(id -u):$(id -g)" <dir>`), then start the container with `--user`.
 

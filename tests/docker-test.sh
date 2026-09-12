@@ -122,6 +122,16 @@ run_suites() {
     sh -c 'node --test tests/docker.test.mjs'
 
   echo ""
+  echo "========== COW on a host bind mount (virtiofs on macOS/Docker) — --user container ($LABEL) =========="
+  # The harness bind mount (/src) is the workspace-data equivalent: on
+  # macOS/Docker it is virtiofs, where the kernel overlay comes up *read-only*
+  # inside the userns.  boxsh must detect that and fall back to fuse-overlayfs
+  # (otherwise every write below the COW fails with EROFS).  On Linux
+  # filesystems the same suite exercises the plain kernel-overlay path.
+  docker run --rm $PRIV_USER $VOL_OPTS $COMMON \
+    sh -c 'node --test tests/docker-cow-hostmount.test.mjs'
+
+  echo ""
   echo "========== Full suite — --user container ($LABEL) =========="
   # Host-style suites run as a natively unprivileged container user, matching
   # host semantics.

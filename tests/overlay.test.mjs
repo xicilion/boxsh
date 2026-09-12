@@ -214,16 +214,20 @@ describe('sandbox — cow mounts', () => {
     try {
       fs.writeFileSync(path.join(src, 'ghost.txt'), 'ghost\n');
       rpcCow(src, dst, `rm ${dst}/ghost.txt`);
-      // Overlayfs records deletion as a char-device whiteout (0,0) in dst (upper).
+      // The deletion is recorded in dst (upper) with one of two encodings:
+      //   - kernel overlayfs: char-device whiteout (0,0) named after the file
+      //   - fuse-overlayfs (COW engine on host mounts that cannot store overlay
+      //     metadata, e.g. macOS/Docker virtiofs): OCI `.wh.<name>` marker
       const dstEntries = fs.readdirSync(dst);
-      assert.ok(
-        dstEntries.includes('ghost.txt'),
-        `expected whiteout for ghost.txt in dst, got: [${dstEntries}]`,
-      );
-      const stat = fs.statSync(path.join(dst, 'ghost.txt'));
-      // Whiteout = character device with rdev 0.
-      assert.ok(stat.isCharacterDevice(), 'whiteout must be a character device');
-      assert.equal(stat.rdev, 0, 'whiteout rdev must be 0');
+      if (dstEntries.includes('ghost.txt')) {
+        const stat = fs.statSync(path.join(dst, 'ghost.txt'));
+        assert.ok(stat.isCharacterDevice(),
+          'kernel whiteout must be a character device');
+        assert.equal(stat.rdev, 0, 'whiteout rdev must be 0');
+      } else {
+        assert.ok(dstEntries.includes('.wh.ghost.txt'),
+          `expected a whiteout for ghost.txt in dst, got: [${dstEntries}]`);
+      }
     } finally {
       cleanup();
     }
