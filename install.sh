@@ -64,7 +64,12 @@ if ! curl -fSL -o "$TMP" "$URL"; then
     echo "Error: download failed. Check that the version and architecture are correct." >&2
     exit 1
 fi
-chmod +x "$TMP"
+# 必须是 0755（而不是 `chmod +x`）：mktemp 创建的文件是 0600，`chmod +x` 只会得到
+# 0711（组/其他无读权限）。以非 root 用户执行「自己不可读」的二进制会被内核置为
+# non-dumpable，进而 /proc/self/setgroups 写入返回 EPERM —— 容器里以 `--user`
+# 运行时 boxsh 的一切 sandbox 请求都会失败：
+#   sandbox_apply failed: write setgroups deny: Permission denied
+chmod 0755 "$TMP"
 
 resign_if_macos() {
     target="$1"
