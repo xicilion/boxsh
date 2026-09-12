@@ -17,7 +17,19 @@ def shell_quote(value: str) -> str:
 
 
 class BoxshClientError(RuntimeError):
-    pass
+    """Raised for tool failures and protocol problems.
+
+    Tool failures carry the stable error code from the server in `code`
+    (one of E_INVALID_ARGUMENT, E_NOT_FOUND, E_NOT_TEXT, E_NOT_IMAGE,
+    E_UNSUPPORTED_FORMAT, E_TOO_LARGE, E_TIMEOUT, E_SANDBOX, E_INTERNAL)
+    plus the optional machine-readable `detail`.
+    """
+
+    def __init__(self, message: str, code: Optional[str] = None,
+                 detail: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.detail = detail
 
 
 @dataclass(frozen=True)
@@ -68,12 +80,35 @@ EditInput = Union[EditOperation, Tuple[str, str], Mapping[str, str]]
 
 @dataclass(frozen=True)
 class ReadResult:
+    """Result of the read tool (text files only).
+
+    Images and other binary files are rejected by the server — use view_image
+    for images.
+    """
+
     content: str
     encoding: str
     mime_type: str
     line_count: Optional[int] = None
     truncated: Optional[bool] = None
-    size: Optional[int] = None
+    total_lines: Optional[int] = None
+    next_offset: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ViewImageResult:
+    """Result of the view_image tool (animated sources give their first frame)."""
+
+    data: str          # base64-encoded image payload
+    mime_type: str     # MIME type of the returned image
+    width: int
+    height: int
+    original_width: int
+    original_height: int
+    was_resized: bool
+    size: int          # size of the original file in bytes
+    animated: bool     # source was animated; only the first frame is returned
+    text: str          # model-facing text, e.g. "[Image: image/png, 200x133]"
 
 
 @dataclass(frozen=True)
@@ -103,6 +138,8 @@ class TerminalSession:
     alive: bool
     cols: int
     rows: int
+    exited: bool = False
+    exit_code: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -256,16 +293,42 @@ class BoxshClient:
     def _check_tool_error(result: Mapping[str, Any]) -> None:
         if not result.get("isError"):
             return
+        structured = result.get("structuredContent")
+        code = None
+        detail = None
+        message = ""
+        if isinstance(structured, Mapping):
+            code = structured.get("code") if isinstance(structured.get("code"), str) else None
+            detail = structured.get("detail")
+            message = str(structured.get("message", ""))
+        if not message:
+            content = result.get("content")
+            if isinstance(content, list):
+                text_chunks = []
+                for chunk in content:
+                    if isinstance(chunk, Mapping) and chunk.get("type") == "text":
+                        text_chunks.append(str(chunk.get("text", "")))
+                message = "\n".join(part for part in text_chunks if part)
+        raise BoxshClientError(message or "tool error", code=code, detail=detail)
+
+    @staticmethod
+    def _text_of(result: Mapping[str, Any]) -> str:
+        """Model-facing text: the concatenated text content blocks."""
         content = result.get("content")
-        if isinstance(content, list):
-            text_chunks = []
-            for chunk in content:
-                if isinstance(chunk, Mapping) and chunk.get("type") == "text":
-                    text_chunks.append(str(chunk.get("text", "")))
-            message = "\n".join(part for part in text_chunks if part)
-        else:
-            message = "tool error"
-        raise BoxshClientError(message or "tool error")
+        if not isinstance(content, list):
+            return ""
+        return "\n".join(
+            str(chunk.get("text", ""))
+            for chunk in content
+            if isinstance(chunk, Mapping) and chunk.get("type") == "text"
+        )
+
+    @staticmethod
+    def _images_of(result: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+        content = result.get("content")
+        if not isinstance(content, list):
+            return []
+        return [c for c in content if isinstance(c, Mapping) and c.get("type") == "image"]
 
     @staticmethod
     def _tool_result(result: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -297,14 +360,45 @@ class BoxshClient:
         if limit is not None:
             arguments["limit"] = limit
 
-        structured = self._tool_result(self._send("tools/call", {"name": "read", "arguments": arguments}))
+        result = self._send("tools/call", {"name": "read", "arguments": arguments})
+        structured = self._tool_result(result)
         return ReadResult(
-            content=str(structured.get("content", "")),
+            content=self._text_of(result),
             encoding=str(structured.get("encoding", "text")),
             mime_type=str(structured.get("mime_type", "")),
             line_count=structured.get("line_count") if isinstance(structured.get("line_count"), int) else None,
             truncated=structured.get("truncated") if isinstance(structured.get("truncated"), bool) else None,
-            size=structured.get("size") if isinstance(structured.get("size"), int) else None,
+            total_lines=structured.get("total_lines") if isinstance(structured.get("total_lines"), int) else None,
+            next_offset=structured.get("next_offset") if isinstance(structured.get("next_offset"), int) else None,
+        )
+
+    def view_image(self, file_path: PathLike, detail: Optional[str] = None) -> ViewImageResult:
+        """View an image file (png, jpeg, gif, bmp, tiff, webp).
+
+        detail="low" returns a 512px preview instead of the default 2000px.
+        Animated GIF/APNG/WebP sources are re-encoded to their first frame.
+        Other image formats (avif, heic, jxl, ...) raise
+        BoxshClientError with code E_UNSUPPORTED_FORMAT.
+        """
+        arguments: Dict[str, Any] = {"path": _path_str(file_path)}
+        if detail is not None:
+            arguments["detail"] = detail
+
+        result = self._send("tools/call", {"name": "view_image", "arguments": arguments})
+        structured = self._tool_result(result)
+        images = self._images_of(result)
+        image = images[0] if images else {}
+        return ViewImageResult(
+            data=str(image.get("data", "")),
+            mime_type=str(image.get("mimeType", structured.get("mime_type", ""))),
+            width=int(structured.get("width", 0)),
+            height=int(structured.get("height", 0)),
+            original_width=int(structured.get("original_width", 0)),
+            original_height=int(structured.get("original_height", 0)),
+            was_resized=bool(structured.get("was_resized", False)),
+            size=int(structured.get("size", 0)),
+            animated=bool(structured.get("animated", False)),
+            text=self._text_of(result),
         )
 
     def write(self, file_path: PathLike, content: str) -> None:

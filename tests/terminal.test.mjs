@@ -5,94 +5,12 @@
 
 import { test, describe, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { createInterface } from 'node:readline';
-import { BOXSH } from './helpers.mjs';
+import { BoxshSession } from './helpers.mjs';
 
 // ---------------------------------------------------------------------------
 // BoxshSession — interactive boxsh --rpc process for stateful tool tests.
-//
-// Usage:
-//   const s = new BoxshSession();
-//   const resp = await s.call({ tool: 'run_in_terminal', command: 'bash' });
-//   await s.close();
+// Lives in helpers.mjs so several suites can share one implementation.
 // ---------------------------------------------------------------------------
-
-class BoxshSession {
-  constructor({ workers = 2 } = {}) {
-    this._proc = spawn(BOXSH, ['--rpc', '--workers', String(workers)]);
-    this._pending = new Map();   // id → { resolve, reject }
-    this._nextId  = 1;
-    this._closed  = false;
-
-    const rl = createInterface({ input: this._proc.stdout });
-    rl.on('line', line => {
-      if (!line.trim()) return;
-      let msg;
-      try { msg = JSON.parse(line); } catch { return; }
-      const p = this._pending.get(String(msg.id));
-      if (p) {
-        this._pending.delete(String(msg.id));
-        p.resolve(msg);
-      }
-    });
-
-    this._proc.on('error', err => {
-      for (const p of this._pending.values()) p.reject(err);
-      this._pending.clear();
-    });
-  }
-
-  /**
-   * Send a single tools/call request and return the raw JSON-RPC response.
-   * @param {string} toolName - MCP tool name
-   * @param {object} [args]   - tool arguments (id here is the session id, not request id)
-   * @param {number} [timeout_ms]
-   */
-  call(toolName, args = {}, timeout_ms = 8000) {
-    return new Promise((resolve, reject) => {
-      const reqId = String(this._nextId++);
-      // Build JSON-RPC directly so args.id goes to the tool arguments,
-      // not to the JSON-RPC request id field.
-      const rpcReq = {
-        jsonrpc: '2.0',
-        id: reqId,
-        method: 'tools/call',
-        params: { name: toolName, arguments: args },
-      };
-      const timer = setTimeout(() => {
-        this._pending.delete(reqId);
-        reject(new Error(`timeout waiting for response to id=${reqId} (tool=${toolName})`));
-      }, timeout_ms);
-
-      this._pending.set(reqId, {
-        resolve: msg => { clearTimeout(timer); resolve(msg); },
-        reject:  err  => { clearTimeout(timer); reject(err);  },
-      });
-
-      this._proc.stdin.write(JSON.stringify(rpcReq) + '\n');
-    });
-  }
-
-  /** Extract structuredContent from a call response, or throw on error. */
-  static sc(resp) {
-    assert.ok(!resp.error, `JSON-RPC error: ${JSON.stringify(resp.error)}`);
-    const r = resp.result ?? {};
-    assert.ok(!r.isError,
-      `tool error: ${(r.content ?? [])[0]?.text ?? '?'}`);
-    return r.structuredContent ?? r;
-  }
-
-  close() {
-    if (this._closed) return Promise.resolve();
-    this._closed = true;
-    return new Promise(resolve => {
-      this._proc.stdin.end();
-      this._proc.on('close', resolve);
-      setTimeout(() => { this._proc.kill(); resolve(); }, 3000);
-    });
-  }
-}
 
 // UUID v4 pattern
 const UUID_RE =

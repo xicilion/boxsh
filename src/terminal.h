@@ -15,6 +15,7 @@ struct TerminalInfo {
     bool        alive;
     int         cols;
     int         rows;
+    int         exit_code; // valid when !alive (-1 when killed by a signal)
 };
 
 // ---------------------------------------------------------------------------

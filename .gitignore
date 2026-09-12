@@ -1,3 +1,5 @@
 build
 temp
 sdk/js/src/exec/
+__pycache__/
+*.pyc

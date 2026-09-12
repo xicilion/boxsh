@@ -3,7 +3,7 @@ set -ev
 
 HOST_OS=$(uname)
 
-# `boxsh --version` reports the BOXSH_VERSION define (CMake defaults it to 5.0.0
+# `boxsh --version` reports the BOXSH_VERSION define (CMake defaults it to 5.1.0
 # for plain dev builds).  Release binaries must report the tag they were cut
 # from, so pass the tag through when this is a tag build.
 VERSION_ARG=""

@@ -6,7 +6,7 @@ boxsh works as a **command-line shell** and as an **MCP (Model Context Protocol)
 
 **Core capabilities:**
 
-- **AI agent sandbox** — MCP-compatible server that AI clients (VS Code, Claude Desktop, Cursor, etc.) connect to directly. The agent gets `bash`, `read`, `write`, and `edit` tools inside an isolated environment.
+- **AI agent sandbox** — MCP-compatible server that AI clients (VS Code, Claude Desktop, Cursor, etc.) connect to directly. The agent gets `bash`, `read`, `view_image`, `write`, and `edit` tools inside an isolated environment.
 - **Copy-on-write workspace** — overlay any directory as a COW workspace. The agent reads and writes freely; all modifications land in a separate destination directory. The original is never touched.
 - **Interactive sandboxed shell** — `boxsh --try` drops you into a root shell over your current directory with COW. Experiment freely; discard everything on exit.
 - **Parallel isolated workers** — pre-forked worker pool with configurable concurrency. Crash recovery, per-request timeout, out-of-order response streaming.
@@ -19,10 +19,10 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 
 | Feature | Details |
 |---|---|
-| **MCP server** | Implements MCP (Model Context Protocol) over stdio with Content-Length framing or newline-delimited JSON. Nine tools: `bash`, `read`, `write`, `edit`, `run_in_terminal`, `send_to_terminal`, `get_terminal_output`, `kill_terminal`, `list_terminals` — each with `inputSchema` and `annotations`. |
+| **MCP server** | Implements MCP (Model Context Protocol) over stdio with Content-Length framing or newline-delimited JSON. Ten tools: `bash`, `read`, `view_image`, `write`, `edit`, `run_in_terminal`, `send_to_terminal`, `get_terminal_output`, `kill_terminal`, `list_terminals` — each with `inputSchema`, `outputSchema` and `annotations`. |
 | **OS-native sandbox** | Linux: user/mount/PID/network namespaces via direct syscalls + seccomp syscall filtering; macOS: Seatbelt (sandbox_init) + SBPL profiles — no external tools required |
 | **Copy-on-write workspace** | Copy-on-write workspace over any read-only base; writes accumulate in a caller-managed destination directory, persist between commands, and can be resumed across sessions |
-| **Built-in file tools** | `read` (text with offset/limit, binary as base64 with MIME detection), `write` (create or overwrite, auto-creates parent dirs), and `edit` (multi-replacement with unified diff) run on background threads — the event loop is never blocked |
+| **Built-in file tools** | `read` (text with offset/limit and `next_offset` paging), `view_image` (png/jpeg/gif/bmp/tiff/webp with automatic downscaling) and `write`/`edit` (create or overwrite, auto-creates parent dirs; unique-match multi-replacement) run on background threads — the event loop is never blocked |
 | **JSON-RPC 2.0** | Dual transport: Content-Length framed (LSP-style) or newline-delimited JSON over stdin/stdout |
 | **Pre-forked worker pool** | Configurable number of workers (`--workers N`); each worker is forked once and reused across requests |
 | **Crash recovery** | If a worker is killed (timeout, segfault, OOM), the coordinator detects `POLLHUP`, returns an error response, and immediately respawns a replacement |
@@ -147,10 +147,10 @@ boxsh supports two JSON-RPC 2.0 transports, auto-detected from the first bytes:
 
 | Method | Description |
 |---|---|
-| `initialize` | Returns server capabilities and protocol version |
+| `initialize` | Returns server capabilities and protocol version (`2025-06-18`; older revisions are echoed back) |
 | `notifications/initialized` | Acknowledged silently (no response) |
-| `tools/list` | Returns all nine tools with `inputSchema` and `annotations` |
-| `tools/call` | Dispatches to a named tool: `bash`, `read`, `write`, `edit` |
+| `tools/list` | Returns all ten tools with `inputSchema`, `outputSchema` and `annotations`. The tool set is static (`capabilities.tools.listChanged: false`) — restart the server to pick up new tool definitions |
+| `tools/call` | Dispatches to a named tool: `bash`, `read`, `view_image`, `write`, `edit` |
 
 ### Tools
 
@@ -170,18 +170,29 @@ Response (MCP `CallToolResult` format):
 }}
 ```
 
-- `content` — text representation for the LLM
-- `structuredContent` — typed fields (`exit_code`, `stdout`, `stderr`, `duration_ms`)
+- `content` — model-facing text: stdout, a `[stderr]` section when stderr is non-empty, and `[exit code: N]` for non-zero exits. Output past ~50 KiB keeps 24 KiB of head and tail with an explicit omission marker; the untouched streams stay in `structuredContent`.
+- `structuredContent` — typed fields (`exit_code`, `stdout`, `stderr`, `duration_ms`, optional `stdout_truncated`/`stderr_truncated`/`timed_out`)
 - `isError: true` — set when `exit_code != 0` or the command fails
 
-#### `read` — Read a file
+#### `read` — Read a text file
 
 ```json
 {"jsonrpc":"2.0", "id":"2", "method":"tools/call",
  "params":{"name":"read", "arguments":{"path":"/etc/hostname", "offset":1, "limit":10}}}
 ```
 
-`offset` (1-indexed start line) and `limit` (max lines) are optional for text files. Binary files are automatically detected and returned as base64 with `encoding: "base64"` and a `mime_type` field. `structuredContent` includes `truncated` and `line_count` (text) or `size` (binary).
+`offset` (1-indexed start line) and `limit` (max lines) are optional; the default cap is 2000 lines / 50 KiB per call. Text lives in `content[0].text` (the model representation); `structuredContent` carries metadata only — `{encoding:"text", mime_type, line_count, truncated, total_lines?, next_offset?}`.
+
+Binary files cannot be read as text: images fail with `E_NOT_IMAGE` (use `view_image`) and other binaries with `E_NOT_TEXT` (use `bash` with `file`, `xxd` or `strings`).
+
+#### `view_image` — View an image
+
+```json
+{"jsonrpc":"2.0", "id":"2b", "method":"tools/call",
+ "params":{"name":"view_image", "arguments":{"path":"/tmp/chart.png", "detail":"auto"}}}
+```
+
+Returns the image as an MCP `image` content block plus `structuredContent` metadata `{encoding:"image", mime_type, width, height, original_width, original_height, was_resized, size, animated}`. Images are downscaled to a 2000px longest edge (`detail:"low"` → 512px) and capped at 4.5 MB of base64; animated GIF/APNG/WebP sources report `animated: true` and are re-encoded so only their first frame is returned. Decodable formats are png, jpeg, gif, bmp, tiff and webp (vendored libwebp decoder) — other image formats (avif, heic, jxl, psd, …) fail with `E_UNSUPPORTED_FORMAT` and list the supported ones in `detail.supported`.
 
 #### `write` — Create or overwrite a file
 
@@ -253,8 +264,11 @@ boxsh distinguishes two kinds of errors per the MCP spec:
 
 | Error type | Serialization | Example |
 |---|---|---|
-| **Protocol error** | JSON-RPC `{"error": {"code": N, "message": "..."}}` | Invalid JSON, unknown method, unknown tool |
-| **Tool execution error** | `{"result": {"content": [...], "isError": true}}` | Non-zero exit code, file not found |
+| **Protocol error** | JSON-RPC `{"error": {"code": N, "message": "..."}}` | Invalid JSON, unknown method, unknown tool, missing/invalid arguments |
+| **Tool error** | `{"result": {"content": [{"type":"text","text":"E_...: ..."}], "structuredContent": {"code": "E_...", "message": "..."}, "isError": true}}` | File not found, not an image, unsupported format, bad base64 |
+| **Command failure** | `isError: true` with the normal command `structuredContent` (no `code`) | Non-zero exit code, timeout (`timed_out: true`) |
+
+Stable tool error codes: `E_INVALID_ARGUMENT`, `E_NOT_FOUND`, `E_NOT_TEXT`, `E_NOT_IMAGE`, `E_UNSUPPORTED_FORMAT`, `E_TOO_LARGE`, `E_TIMEOUT`, `E_SANDBOX`, `E_INTERNAL`. The full contract lives in [`docs/analysis-tool-result-contract.md`](docs/analysis-tool-result-contract.md).
 
 ### Client configuration
 
@@ -512,7 +526,9 @@ node --test tests/index.test.mjs
 | `timeout.test.mjs` | Timeout triggering, post-timeout worker recovery and reuse |
 | `concurrent.test.mjs` | Concurrent correctness, out-of-order responses, isolation, stress |
 | `overlay.test.mjs` | COW bind mounts, copy-on-write, delete/whiteout |
-| `tools.test.mjs` | Built-in tools: read (offset/limit), write, edit (diff, uniqueness checks) |
+| `tools.test.mjs` | Built-in tools: read (offset/limit), write, edit (uniqueness checks) |
+| `view-image.test.mjs` | `view_image`: image block + metadata, 2000px/512px downscaling, animated flag, image error codes |
+| `tool-contract.test.mjs` | Result contract: descriptors, `outputSchema` conformance, error codes, readable `content`, bash text budget |
 | `mcp.test.mjs` | MCP protocol: initialize, tools/list, tools/call, notifications, handshake |
 | `protocol-regression.test.mjs` | Content-Length transport, ID type preservation, initialize handshake, error distinction |
 | `docker.test.mjs` | Container engine contract: engine switch, COW via fuse-overlayfs, sandbox isolation (run by `docker-test.sh`, not in `index.test.mjs`) |

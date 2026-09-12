@@ -37,7 +37,9 @@ class BoxshChangesTests(unittest.TestCase):
 
             (base / "src").mkdir(parents=True)
             (upper / "src").mkdir(parents=True)
-            (upper.parent / ".boxsh").mkdir(parents=True)
+            # The manifest directory lives next to the upper dir in the shared
+            # temp root, so a leftover from an aborted run must not fail here.
+            (upper.parent / ".boxsh").mkdir(parents=True, exist_ok=True)
 
             (base / "README.md").write_text("base\n", encoding="utf-8")
             (base / "src" / "keep.txt").write_text("keep\n", encoding="utf-8")

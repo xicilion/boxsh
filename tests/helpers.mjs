@@ -11,6 +11,7 @@ import { spawnSync, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -92,8 +93,8 @@ export function toJsonRpc(req) {
 /**
  * Unwrap a JSON-RPC 2.0 response into a flat object compatible with old tests.
  * Flattens structuredContent so that e.g. r.exit_code, r.stdout, r.diff work.
- * For tool execution errors (isError=true without structuredContent), extracts
- * the error text from content into r.error for backward compatibility.
+ * For failures (isError=true) the readable message is exposed as r.error, and
+ * the stable error code (r.code) comes from structuredContent when present.
  * @param {object} raw  JSON-RPC 2.0 response
  * @returns {object}
  */
@@ -105,13 +106,166 @@ export function fromJsonRpc(raw) {
   const { structuredContent, ...rest } = result;
   const flat = { id: raw.id ?? '', ...rest, ...(structuredContent ?? {}) };
 
-  // Tool execution errors: isError=true, no structuredContent.
-  if (result.isError && !structuredContent && Array.isArray(result.content)) {
-    const text = result.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-    if (text) flat.error = text;
+  if (result.isError) {
+    // Tool errors carry {code, message}; a non-zero command exit does not.
+    if (structuredContent && typeof structuredContent.message === 'string') {
+      flat.error = structuredContent.message;
+    } else if (Array.isArray(result.content)) {
+      const text = result.content.filter(c => c.type === 'text')
+        .map(c => c.text).join('\n');
+      if (text) flat.error = text;
+    }
   }
 
   return flat;
+}
+
+// ---------------------------------------------------------------------------
+// Minimal JSON Schema validation
+//
+// boxsh's outputSchema descriptors stay inside a small, documented subset so
+// that the test suite can validate real tool results without pulling in an
+// external dependency (the repo has no root package.json; CI runs `node
+// --test` only).
+//
+// Supported keywords: anyOf, type (string or array of strings), enum,
+// properties, required, items. Everything else is ignored.
+// ---------------------------------------------------------------------------
+
+const JSON_TYPE_NAMES = ['object', 'array', 'string', 'integer', 'number', 'boolean', 'null'];
+
+function jsonTypeOf(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (Number.isInteger(value)) return 'integer';
+  if (typeof value === 'number') return 'number';
+  return typeof value; // object | string | boolean
+}
+
+function matchesSchemaType(type, value) {
+  const actual = jsonTypeOf(value);
+  if (type === actual) return true;
+  // An integer satisfies "number"; a number like 1.5 does not satisfy "integer".
+  if (type === 'number' && actual === 'integer') return true;
+  return false;
+}
+
+/**
+ * Validate a value against a boxsh outputSchema (subset — see above).
+ * @param {object} schema
+ * @param {unknown} value
+ * @param {string} [path]
+ * @returns {string[]} list of human-readable violations (empty = valid)
+ */
+export function schemaErrors(schema, value, path = '$') {
+  const errors = [];
+
+  if (schema.anyOf) {
+    const ok = schema.anyOf.some(s => schemaErrors(s, value, path).length === 0);
+    if (!ok) errors.push(`${path}: value does not match any anyOf branch`);
+    return errors;
+  }
+
+  if (schema.type !== undefined) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    for (const t of types) {
+      if (!JSON_TYPE_NAMES.includes(t))
+        errors.push(`${path}: schema uses unsupported type "${t}"`);
+    }
+    if (!types.some(t => matchesSchemaType(t, value))) {
+      errors.push(`${path}: expected ${types.join('|')}, got ${jsonTypeOf(value)}`);
+      return errors;
+    }
+  }
+
+  if (schema.enum && !schema.enum.some(v => JSON.stringify(v) === JSON.stringify(value)))
+    errors.push(`${path}: ${JSON.stringify(value)} is not one of ${JSON.stringify(schema.enum)}`);
+
+  if (jsonTypeOf(value) === 'object' && (schema.properties || schema.required)) {
+    for (const key of schema.required ?? []) {
+      if (!Object.prototype.hasOwnProperty.call(value, key))
+        errors.push(`${path}: missing required property "${key}"`);
+    }
+    for (const [key, subschema] of Object.entries(schema.properties ?? {})) {
+      if (Object.prototype.hasOwnProperty.call(value, key))
+        errors.push(...schemaErrors(subschema, value[key], `${path}.${key}`));
+    }
+  }
+
+  if (Array.isArray(value) && schema.items) {
+    value.forEach((item, i) => {
+      errors.push(...schemaErrors(schema.items, item, `${path}[${i}]`));
+    });
+  }
+
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
+// Test image fixtures
+// ---------------------------------------------------------------------------
+
+const CRC_TABLE = (() => {
+  const table = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c;
+  }
+  return table;
+})();
+
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const body = Buffer.concat([Buffer.from(type, 'latin1'), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(body), 0);
+  return Buffer.concat([len, body, crc]);
+}
+
+/**
+ * Build a real (decodable) 8-bit RGB PNG of the given size.
+ * Uses node's zlib, so the suite needs no image library.
+ * @param {number} width
+ * @param {number} height
+ * @param {{ solid?: boolean }} [opts]  solid = single colour (tiny file)
+ * @returns {Buffer}
+ */
+export function makePng(width, height, { solid = false } = {}) {
+  const stride = width * 3 + 1;
+  const raw = Buffer.alloc(stride * height);
+  for (let y = 0; y < height; y++) {
+    const row = y * stride;
+    raw[row] = 0; // filter type: none
+    for (let x = 0; x < width; x++) {
+      const p = row + 1 + x * 3;
+      if (solid) {
+        raw[p] = 0x40; raw[p + 1] = 0x80; raw[p + 2] = 0xc0;
+      } else {
+        raw[p]     = (x * 7 + y) & 0xff;
+        raw[p + 1] = (x + y * 5) & 0xff;
+        raw[p + 2] = (x ^ y) & 0xff;
+      }
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // colour type: truecolour
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +289,22 @@ export function run(args, input = '', timeout_ms = 5000) {
     // well above that so spawnSync never kills boxsh due to buffer overflow.
     maxBuffer: 64 * 1024 * 1024,
   });
+}
+
+/**
+ * Like rpc() but returns the untouched JSON-RPC 2.0 response, so tests can
+ * assert on the exact MCP shape (content array, structuredContent, isError).
+ * @param {object} req
+ * @param {{ workers?: number, timeout_ms?: number }} [opts]
+ * @returns {object}
+ */
+export function rpcRaw(req, { workers = 2, timeout_ms = 5000 } = {}) {
+  const line = JSON.stringify(toJsonRpc(req)) + '\n';
+  const r = run(['--rpc', '--workers', String(workers)], line, timeout_ms);
+  assert.equal(r.signal, null, `boxsh killed by signal ${r.signal}`);
+  const trimmed = r.stdout.trim();
+  assert.ok(trimmed.length > 0, 'boxsh produced no stdout');
+  return JSON.parse(trimmed);
 }
 
 /**
@@ -193,6 +363,95 @@ export function rpcMany(requests, { workers = 4, timeout_ms = 8000 } = {}) {
  */
 export function byId(resps) {
   return Object.fromEntries(resps.map(r => [r.id, r]));
+}
+
+// ---------------------------------------------------------------------------
+// Interactive session (stateful tool tests: terminals, MCP handshakes)
+// ---------------------------------------------------------------------------
+
+/**
+ * A long-running `boxsh --rpc` process for tests that need several tools to
+ * share one server instance (e.g. terminal sessions).
+ *
+ * Usage:
+ *   const s = new BoxshSession();
+ *   const resp = await s.call('run_in_terminal', { command: 'bash' });
+ *   await s.close();
+ */
+export class BoxshSession {
+  constructor({ workers = 2 } = {}) {
+    this._proc = spawn(BOXSH, ['--rpc', '--workers', String(workers)]);
+    this._pending = new Map();   // id → { resolve, reject }
+    this._nextId  = 1;
+    this._closed  = false;
+
+    const rl = createInterface({ input: this._proc.stdout });
+    rl.on('line', line => {
+      if (!line.trim()) return;
+      let msg;
+      try { msg = JSON.parse(line); } catch { return; }
+      const p = this._pending.get(String(msg.id));
+      if (p) {
+        this._pending.delete(String(msg.id));
+        p.resolve(msg);
+      }
+    });
+
+    this._proc.on('error', err => {
+      for (const p of this._pending.values()) p.reject(err);
+      this._pending.clear();
+    });
+  }
+
+  /**
+   * Send a single tools/call request and return the raw JSON-RPC response.
+   * @param {string} toolName - MCP tool name
+   * @param {object} [args]   - tool arguments (args.id is the terminal session id)
+   * @param {number} [timeout_ms]
+   */
+  call(toolName, args = {}, timeout_ms = 8000) {
+    return new Promise((resolve, reject) => {
+      const reqId = String(this._nextId++);
+      // Build JSON-RPC directly so args.id goes to the tool arguments,
+      // not to the JSON-RPC request id field.
+      const rpcReq = {
+        jsonrpc: '2.0',
+        id: reqId,
+        method: 'tools/call',
+        params: { name: toolName, arguments: args },
+      };
+      const timer = setTimeout(() => {
+        this._pending.delete(reqId);
+        reject(new Error(`timeout waiting for response to id=${reqId} (tool=${toolName})`));
+      }, timeout_ms);
+
+      this._pending.set(reqId, {
+        resolve: msg => { clearTimeout(timer); resolve(msg); },
+        reject:  err  => { clearTimeout(timer); reject(err);  },
+      });
+
+      this._proc.stdin.write(JSON.stringify(rpcReq) + '\n');
+    });
+  }
+
+  /** Extract structuredContent from a call response, or throw on error. */
+  static sc(resp) {
+    assert.ok(!resp.error, `JSON-RPC error: ${JSON.stringify(resp.error)}`);
+    const r = resp.result ?? {};
+    assert.ok(!r.isError,
+      `tool error: ${(r.content ?? [])[0]?.text ?? '?'}`);
+    return r.structuredContent ?? r;
+  }
+
+  close() {
+    if (this._closed) return Promise.resolve();
+    this._closed = true;
+    return new Promise(resolve => {
+      this._proc.stdin.end();
+      this._proc.on('close', resolve);
+      setTimeout(() => { this._proc.kill(); resolve(); }, 3000);
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

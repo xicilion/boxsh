@@ -43,12 +43,22 @@ with BoxshClient(workers=4) as client:
 ```python
 from pathlib import Path
 
-from boxsh_py import BoxshClient
+from boxsh_py import BoxshClient, BoxshClientError
 
 with BoxshClient() as client:
     output = Path("/workspace/output.txt")
     text = client.read(Path("/workspace/src/main.cpp"))
     print(text.content)
+
+    # Images go through view_image: base64 payload + metadata
+    image = client.view_image(Path("/workspace/chart.png"))
+    print(image.mime_type, image.width, image.height, image.was_resized)
+
+    # Binary files are rejected with a stable error code
+    try:
+        client.read(Path("/workspace/archive.zip"))
+    except BoxshClientError as err:
+        print(err.code, err.detail)   # E_NOT_TEXT {'mime': 'application/zip', ...}
 
     client.write(output, "hello\n")
 

@@ -9,13 +9,45 @@
  *   shell:  { id, cmd, timeout? }
  *   tool:   { id, tool: "read|write", path, ...opts }
  *
- * Protocol (response):
+ * Protocol (response, MCP CallToolResult):
  *   shell:  { id, exit_code, stdout, stderr, duration_ms }
- *   tool:   { id, content: [{ text }] }  or  { id, error }
+ *   tool:   { id, content: [{ type: 'text', text } | { type: 'image', ... }],
+ *             structuredContent?, isError? }
+ *
+ * Tool errors are rejected with a BoxshToolError carrying the stable `code`
+ * from structuredContent (see docs/analysis-tool-result-contract.md).
  */
 
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+
+/** Error thrown for MCP tool failures (isError:true). */
+export class BoxshToolError extends Error {
+    /**
+     * @param {string} message  self-describing message from the server
+     * @param {object} [opts]
+     * @param {string} [opts.code]    stable error code (E_*)
+     * @param {unknown} [opts.detail] machine-readable extra information
+     */
+    constructor(message, { code, detail } = {}) {
+        super(message);
+        this.name = 'BoxshToolError';
+        this.code = code;
+        this.detail = detail;
+    }
+}
+
+/** First text block of a CallToolResult, or ''. */
+function textOf(result) {
+    if (!Array.isArray(result?.content)) return '';
+    return result.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+}
+
+/** All image blocks of a CallToolResult. */
+function imagesOf(result) {
+    if (!Array.isArray(result?.content)) return [];
+    return result.content.filter(c => c.type === 'image');
+}
 
 /**
  * POSIX single-quote escaping.
@@ -100,16 +132,16 @@ export class BoxshClient {
     }
 
     /**
-     * Throw if the MCP CallToolResult indicates a tool execution error.
+     * Throw if the MCP CallToolResult indicates a tool failure.
      * @param {Record<string, unknown>} result
      */
     #checkToolError(result) {
-        if (result.isError) {
-            const text = Array.isArray(result.content)
-                ? result.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
-                : 'tool error';
-            throw new Error(text);
-        }
+        if (!result.isError) return;
+        const sc = result.structuredContent ?? {};
+        throw new BoxshToolError(
+            typeof sc.message === 'string' ? sc.message : (textOf(result) || 'tool error'),
+            { code: sc.code, detail: sc.detail },
+        );
     }
 
     /**
@@ -161,12 +193,15 @@ export class BoxshClient {
     }
 
     /**
-     * Read a file using boxsh's built-in read tool.
+     * Read a text file using boxsh's built-in read tool.
+     *
+     * Images and other binary files are rejected by the server — use
+     * viewImage() for images.
      *
      * @param {string} filePath    Absolute path to the file
      * @param {number} [offset]   1-based line number to start reading from
      * @param {number} [limit]    Maximum number of lines to return
-     * @returns {Promise<{ content: string, encoding: string, mime_type: string, line_count?: number, truncated?: boolean, size?: number }>}
+     * @returns {Promise<{ content: string, encoding: string, mime_type: string, line_count?: number, truncated?: boolean, total_lines?: number, next_offset?: number }>}
      */
     async read(filePath, offset, limit) {
         const args = { path: filePath };
@@ -180,18 +215,53 @@ export class BoxshClient {
         this.#checkToolError(result);
         const sc = result.structuredContent ?? {};
         return {
-            content:    sc.content ?? '',
+            content:    textOf(result),
             encoding:   sc.encoding ?? 'text',
             mime_type:  sc.mime_type ?? '',
-            ...(sc.line_count !== undefined ? { line_count: sc.line_count } : {}),
-            ...(sc.truncated  !== undefined ? { truncated: sc.truncated }  : {}),
-            ...(sc.size       !== undefined ? { size: sc.size }           : {}),
+            ...(sc.line_count  !== undefined ? { line_count: sc.line_count }   : {}),
+            ...(sc.truncated   !== undefined ? { truncated: sc.truncated }     : {}),
+            ...(sc.total_lines !== undefined ? { total_lines: sc.total_lines } : {}),
+            ...(sc.next_offset !== undefined ? { next_offset: sc.next_offset } : {}),
         };
     }
 
     /**
-     * Write a file using boxsh's built-in write tool.
-     * Fails if the file already exists — use edit() to modify existing files.
+     * View an image file (png, jpeg, gif, bmp, tiff, webp).
+     * Other image formats (avif, heic, jxl, …) are rejected with
+     * E_UNSUPPORTED_FORMAT.
+     *
+     * @param {string} filePath          Absolute path to the image
+     * @param {'auto'|'low'} [detail]    'low' returns a 512px preview
+     * @returns {Promise<{ data: string, mimeType: string, width: number, height: number, original_width: number, original_height: number, was_resized: boolean, size: number, animated: boolean, text: string }>}
+     */
+    async viewImage(filePath, detail) {
+        const args = { path: filePath };
+        if (detail !== undefined) args.detail = detail;
+
+        const result = await this.#send({
+            method: 'tools/call',
+            params: { name: 'view_image', arguments: args },
+        });
+        this.#checkToolError(result);
+        const sc = result.structuredContent ?? {};
+        const [image] = imagesOf(result);
+        return {
+            data:            image?.data ?? '',
+            mimeType:        image?.mimeType ?? sc.mime_type ?? '',
+            width:           sc.width ?? 0,
+            height:          sc.height ?? 0,
+            original_width:  sc.original_width ?? 0,
+            original_height: sc.original_height ?? 0,
+            was_resized:     sc.was_resized ?? false,
+            size:            sc.size ?? 0,
+            animated:        sc.animated ?? false,
+            text:            textOf(result),
+        };
+    }
+
+    /**
+     * Write a file using boxsh's built-in write tool (creates or overwrites).
+     * Parent directories are created automatically.
      *
      * @param {string} filePath   Absolute path to the file
      * @param {string} content    Full file content to write

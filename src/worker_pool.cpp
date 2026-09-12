@@ -85,9 +85,11 @@ static void run_shell_command(const std::string &shell_path,
                               std::string &stderr_out,
                               int &exit_code,
                               bool &stdout_truncated,
-                              bool &stderr_truncated) {
+                              bool &stderr_truncated,
+                              bool &timed_out) {
     stdout_truncated = false;
     stderr_truncated = false;
+    timed_out = false;
     int pfd_out[2], pfd_err[2];
     if (pipe(pfd_out) != 0 || pipe(pfd_err) != 0) {
         exit_code = -1;
@@ -176,6 +178,7 @@ static void run_shell_command(const std::string &shell_path,
         kill(-child, SIGKILL);  // kill the whole process group
         exit_code  = -1;
         stderr_out = "timeout";
+        timed_out  = true;
         close(pfd_out[0]); close(pfd_err[0]);
         waitpid(child, nullptr, 0);
     };
@@ -320,9 +323,9 @@ static void worker_loop(int sock_fd, const std::string &shell_path) {
 
         std::string out, serr;
         int code = -1;
-        bool out_trunc = false, err_trunc = false;
+        bool out_trunc = false, err_trunc = false, timed_out = false;
         run_shell_command(shell_path, req.cmd, req.timeout_sec,
-                          out, serr, code, out_trunc, err_trunc);
+                          out, serr, code, out_trunc, err_trunc, timed_out);
 
         auto t1 = std::chrono::steady_clock::now();
         uint64_t ms = (uint64_t)std::chrono::duration_cast<
@@ -336,6 +339,7 @@ static void worker_loop(int sock_fd, const std::string &shell_path) {
         resp.duration_ms       = ms;
         resp.stdout_truncated  = out_trunc;
         resp.stderr_truncated  = err_trunc;
+        resp.timed_out         = timed_out;
 
         extern std::string rpc_serialize_response(const RpcResponse &);
         std::string r = rpc_serialize_response(resp);
@@ -432,6 +436,7 @@ static RpcResponse parse_worker_response(const std::string &payload,
         resp.duration_ms = sc.value("duration_ms", (uint64_t)0);
         resp.stdout_truncated = sc.value("stdout_truncated", false);
         resp.stderr_truncated = sc.value("stderr_truncated", false);
+        resp.timed_out = sc.value("timed_out", false);
     } else if (result.value("isError", false)) {
         // Tool error without structuredContent (e.g. worker internal error).
         auto content = result.value("content", nlohmann::json::array());

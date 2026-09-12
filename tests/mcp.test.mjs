@@ -55,9 +55,14 @@ describe('mcp — initialize', () => {
     assert.ok(!resp.error, 'unexpected error field');
   });
 
-  test('protocolVersion is 2024-11-05', () => {
+  test('protocolVersion defaults to the 2025-06-18 baseline', () => {
     const resp = mcpOne({ jsonrpc: '2.0', id: 'init-2', method: 'initialize', params: {} });
-    assert.equal(resp.result.protocolVersion, '2024-11-05');
+    assert.equal(resp.result.protocolVersion, '2025-06-18');
+  });
+
+  test('capabilities declares a static tool list', () => {
+    const resp = mcpOne({ jsonrpc: '2.0', id: 'init-2b', method: 'initialize', params: {} });
+    assert.equal(resp.result.capabilities.tools.listChanged, false);
   });
 
   test('capabilities includes tools', () => {
@@ -105,17 +110,17 @@ describe('mcp — tools/list', () => {
     assert.ok(Array.isArray(resp.result.tools), 'expected tools array');
   });
 
-  test('contains exactly 9 tools', () => {
+  test('contains exactly 10 tools', () => {
     const resp = mcpOne({ jsonrpc: '2.0', id: 'tl-2', method: 'tools/list' });
-    assert.equal(resp.result.tools.length, 9);
+    assert.equal(resp.result.tools.length, 10);
   });
 
-  test('tool names include bash, read, write, edit and terminal tools', () => {
+  test('tool names include bash, read, view_image, write, edit and terminal tools', () => {
     const resp = mcpOne({ jsonrpc: '2.0', id: 'tl-3', method: 'tools/list' });
     const names = resp.result.tools.map(t => t.name).sort();
     assert.deepEqual(names, [
       'bash', 'edit', 'get_terminal_output', 'kill_terminal', 'list_terminals',
-      'read', 'run_in_terminal', 'send_to_terminal', 'write',
+      'read', 'run_in_terminal', 'send_to_terminal', 'view_image', 'write',
     ]);
   });
 
@@ -175,11 +180,28 @@ describe('mcp — tools/list', () => {
     const read = resp.result.tools.find(t => t.name === 'read');
     assert.ok(read.outputSchema, 'read should have outputSchema');
     assert.equal(read.outputSchema.type, 'object');
-    assert.ok('content' in read.outputSchema.properties);
     assert.ok('encoding' in read.outputSchema.properties);
     assert.ok('mime_type' in read.outputSchema.properties);
+    assert.ok('line_count' in read.outputSchema.properties);
+    assert.ok('truncated' in read.outputSchema.properties);
+    // read only serves text: the body lives in content[0].text, not in
+    // structuredContent, and there is no base64/binary payload any more.
+    assert.ok(!('content' in read.outputSchema.properties),
+      'read outputSchema must not carry a body copy');
     assert.deepEqual(read.outputSchema.required.sort(),
-      ['content', 'encoding', 'mime_type']);
+      ['encoding', 'line_count', 'mime_type', 'truncated']);
+  });
+
+  test('view_image tool has outputSchema and image annotations', () => {
+    const resp = mcpOne({ jsonrpc: '2.0', id: 'tl-os2b', method: 'tools/list' });
+    const view = resp.result.tools.find(t => t.name === 'view_image');
+    assert.ok(view, 'view_image should be listed');
+    assert.deepEqual(view.inputSchema.required, ['path']);
+    assert.equal(view.annotations.readOnlyHint, true);
+    assert.deepEqual(view.outputSchema.required.sort(), [
+      'encoding', 'height', 'mime_type', 'original_height', 'original_width',
+      'size', 'was_resized', 'width',
+    ]);
   });
 
   test('edit tool has outputSchema', () => {
@@ -187,7 +209,16 @@ describe('mcp — tools/list', () => {
     const edit = resp.result.tools.find(t => t.name === 'edit');
     assert.ok(edit.outputSchema, 'edit should have outputSchema');
     assert.equal(edit.outputSchema.type, 'object');
-    assert.ok(edit.outputSchema.properties, 'edit outputSchema should have properties');
+    assert.deepEqual(edit.outputSchema.required.sort(),
+      ['first_changed_line', 'lines_added', 'lines_removed', 'path']);
+  });
+
+  test('every tool declares an outputSchema', () => {
+    const resp = mcpOne({ jsonrpc: '2.0', id: 'tl-os4', method: 'tools/list' });
+    for (const tool of resp.result.tools) {
+      assert.ok(tool.outputSchema, `${tool.name} should have outputSchema`);
+      assert.equal(tool.outputSchema.type, 'object', `${tool.name} outputSchema type`);
+    }
   });
 
   test('tools have annotations', () => {
@@ -266,9 +297,11 @@ describe('mcp — tools/call read', () => {
       });
       assert.ok(resp.result, 'expected result');
       assert.ok(Array.isArray(resp.result.content));
-      // content[0].text is now a JSON string; structuredContent.content has the file text.
-      assert.equal(resp.result.structuredContent.content, 'MCP read test\n');
+      // content[0].text is the file body; structuredContent carries metadata only.
+      assert.equal(resp.result.content[0].text, 'MCP read test\n');
       assert.equal(resp.result.structuredContent.encoding, 'text');
+      assert.equal(resp.result.structuredContent.content, undefined,
+        'structuredContent must not duplicate the body');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -279,13 +312,13 @@ describe('mcp — tools/call read', () => {
         jsonrpc: '2.0', id: 'tr-2', method: 'tools/call',
         params: { name: 'read', arguments: { path: p, offset: 2, limit: 2 } },
       });
-      assert.equal(resp.result.structuredContent.content, 'b\nc\n');
+      assert.ok(resp.result.content[0].text.startsWith('b\nc\n'));
       assert.equal(resp.result.structuredContent.truncated, true);
       assert.equal(resp.result.structuredContent.line_count, 2);
     } finally { fs.rmSync(p, { force: true }); }
   });
 
-  test('binary file returns metadata encoding', () => {
+  test('image file is redirected to view_image', () => {
     const p = path.join(os.tmpdir(),
       `boxsh-mcp-bin-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
     const buf = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
@@ -295,10 +328,10 @@ describe('mcp — tools/call read', () => {
         jsonrpc: '2.0', id: 'tr-3', method: 'tools/call',
         params: { name: 'read', arguments: { path: p } },
       });
-      assert.ok(resp.result, 'expected result');
-      // Truncated PNG (8 bytes) — image can't be decoded, falls back to metadata.
-      assert.equal(resp.result.structuredContent.encoding, 'metadata');
-      assert.equal(resp.result.structuredContent.size, 8);
+      assert.equal(resp.result.isError, true);
+      assert.equal(resp.result.structuredContent.code, 'E_NOT_IMAGE');
+      assert.equal(resp.result.structuredContent.detail.size, 8);
+      assert.match(resp.result.content[0].text, /use view_image/);
     } finally { fs.rmSync(p, { force: true }); }
   });
 });
@@ -405,11 +438,11 @@ describe('mcp — full handshake', () => {
 
     // initialize
     assert.equal(resps[0].id, 'h-1');
-    assert.equal(resps[0].result.protocolVersion, '2024-11-05');
+    assert.equal(resps[0].result.protocolVersion, '2025-06-18');
 
     // tools/list
     assert.equal(resps[1].id, 'h-2');
-    assert.equal(resps[1].result.tools.length, 9);
+    assert.equal(resps[1].result.tools.length, 10);
 
     // tools/call
     assert.equal(resps[2].id, 'h-3');
@@ -425,7 +458,7 @@ describe('mcp — full handshake', () => {
         params: { name: 'bash', arguments: { command: 'echo second' } } },
     ]);
     assert.equal(resps.length, 3);
-    assert.equal(resps[0].result.protocolVersion, '2024-11-05');
+    assert.equal(resps[0].result.protocolVersion, '2025-06-18');
     assert.equal(resps[1].result.structuredContent.stdout, 'first\n');
     assert.equal(resps[2].result.structuredContent.stdout, 'second\n');
   });

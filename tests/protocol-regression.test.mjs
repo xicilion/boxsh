@@ -74,7 +74,7 @@ describe('protocol — Content-Length transport', () => {
     const resps = parseFramedResponses(raw);
     assert.equal(resps.length, 1);
     assert.equal(resps[0].id, 'cl-1');
-    assert.equal(resps[0].result.protocolVersion, '2024-11-05');
+    assert.equal(resps[0].result.protocolVersion, '2025-06-18');
   });
 
   test('multiple framed requests get framed responses', () => {
@@ -194,19 +194,27 @@ describe('protocol — initialize handshake', () => {
     assert.equal(resps[0].result.protocolVersion, '2024-11-05');
   });
 
-  test('falls back to default version when client omits protocolVersion', () => {
+  test('falls back to the supported baseline when client omits protocolVersion', () => {
     const resps = mcpRaw([
       { jsonrpc: '2.0', id: 'iv-2', method: 'initialize', params: {} },
     ]);
-    assert.equal(resps[0].result.protocolVersion, '2024-11-05');
+    assert.equal(resps[0].result.protocolVersion, '2025-06-18');
   });
 
-  test('echoes non-standard protocolVersion from client', () => {
+  test('echoes a known legacy protocolVersion from the client', () => {
     const resps = mcpRaw([
       { jsonrpc: '2.0', id: 'iv-3', method: 'initialize',
         params: { protocolVersion: '2025-03-26' } },
     ]);
     assert.equal(resps[0].result.protocolVersion, '2025-03-26');
+  });
+
+  test('unknown/future protocolVersion falls back to the supported baseline', () => {
+    const resps = mcpRaw([
+      { jsonrpc: '2.0', id: 'iv-3b', method: 'initialize',
+        params: { protocolVersion: '2030-01-01' } },
+    ]);
+    assert.equal(resps[0].result.protocolVersion, '2025-06-18');
   });
 
   test('initialize response has correct structure', () => {
@@ -229,6 +237,7 @@ describe('protocol — initialize handshake', () => {
     const resps = parseFramedResponses(raw);
     assert.equal(resps.length, 1);
     assert.equal(resps[0].result.protocolVersion, '2024-11-05');
+    assert.equal(resps[0].result.capabilities.tools.listChanged, false);
     assert.equal(resps[0].result.serverInfo.name, 'boxsh');
   });
 });

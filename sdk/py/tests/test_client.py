@@ -6,7 +6,7 @@ import unittest
 
 from boxsh_py import BoxshClientError, EditOperation
 
-from .common import make_client
+from .common import ROOT, make_client
 
 
 class BoxshClientToolTests(unittest.TestCase):
@@ -41,18 +41,47 @@ class BoxshClientToolTests(unittest.TestCase):
         self.assertEqual(result.content, "line1\nline2\n")
         self.assertEqual(result.line_count, 2)
 
-    def test_read_returns_binary_metadata(self) -> None:
+    def test_read_returns_binary_error(self) -> None:
         target = self.tmp / "sample.bin"
         target.write_bytes(bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00]))
-        result = self.client.read(target)
-        self.assertEqual(result.encoding, "metadata")
-        self.assertEqual(result.size, 10)
+        with self.assertRaises(BoxshClientError) as ctx:
+            self.client.read(target)
+        # Truncated PNG header: detected as an image, not readable as text.
+        self.assertEqual(ctx.exception.code, "E_NOT_IMAGE")
+        self.assertEqual(ctx.exception.detail["size"], 10)
+
+    def test_view_image_returns_payload_and_metadata(self) -> None:
+        target = ROOT / "tests" / "fixture" / "fixture.png"
+        result = self.client.view_image(target)
+        self.assertEqual(result.mime_type, "image/png")
+        self.assertEqual((result.width, result.height), (200, 133))
+        self.assertFalse(result.was_resized)
+        self.assertFalse(result.animated)
+        self.assertTrue(result.data)
+        self.assertEqual(result.text, "[Image: image/png, 200x133]")
+
+    def test_view_image_rejects_non_image(self) -> None:
+        target = self.tmp / "not-an-image.txt"
+        target.write_text("hello\n", encoding="utf-8")
+        with self.assertRaises(BoxshClientError) as ctx:
+            self.client.view_image(target)
+        self.assertEqual(ctx.exception.code, "E_NOT_IMAGE")
+
+    def test_read_reports_paging_information(self) -> None:
+        target = self.tmp / "page.txt"
+        target.write_text("".join(f"l{i}\n" for i in range(1, 21)), encoding="utf-8")
+        result = self.client.read(target, offset=1, limit=5)
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.total_lines, 20)
+        self.assertEqual(result.next_offset, 6)
 
     def test_read_supports_offset_and_limit(self) -> None:
         target = self.tmp / "lines.txt"
         target.write_text("a\nb\nc\nd\ne\n", encoding="utf-8")
         result = self.client.read(target, offset=2, limit=2)
-        self.assertEqual(result.content, "b\nc\n")
+        # body plus the paging hint appended by the server
+        self.assertTrue(result.content.startswith("b\nc\n"))
+        self.assertIn("continue with offset=4", result.content)
 
     def test_read_returns_empty_file(self) -> None:
         target = self.tmp / "empty.txt"
@@ -70,15 +99,14 @@ class BoxshClientToolTests(unittest.TestCase):
     def test_edit_accepts_tuple_operations(self) -> None:
         target = self.tmp / "edit.txt"
         target.write_text("hello world\n", encoding="utf-8")
-        result = self.client.edit(target, [("world", "earth")])
-        self.assertIn("+hello earth", result.diff)
+        self.client.edit(target, [("world", "earth")])
         self.assertEqual(target.read_text(encoding="utf-8"), "hello earth\n")
 
     def test_edit_accepts_dataclass_operations(self) -> None:
         target = self.tmp / "edit-dataclass.txt"
         target.write_text("hello world\n", encoding="utf-8")
-        result = self.client.edit(target, [EditOperation(old_text="hello", new_text="goodbye")])
-        self.assertIn("+goodbye world", result.diff)
+        self.client.edit(target, [EditOperation(old_text="hello", new_text="goodbye")])
+        self.assertEqual(target.read_text(encoding="utf-8"), "goodbye world\n")
 
     def test_edit_missing_file_raises(self) -> None:
         with self.assertRaises(BoxshClientError):

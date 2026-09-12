@@ -1,10 +1,10 @@
 /**
  * timeout.test.mjs — tests for the per-request timeout field.
  *
- * The "timeout" JSON field is forwarded to the worker, which uses alarm(2)
- * to kill the grandchild shell.  When the alarm fires, the worker process
- * itself receives SIGALRM and dies; the coordinator detects the crash via
- * POLLHUP and responds with an error, then respawns the worker.
+ * The "timeout" JSON field is forwarded to the worker; when the deadline
+ * fires the grandchild shell (and its process group) is killed and the
+ * response reports exit_code -1, stderr "timeout" and timed_out:true — a
+ * command result, not a tool error.
  */
 
 import { test, describe } from 'node:test';
@@ -142,17 +142,20 @@ describe('timeout — recovery', () => {
 // ---------------------------------------------------------------------------
 
 describe('timeout — clean kill path', () => {
-  test('timeout response has stderr=timeout and no crash error', () => {
-    // When SIGALRM fires the poll() loop must catch EINTR and kill the
-    // grandchild cleanly.  The worker process must NOT be killed by SIGALRM
-    // (i.e. there should be no "worker crash" error in the response).
+  test('timeout response is a command result, not a tool error', () => {
+    // When the deadline fires the poll() loop must kill the grandchild
+    // cleanly.  The worker process must NOT be killed (i.e. there should be
+    // no crash marker in the readable text).
     const resp = rpc(
       { id: 't', cmd: 'sleep 30', timeout: 1 },
       { timeout_ms: 6000 },
     );
     assert.equal(resp.stderr, 'timeout', 'expected clean timeout stderr marker');
     assert.equal(resp.exit_code, -1, 'expected exit_code -1 for timeout');
-    assert.ok(!resp.error, `expected no crash error, got: ${resp.error}`);
+    assert.equal(resp.timed_out, true, 'expected structuredContent.timed_out');
+    assert.equal(resp.code, undefined, 'a timeout is a command result, not a tool error');
+    assert.ok(!/crash|internal error|parse_error/i.test(resp.error ?? ''),
+      `expected no crash error, got: ${resp.error}`);
   });
 
   test('worker is still alive after timeout (no respawn)', () => {
@@ -167,7 +170,8 @@ describe('timeout — clean kill path', () => {
     );
     const m = byId(resps);
     assert.equal(m['to'].stderr, 'timeout');
-    assert.ok(!m['to'].error, `worker should not have crashed: ${m['to'].error}`);
+    assert.ok(!/crash|internal error/i.test(m['to'].error ?? ''),
+      `worker should not have crashed: ${m['to'].error}`);
     assert.equal(m['after'].stdout, 'alive\n');
   });
 });

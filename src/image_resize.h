@@ -5,21 +5,32 @@
 
 namespace boxsh {
 
+// Default inline-image budget: 4.5 MB of base64 payload.
+inline constexpr size_t kMaxImageBase64Bytes = 4718592;
+
+enum class ImageResizeStatus {
+    Ok,            // data holds a usable base64 image
+    DecodeFailed,  // the input could not be decoded (unsupported/corrupt)
+    TooLarge,      // decoded fine but no encoding fits max_bytes
+};
+
 struct ResizedImage {
-    std::string data;       // base64-encoded image data
+    std::string data;       // base64-encoded image data (empty unless status == Ok)
     std::string mime_type;  // output MIME type (may differ from input if re-encoded)
-    int width;
-    int height;
-    int original_width;
-    int original_height;
-    bool was_resized;
+    int width = 0;
+    int height = 0;
+    int original_width = 0;
+    int original_height = 0;
+    bool was_resized = false;
+    ImageResizeStatus status = ImageResizeStatus::DecodeFailed;
 };
 
 // Resize an image to fit within max dimensions and base64 size limit.
-// Returns empty data on failure (unsupported format, decode error, etc.).
+// Returns status == DecodeFailed on unsupported/corrupt input and
+// status == TooLarge when no encoding fits max_bytes.
 //
 // Strategy (following pi's approach):
-//   1. If already within limits → return base64 of original
+//   1. If already within limits and !always_reencode → return base64 of original
 //   2. Resize to maxWidth×maxHeight
 //   3. Try both PNG and JPEG, pick smaller
 //   4. If still over maxBytes, reduce JPEG quality
@@ -27,9 +38,13 @@ struct ResizedImage {
 //
 // raw: raw file bytes (not base64)
 // mime: detected MIME type of the input
+// always_reencode: skip the "return the original bytes" fast path — used for
+//                  animated sources, which must be re-encoded so that only the
+//                  first frame is returned (contract §2.3).
 ResizedImage resize_image(const std::string &raw, const std::string &mime,
                           int max_width = 2000, int max_height = 2000,
-                          size_t max_bytes = 4718592 /* 4.5 MB */);
+                          size_t max_bytes = kMaxImageBase64Bytes,
+                          bool always_reencode = false);
 
 }  // namespace boxsh
 

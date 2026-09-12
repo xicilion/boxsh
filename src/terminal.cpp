@@ -357,7 +357,8 @@ std::vector<TerminalInfo> terminal_list() {
     result.reserve(sessions.size());
     for (auto &s : sessions) {
         std::lock_guard<std::mutex> lk(s->mu);
-        result.push_back({s->id, s->command, !s->exited, s->cols, s->rows});
+        result.push_back({s->id, s->command, !s->exited, s->cols, s->rows,
+                          s->exit_code});
     }
     return result;
 }

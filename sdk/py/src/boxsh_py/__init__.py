@@ -18,6 +18,7 @@ from .client import (
     RunInTerminalResult,
     TerminalOutputResult,
     TerminalSession,
+    ViewImageResult,
     create_bash_operations,
     shell_quote,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "RunInTerminalResult",
     "TerminalOutputResult",
     "TerminalSession",
+    "ViewImageResult",
     "create_bash_operations",
     "format_changes",
     "get_changes",

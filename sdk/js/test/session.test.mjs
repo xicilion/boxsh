@@ -37,6 +37,7 @@ describe('BoxshClient — tool error handling', () => {
             (err) => {
                 assert.ok(err instanceof Error);
                 assert.match(err.message, /read:/);
+                assert.equal(err.code, 'E_NOT_FOUND');
                 return true;
             },
         );
@@ -52,22 +53,64 @@ describe('BoxshClient — tool error handling', () => {
         assert.equal(typeof result.mime_type, 'string');
     });
 
-    it('read() returns metadata for binary file', async () => {
+    it('read() reports paging information when truncated', async () => {
+        const p = path.join(tmpDir, 'read-page.txt');
+        fs.writeFileSync(p, Array.from({ length: 20 }, (_, i) => `l${i + 1}`).join('\n') + '\n');
+        const result = await client.read(p, 1, 5);
+        assert.equal(result.encoding, 'text');
+        assert.equal(result.truncated, true);
+        assert.equal(result.total_lines, 20);
+        assert.equal(result.next_offset, 6);
+        assert.ok(result.content.startsWith('l1\nl2\nl3\nl4\nl5\n'));
+    });
+
+    it('read() rejects binary files with a stable code', async () => {
         const p = path.join(tmpDir, 'read-bin.dat');
         const buf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]);
         fs.writeFileSync(p, buf);
-        const result = await client.read(p);
-        // Truncated PNG — stb can't decode, falls back to metadata.
-        assert.equal(result.encoding, 'metadata');
-        assert.equal(result.size, 10);
+        await assert.rejects(
+            () => client.read(p),
+            (err) => {
+                // Truncated PNG header: detected as an image, not readable as text.
+                assert.equal(err.code, 'E_NOT_IMAGE');
+                assert.equal(err.detail.size, 10);
+                assert.match(err.message, /view_image/);
+                return true;
+            },
+        );
     });
 
-    it('read() supports offset and limit', async () => {
-        const p = path.join(tmpDir, 'read-offset.txt');
-        fs.writeFileSync(p, 'a\nb\nc\nd\ne\n');
-        const result = await client.read(p, 2, 2);
-        assert.equal(result.encoding, 'text');
-        assert.equal(result.content, 'b\nc\n');
+    it('viewImage() returns the image plus metadata', async () => {
+        const p = path.resolve(import.meta.dirname, '../../..', 'tests/fixture/fixture.png');
+        const image = await client.viewImage(p);
+        assert.equal(image.mimeType, 'image/png');
+        assert.equal(image.width, 200);
+        assert.equal(image.height, 133);
+        assert.equal(image.was_resized, false);
+        assert.equal(image.animated, false);
+        assert.ok(image.data.length > 0, 'expected base64 image data');
+        assert.ok(Buffer.from(image.data, 'base64').length > 0);
+        assert.match(image.text, /^\[Image: image\/png, 200x133\]$/);
+    });
+
+    it('viewImage() decodes webp through the vendored decoder', async () => {
+        const p = path.resolve(import.meta.dirname, '../../..', 'tests/fixture/fixture.webp');
+        const image = await client.viewImage(p);
+        assert.equal(image.mimeType, 'image/webp');
+        assert.equal(image.width, 200);
+        assert.equal(image.height, 133);
+    });
+
+    it('viewImage() rejects non-images', async () => {
+        const p = path.join(tmpDir, 'not-an-image.txt');
+        fs.writeFileSync(p, 'hello\n');
+        await assert.rejects(
+            () => client.viewImage(p),
+            (err) => {
+                assert.equal(err.code, 'E_NOT_IMAGE');
+                return true;
+            },
+        );
     });
 
     it('read() returns empty file', async () => {

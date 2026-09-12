@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 project(boxsh LANGUAGES C CXX)
 
 # Version reported by `boxsh --version` (BOXSH_VERSION define).  Overridable so
-# dev builds can identify themselves: cmake -DBOXSH_VERSION=5.0.0-dev+abc1234.
-set(BOXSH_VERSION "5.0.0" CACHE STRING "boxsh version string")
+# dev builds can identify themselves: cmake -DBOXSH_VERSION=5.1.0-dev+abc1234.
+set(BOXSH_VERSION "5.1.0" CACHE STRING "boxsh version string")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -208,6 +208,70 @@ target_include_directories(libvterm_static
 target_compile_options(libvterm_static PRIVATE -w)
 
 # ---------------------------------------------------------------------------
+# libwebp (vendored decode-only subset)
+#
+# WebP decoding for the view_image tool.  Only the decoder side of libwebp
+# 1.6.0 is vendored (src/dec, the portable-C dsp files, src/utils, src/demux
+# and the public headers); the encoder and all SIMD variants are absent.
+# See third_party/libwebp/README.md for the file list and upgrade steps.
+# ---------------------------------------------------------------------------
+set(LIBWEBP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libwebp)
+set(LIBWEBP_SRC ${LIBWEBP_DIR}/src)
+
+set(LIBWEBP_SOURCES
+    # core decoder
+    ${LIBWEBP_SRC}/dec/alpha_dec.c
+    ${LIBWEBP_SRC}/dec/buffer_dec.c
+    ${LIBWEBP_SRC}/dec/frame_dec.c
+    ${LIBWEBP_SRC}/dec/idec_dec.c
+    ${LIBWEBP_SRC}/dec/io_dec.c
+    ${LIBWEBP_SRC}/dec/quant_dec.c
+    ${LIBWEBP_SRC}/dec/tree_dec.c
+    ${LIBWEBP_SRC}/dec/vp8_dec.c
+    ${LIBWEBP_SRC}/dec/vp8l_dec.c
+    ${LIBWEBP_SRC}/dec/webp_dec.c
+    # dsp (portable C only — no SIMD variants are vendored)
+    ${LIBWEBP_SRC}/dsp/alpha_processing.c
+    ${LIBWEBP_SRC}/dsp/cpu.c
+    ${LIBWEBP_SRC}/dsp/dec.c
+    ${LIBWEBP_SRC}/dsp/dec_clip_tables.c
+    ${LIBWEBP_SRC}/dsp/filters.c
+    ${LIBWEBP_SRC}/dsp/lossless.c
+    ${LIBWEBP_SRC}/dsp/rescaler.c
+    ${LIBWEBP_SRC}/dsp/upsampling.c
+    ${LIBWEBP_SRC}/dsp/yuv.c
+    # utils
+    ${LIBWEBP_SRC}/utils/bit_reader_utils.c
+    ${LIBWEBP_SRC}/utils/color_cache_utils.c
+    ${LIBWEBP_SRC}/utils/filters_utils.c
+    ${LIBWEBP_SRC}/utils/huffman_utils.c
+    ${LIBWEBP_SRC}/utils/palette.c
+    ${LIBWEBP_SRC}/utils/quant_levels_dec_utils.c
+    ${LIBWEBP_SRC}/utils/rescaler_utils.c
+    ${LIBWEBP_SRC}/utils/random_utils.c
+    ${LIBWEBP_SRC}/utils/thread_utils.c
+    ${LIBWEBP_SRC}/utils/utils.c
+    # demux (animated WebP: frame info + first frame)
+    ${LIBWEBP_SRC}/demux/anim_decode.c
+    ${LIBWEBP_SRC}/demux/demux.c
+)
+
+add_library(libwebp_decoder STATIC ${LIBWEBP_SOURCES})
+
+# libwebp's internal includes are rooted at the source root ("src/dec/...").
+target_include_directories(libwebp_decoder
+    PUBLIC
+        ${LIBWEBP_DIR}
+        ${LIBWEBP_SRC}
+)
+
+# Use the vendored src/webp/config.h (portable C, no SIMD, no threads).
+target_compile_definitions(libwebp_decoder PRIVATE HAVE_CONFIG_H)
+
+# Third-party code: keep its warnings out of our build log.
+target_compile_options(libwebp_decoder PRIVATE -w)
+
+# ---------------------------------------------------------------------------
 # boxsh executable
 # ---------------------------------------------------------------------------
 
@@ -248,6 +312,7 @@ target_compile_definitions(boxsh
     PRIVATE
         _GNU_SOURCE
         BOXSH_VERSION="${BOXSH_VERSION}"
+        BOXSH_HAVE_WEBP
 )
 
 target_compile_options(boxsh
@@ -262,6 +327,7 @@ target_link_libraries(boxsh
         dash_static
         nlohmann_json
         libvterm_static
+        libwebp_decoder
         ${LIBEDIT_INSTALL_DIR}/lib/libedit.a
         ncurses
         pthread

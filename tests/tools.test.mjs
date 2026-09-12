@@ -47,7 +47,7 @@ describe('tool — read', () => {
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(resp.content, 'hello\nworld\n');
+      assert.equal(text(resp), 'hello\nworld\n');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -56,7 +56,7 @@ describe('tool — read', () => {
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p, offset: 2 });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(resp.content, 'line2\nline3\n');
+      assert.equal(text(resp), 'line2\nline3\n');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -65,7 +65,7 @@ describe('tool — read', () => {
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p, limit: 2 });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(resp.content, 'a\nb\n');
+      assert.ok(text(resp).startsWith('a\nb\n'), 'expected the first two lines');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -74,7 +74,7 @@ describe('tool — read', () => {
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p, offset: 2, limit: 2 });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(resp.content, 'b\nc\n');
+      assert.ok(text(resp).startsWith('b\nc\n'), 'expected the requested window');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -190,8 +190,9 @@ describe('tool — read', () => {
     } finally { fs.rmSync(p, { force: true }); }
   });
 
-  test('reads binary image as metadata (truncated image)', () => {
-    // Create a small PNG-like binary file (too small for stb to decode).
+  test('image file is rejected with E_NOT_IMAGE', () => {
+    // PNG magic bytes only — detected as image/png even though it cannot be
+    // decoded; read must redirect the caller to view_image.
     const p = path.join(os.tmpdir(),
       `boxsh-bin-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
     const buf = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
@@ -199,30 +200,28 @@ describe('tool — read', () => {
     fs.writeFileSync(p, buf);
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p });
-      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      // Truncated PNG — stb can't decode, falls back to metadata.
-      assert.equal(resp.encoding, 'metadata');
-      assert.equal(resp.mime_type, 'image/png');
-      assert.equal(resp.size, 16);
+      assert.equal(resp.code, 'E_NOT_IMAGE');
+      assert.equal(resp.detail.mime, 'image/png');
+      assert.equal(resp.detail.size, 16);
+      assert.match(resp.error, /view_image/);
     } finally { fs.rmSync(p, { force: true }); }
   });
 
-  test('binary file has mime_type and size', () => {
+  test('gif is reported as an image, not as readable metadata', () => {
     const p = path.join(os.tmpdir(),
       `boxsh-bin-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
-    // Use a GIF header to ensure detection identifies it as binary.
+    // Use a GIF header to ensure detection identifies it as an image.
     const buf = Buffer.from('GIF89a' + '\x00'.repeat(58));
     fs.writeFileSync(p, buf);
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p });
-      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(resp.encoding, 'metadata');
-      assert.equal(typeof resp.mime_type, 'string');
-      assert.equal(resp.size, 64);
+      assert.equal(resp.code, 'E_NOT_IMAGE');
+      assert.equal(resp.detail.mime, 'image/gif');
+      assert.equal(resp.detail.size, 64);
     } finally { fs.rmSync(p, { force: true }); }
   });
 
-  test('ELF binary detected correctly', () => {
+  test('ELF binary is rejected with E_NOT_TEXT', () => {
     const p = path.join(os.tmpdir(),
       `boxsh-elf-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
     // ELF magic header.
@@ -231,10 +230,11 @@ describe('tool — read', () => {
     fs.writeFileSync(p, buf);
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p });
-      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(resp.encoding, 'metadata');
-      assert.ok(resp.mime_type.includes('elf') || resp.mime_type.includes('executable') ||
-                resp.mime_type.includes('octet'), `expected binary mime, got ${resp.mime_type}`);
+      assert.equal(resp.code, 'E_NOT_TEXT');
+      const mime = resp.detail.mime;
+      assert.ok(mime.includes('elf') || mime.includes('executable') ||
+                mime.includes('octet'), `expected binary mime, got ${mime}`);
+      assert.match(resp.error, /bash/, 'error should point at bash');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -246,7 +246,7 @@ describe('tool — read', () => {
       const resp = rpc({ id: '1', tool: 'read', path: p });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
       assert.equal(resp.encoding, 'text');
-      assert.equal(resp.content, '{"key": "value"}\n');
+      assert.equal(text(resp), '{"key": "value"}\n');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -256,7 +256,7 @@ describe('tool — read', () => {
       const resp = rpc({ id: '1', tool: 'read', path: p });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
       assert.equal(resp.encoding, 'text');
-      assert.equal(resp.content, '');
+      assert.equal(text(resp), '');
     } finally { fs.rmSync(p, { force: true }); }
   });
 });
@@ -739,7 +739,7 @@ describe('tool — Unicode path normalization', () => {
       const asciiPath = path.join(dir, "it's a test.txt");
       const resp = rpc({ id: '1', tool: 'read', path: asciiPath });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(resp.content, 'curly\n');
+      assert.equal(text(resp), 'curly\n');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -756,7 +756,7 @@ describe('tool — Unicode path normalization', () => {
       const spacePath = path.join(dir, 'shot 3 PM.txt');
       const resp = rpc({ id: '1', tool: 'read', path: spacePath });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(resp.content, 'narrow nbsp\n');
+      assert.equal(text(resp), 'narrow nbsp\n');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -785,7 +785,7 @@ describe('tool — Unicode path normalization', () => {
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(resp.content, 'hello\n');
+      assert.equal(text(resp), 'hello\n');
     } finally { fs.rmSync(p, { force: true }); }
   });
 });

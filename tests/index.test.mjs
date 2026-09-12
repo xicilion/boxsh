@@ -8,6 +8,8 @@ import './overlay.test.mjs';
 import './bind-preflight.test.mjs';
 import './try.test.mjs';
 import './tools.test.mjs';
+import './view-image.test.mjs';
+import './tool-contract.test.mjs';
 import './mcp.test.mjs';
 import './protocol-regression.test.mjs';
 import './sandbox-escape.test.mjs';

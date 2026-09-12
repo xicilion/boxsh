@@ -1,12 +1,18 @@
 /**
  * file-type.test.mjs — MIME detection accuracy tests.
  *
- * Reads fixture files via boxsh `read` tool and asserts the returned
- * `mime_type` matches expected values.  Fixture files come from the
- * npm `file-type` project and live in ./fixture/.
+ * Reads fixture files via boxsh and asserts the reported MIME type matches
+ * the expected value.  Fixture files come from the npm `file-type` project and
+ * live in ./fixture/.
+ *
+ * Two result shapes are valid after the contract refactor
+ * (docs/analysis-tool-result-contract.md):
+ *   - text files  → read returns the body, mime_type in structuredContent
+ *   - everything else → read fails with E_NOT_TEXT / E_NOT_IMAGE and the
+ *     detected MIME type in detail.mime
  *
  * Only formats that file_type.cpp actually detects are tested here.
- * Unsupported formats are expected to return "application/octet-stream".
+ * Unsupported formats are expected to report "application/octet-stream".
  */
 
 import { describe, test } from 'node:test';
@@ -322,6 +328,25 @@ function getFixtures() {
 // Image MIME prefixes → encoding will be 'image' (if stb can decode) or 'metadata'.
 const isImageMime = (mime) => mime.startsWith('image/');
 
+/**
+ * MIME type reported by a read result: text results carry it in
+ * structuredContent, binary results in the error's detail.
+ */
+function reportedMime(resp, filename) {
+  if (resp.error) {
+    assert.ok(resp.code === 'E_NOT_TEXT' || resp.code === 'E_NOT_IMAGE',
+      `${filename}: unexpected error code ${resp.code} (${resp.error})`);
+    assert.equal(typeof resp.detail?.mime, 'string',
+      `${filename}: error must carry detail.mime`);
+    assert.equal(typeof resp.detail?.size, 'number',
+      `${filename}: error must carry detail.size`);
+    return resp.detail.mime;
+  }
+  assert.equal(resp.encoding, 'text',
+    `${filename}: text results must use encoding 'text'`);
+  return resp.mime_type;
+}
+
 describe('MIME detection', () => {
   const fixtures = getFixtures();
 
@@ -331,18 +356,15 @@ describe('MIME detection', () => {
     test(`${f.filename} → ${expectedMime}`, () => {
       const timeout_ms = f.filename.includes('bdav') ? 30000 : 5000;
       const resp = rpc({ id: '1', tool: 'read', path: f.path }, { timeout_ms });
-      assert.ok(!resp.error, `read error: ${resp.error}`);
-      if (isImageMime(expectedMime)) {
-        assert.ok(
-          resp.encoding === 'image' || resp.encoding === 'metadata',
-          `expected image or metadata encoding for ${f.filename}, got ${resp.encoding}`,
-        );
-      } else {
-        assert.equal(resp.encoding, 'metadata',
-          `expected metadata encoding for ${f.filename}, got ${resp.encoding}`);
-      }
-      assert.equal(resp.mime_type, expectedMime,
-        `MIME mismatch for ${f.filename}: got ${resp.mime_type}, expected ${expectedMime}`);
+
+      // Images must be redirected to view_image instead of being returned
+      // silently as metadata.
+      if (isImageMime(expectedMime) && resp.error)
+        assert.equal(resp.code, 'E_NOT_IMAGE',
+          `${f.filename}: images must fail with E_NOT_IMAGE`);
+
+      assert.equal(reportedMime(resp, f.filename), expectedMime,
+        `MIME mismatch for ${f.filename}`);
     });
   }
 });
@@ -379,10 +401,10 @@ describe('unsupported formats → application/octet-stream', () => {
   for (const filename of unsupportedFixtures) {
     test(filename, () => {
       const resp = rpc({ id: '1', tool: 'read', path: path.join(FIXTURE, filename) });
-      assert.ok(!resp.error, `read error: ${resp.error}`);
-      assert.equal(resp.encoding, 'metadata', `expected metadata for ${filename}`);
-      assert.equal(resp.mime_type, 'application/octet-stream',
-        `expected octet-stream for unsupported ${filename}, got ${resp.mime_type}`);
+      assert.equal(resp.code, 'E_NOT_TEXT',
+        `${filename}: expected E_NOT_TEXT, got ${resp.code ?? 'success'}`);
+      assert.equal(resp.detail?.mime, 'application/octet-stream',
+        `expected octet-stream for unsupported ${filename}, got ${resp.detail?.mime}`);
     });
   }
 });

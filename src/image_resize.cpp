@@ -1,4 +1,4 @@
-// Image resize using stb libraries.
+// Image resize using stb libraries (decode: stb + libwebp, encode: stb).
 // Decodes image, resizes if needed, re-encodes as JPEG or PNG.
 
 #include "image_resize.h"
@@ -19,7 +19,114 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../third_party/stb/stb_image_write.h"
 
+#ifdef BOXSH_HAVE_WEBP
+#include <webp/decode.h>
+#include <webp/demux.h>
+#endif
+
 namespace boxsh {
+
+// ---------------------------------------------------------------------------
+// Decoding
+// ---------------------------------------------------------------------------
+
+// Decoded pixels plus ownership.  Pixels come either from stb (malloc'ed by
+// stb_image, freed with stbi_image_free) or from libwebp (copied into the
+// vector, because WebPDecodeRGBA / WebPAnimDecoder own their buffers).
+struct DecodedPixels {
+    const unsigned char *data = nullptr;
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    unsigned char *stb_owned = nullptr;
+    std::vector<unsigned char> webp_owned;
+
+    ~DecodedPixels() {
+        if (stb_owned) stbi_image_free(stb_owned);
+    }
+};
+
+#ifdef BOXSH_HAVE_WEBP
+
+// Decode a WebP file into RGBA pixels.  Animated files yield their first
+// frame (composited onto the canvas), so the caller always receives a single
+// still image.
+static bool decode_webp(const std::string &raw, DecodedPixels &out) {
+    const uint8_t *data = reinterpret_cast<const uint8_t *>(raw.data());
+    const size_t size = raw.size();
+
+    WebPBitstreamFeatures features;
+    if (WebPGetFeatures(data, size, &features) != VP8_STATUS_OK)
+        return false;
+
+    if (features.has_animation) {
+        WebPData webp_data = {data, size};
+        WebPAnimDecoderOptions opts;
+        if (!WebPAnimDecoderOptionsInit(&opts))
+            return false;
+        opts.color_mode = MODE_RGBA;
+
+        WebPAnimDecoder *dec = WebPAnimDecoderNew(&webp_data, &opts);
+        if (dec == nullptr)
+            return false;
+
+        WebPAnimInfo info;
+        uint8_t *frame = nullptr;
+        int timestamp = 0;
+        const bool ok = WebPAnimDecoderGetInfo(dec, &info) &&
+                        WebPAnimDecoderGetNext(dec, &frame, &timestamp);
+        if (ok && frame != nullptr) {
+            const size_t bytes = static_cast<size_t>(info.canvas_width) *
+                                 static_cast<size_t>(info.canvas_height) * 4;
+            out.webp_owned.assign(frame, frame + bytes);
+            out.width    = static_cast<int>(info.canvas_width);
+            out.height   = static_cast<int>(info.canvas_height);
+            out.channels = 4;
+        }
+        WebPAnimDecoderDelete(dec);
+        if (!ok) return false;
+    } else {
+        int w = 0, h = 0;
+        uint8_t *rgba = WebPDecodeRGBA(data, size, &w, &h);
+        if (rgba == nullptr) return false;
+        out.webp_owned.assign(rgba, rgba + static_cast<size_t>(w) *
+                                    static_cast<size_t>(h) * 4);
+        WebPFree(rgba);
+        out.width    = w;
+        out.height   = h;
+        out.channels = 4;
+    }
+
+    out.data = out.webp_owned.data();
+    return true;
+}
+
+#endif  // BOXSH_HAVE_WEBP
+
+// Decode any supported format.  WebP goes through libwebp (when vendored),
+// everything else through stb_image.
+static bool decode_image(const std::string &raw, const std::string &mime,
+                         DecodedPixels &out) {
+#ifdef BOXSH_HAVE_WEBP
+    if (mime == "image/webp")
+        return decode_webp(raw, out);
+#else
+    (void)mime;
+#endif
+
+    int w = 0, h = 0, channels = 0;
+    unsigned char *pixels = stbi_load_from_memory(
+        reinterpret_cast<const unsigned char *>(raw.data()),
+        static_cast<int>(raw.size()), &w, &h, &channels, 0);
+    if (!pixels) return false;
+
+    out.stb_owned = pixels;
+    out.data      = pixels;
+    out.width     = w;
+    out.height    = h;
+    out.channels  = (channels > 4) ? 4 : channels;  // stb may report >4 for HDR
+    return true;
+}
 
 // Base64 encoding (duplicated here to keep image_resize self-contained).
 static const char b64_table[] =
@@ -77,26 +184,26 @@ static Candidate best_encoding(const unsigned char *pixels,
 }
 
 ResizedImage resize_image(const std::string &raw, const std::string &mime,
-                          int max_width, int max_height, size_t max_bytes) {
-    int w, h, channels;
-    unsigned char *pixels = stbi_load_from_memory(
-        reinterpret_cast<const unsigned char *>(raw.data()),
-        static_cast<int>(raw.size()), &w, &h, &channels, 0);
-    if (!pixels)
-        return {};
+                          int max_width, int max_height, size_t max_bytes,
+                          bool always_reencode) {
+    DecodedPixels decoded;
+    if (!decode_image(raw, mime, decoded))
+        return {};  // status stays DecodeFailed
 
-    // Clamp channels to 4 (stb sometimes reports >4 for HDR).
-    if (channels > 4) channels = 4;
+    const unsigned char *pixels = decoded.data;
+    const int w = decoded.width;
+    const int h = decoded.height;
+    const int channels = decoded.channels;
 
     // Check if dimensions are already within limits — only then compute
     // the original base64 (avoids wasting CPU on large images that will
     // be resized anyway).
-    if (w <= max_width && h <= max_height) {
+    if (!always_reencode && w <= max_width && h <= max_height) {
         std::string orig_b64 = b64_encode(
             reinterpret_cast<const unsigned char *>(raw.data()), raw.size());
         if (orig_b64.size() <= max_bytes) {
-            stbi_image_free(pixels);
-            return {std::move(orig_b64), mime, w, h, w, h, false};
+            return {std::move(orig_b64), mime, w, h, w, h, false,
+                    ImageResizeStatus::Ok};
         }
     }
 
@@ -128,9 +235,9 @@ ResizedImage resize_image(const std::string &raw, const std::string &mime,
         for (int q : jpeg_qualities) {
             auto c = best_encoding(resized.data(), tw, th, channels, q);
             if (c.data.size() <= max_bytes) {
-                stbi_image_free(pixels);
                 return {std::move(c.data), std::move(c.mime),
-                        tw, th, orig_w, orig_h, true};
+                        tw, th, orig_w, orig_h,
+                        tw != orig_w || th != orig_h, ImageResizeStatus::Ok};
             }
         }
 
@@ -139,9 +246,9 @@ ResizedImage resize_image(const std::string &raw, const std::string &mime,
         th /= 2;
     }
 
-    // All attempts failed.
-    stbi_image_free(pixels);
-    return {};
+    // All attempts failed — the image decoded but cannot fit the budget.
+    return ResizedImage{"", "", 0, 0, orig_w, orig_h, true,
+                        ImageResizeStatus::TooLarge};
 }
 
 }  // namespace boxsh

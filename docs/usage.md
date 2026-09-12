@@ -867,10 +867,10 @@ boxsh supports two transports, auto-detected from the first bytes:
 
 | Method | Description |
 |---|---|
-| `initialize` | Returns server capabilities and protocol version |
+| `initialize` | Returns server capabilities and protocol version (`2025-06-18`; known older revisions are echoed back) |
 | `notifications/initialized` | Acknowledged silently (no response) |
-| `tools/list` | Returns all nine tools with `inputSchema` and `annotations` |
-| `tools/call` | Dispatches to a named tool: `bash`, `read`, `write`, `edit`, `run_in_terminal`, `send_to_terminal`, `get_terminal_output`, `kill_terminal`, `list_terminals` |
+| `tools/list` | Returns all ten tools with `inputSchema`, `outputSchema` and `annotations` |
+| `tools/call` | Dispatches to a named tool: `bash`, `read`, `view_image`, `write`, `edit`, `run_in_terminal`, `send_to_terminal`, `get_terminal_output`, `kill_terminal`, `list_terminals` |
 
 #### Shell Commands
 
@@ -889,8 +889,8 @@ echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"bash","a
 }}
 ```
 
-- `content` — text representation for the LLM
-- `structuredContent` — typed fields: `exit_code`, `stdout`, `stderr`, `duration_ms`
+- `content` — model-facing text: stdout, a `[stdout]`/`[stderr]` section layout when both are present, and `[exit code: N]` for non-zero exits. Output beyond ~50 KiB keeps 24 KiB of head and tail with an explicit `… [truncated: N bytes of M omitted] …` marker; the untouched streams remain in `structuredContent`.
+- `structuredContent` — typed fields: `exit_code`, `stdout`, `stderr`, `duration_ms`, plus optional `stdout_truncated`/`stderr_truncated`/`timed_out`
 - `isError: true` — set when `exit_code != 0` or the command fails
 
 Full shell syntax is supported — pipes, redirections, variables, subshells, etc.:
@@ -905,9 +905,9 @@ echo '{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"bash","a
 
 #### Built-in File Tools
 
-Three file-operation tools are available via `tools/call`. They run on background threads and do not occupy a worker slot.
+Four file-operation tools are available via `tools/call`. They run on background threads and do not occupy a worker slot.
 
-**`read`** — Read a file. Text files support `offset`/`limit` for slicing. Binary files are automatically detected and returned as base64 with MIME type.
+**`read`** — Read a text file. `offset`/`limit` slice large files; the default cap is 2000 lines or 50 KiB per call.
 
 ```sh
 # Read entire file
@@ -919,16 +919,35 @@ echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"read","a
 
 | Argument | Type | Default | Description |
 |---|---|---|---|
-| `offset` | number | 1 | 1-based start line (text only) |
-| `limit` | number | unlimited | Maximum lines to return (text only) |
+| `offset` | number | 1 | 1-based start line |
+| `limit` | number | 2000 | Maximum lines to return |
 
-`structuredContent` includes: `content`, `encoding` (`"text"` or `"base64"`), `mime_type`, and `truncated`/`line_count` (text) or `size` (binary).
+The file body is the model-facing `content[0].text`; when the result is truncated the server appends `[truncated: showing lines A-B of T; continue with offset=N]`. `structuredContent` carries metadata only: `encoding` (always `"text"`), `mime_type`, `line_count`, `truncated`, and `total_lines`/`next_offset` when truncated.
+
+Binary files are rejected instead of returning a base64 blob:
+
+- images → `E_NOT_IMAGE` ("use view_image")
+- everything else → `E_NOT_TEXT` ("use bash: file/xxd/strings")
+
+**`view_image`** — View an image file (png, jpeg, gif, bmp, tiff, webp).
+
+```sh
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"view_image","arguments":{"path":"/tmp/chart.png"}}}' | boxsh --rpc
+```
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `path` | string | — | Image file to view |
+| `detail` | `"auto"` \| `"low"` | `"auto"` | `"low"` returns a 512px preview instead of the 2000px default |
+
+Returns an MCP `image` content block plus `structuredContent`: `encoding` (`"image"`), `mime_type`, `width`, `height`, `original_width`, `original_height`, `was_resized`, `size`, `animated`. Oversized images are downscaled and re-encoded (PNG/JPEG, whichever is smaller) under a 4.5 MB base64 budget; animated GIF/APNG/WebP sources are re-encoded to their first frame with `animated: true`. Other image formats (avif, heic, jxl, …) return `E_UNSUPPORTED_FORMAT`.
 
 **`write`** — Create or overwrite a file. Parent directories are created automatically.
 
 ```sh
 echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"write","arguments":{"path":"/tmp/hello.txt","content":"hello\n"}}}' | boxsh --rpc
-# → content: "written 6 bytes"
+# → content: "write: /tmp/hello.txt (created, 6 bytes)"
+# → structuredContent: {"path":"/tmp/hello.txt","bytes":6,"created":true}
 ```
 
 **`edit`** — Apply one or more search-and-replace operations on a file.
@@ -941,6 +960,7 @@ echo '{
     {"oldText":"port = 3000","newText":"port = 8080"}
   ]}}
 }' | boxsh --rpc
+# → structuredContent: {"path":"config.ini","lines_added":2,"lines_removed":2,"first_changed_line":3}
 ```
 
 Rules:
@@ -952,12 +972,15 @@ Rules:
 
 #### Error Model
 
-boxsh distinguishes two kinds of errors per the MCP spec:
+boxsh distinguishes three kinds of failures per the MCP spec:
 
 | Error type | Serialization | Example |
 |---|---|---|
-| **Protocol error** | JSON-RPC `{"error": {"code": N, "message": "..."}}` | Invalid JSON, unknown method, unknown tool |
-| **Tool execution error** | `{"result": {"content": [...], "isError": true}}` | Non-zero exit code, file not found |
+| **Protocol error** | JSON-RPC `{"error": {"code": N, "message": "..."}}` | Invalid JSON, unknown method/tool, missing or invalid arguments |
+| **Tool error** | `{"result": {"content": [{"type":"text","text":"E_...: ..."}], "structuredContent": {"code": "E_...", "message": "...", "detail"?}, "isError": true}}` | File not found, not an image, unsupported format, bad base64 |
+| **Command failure** | `isError: true` with the normal command `structuredContent` (no `code`) | Non-zero exit code, timeout (`timed_out: true`) |
+
+Stable error codes: `E_INVALID_ARGUMENT`, `E_NOT_FOUND`, `E_NOT_TEXT`, `E_NOT_IMAGE`, `E_UNSUPPORTED_FORMAT`, `E_TOO_LARGE`, `E_TIMEOUT`, `E_SANDBOX`, `E_INTERNAL`.
 
 #### Concurrency
 
@@ -1205,10 +1228,9 @@ const { content } = await client.read(`${dst}/package.json`);
 await client.write(`${dst}/notes.txt`, 'done\n');
 
 // Edit files with search-and-replace
-const { diff } = await client.edit(`${dst}/config.js`, [
+await client.edit(`${dst}/config.js`, [
     { oldText: 'DEBUG = false', newText: 'DEBUG = true' },
 ]);
-console.log(diff);
 
 await client.close();
 
@@ -1253,9 +1275,10 @@ await client.close();
 | Method | Returns | Description |
 |---|---|---|
 | `exec(cmd, cwd?, timeout?)` | `{ exitCode, stdout, stderr }` | Run a shell command |
-| `read(path, offset?, limit?)` | `ReadResult` | Read file content (text or binary) |
+| `read(path, offset?, limit?)` | `ReadResult` | Read a text file (body + paging metadata) |
+| `viewImage(path, detail?)` | `ViewImageResult` | View an image (base64 + metadata) |
 | `write(path, content)` | `void` | Create or overwrite a file |
-| `edit(path, edits)` | `{ diff, firstChangedLine }` | Search-and-replace edit |
+| `edit(path, edits)` | `void` | Search-and-replace edit |
 | `runInTerminal(cmd, opts?)` | `{ id, output, exited, exitCode }` | Start a PTY session |
 | `sendToTerminal(id, cmd)` | `{ output, exited, exitCode }` | Send to PTY and get screen |
 | `getTerminalOutput(id)` | `{ output, exited, exitCode }` | Poll PTY output |

@@ -13,13 +13,59 @@ namespace boxsh {
 // Built-in tool types
 // ---------------------------------------------------------------------------
 
-enum class ToolKind { None, Read, Write, Edit,
+enum class ToolKind { None, Read, ViewImage, Write, Edit,
     TerminalRun, TerminalSend, TerminalOutput, TerminalKill, TerminalList };
 
 struct EditOp {
     std::string old_text;
     std::string new_text;
 };
+
+// ---------------------------------------------------------------------------
+// Tool result contract (single source: docs/analysis-tool-result-contract.md)
+// ---------------------------------------------------------------------------
+
+// Error codes are stable — do not add new ones without updating the contract
+// document first.
+namespace error_code {
+inline constexpr const char *kInvalidArgument   = "E_INVALID_ARGUMENT";
+inline constexpr const char *kNotFound          = "E_NOT_FOUND";
+inline constexpr const char *kNotText           = "E_NOT_TEXT";
+inline constexpr const char *kNotImage          = "E_NOT_IMAGE";
+inline constexpr const char *kUnsupportedFormat = "E_UNSUPPORTED_FORMAT";
+inline constexpr const char *kTooLarge          = "E_TOO_LARGE";
+inline constexpr const char *kTimeout           = "E_TIMEOUT";
+inline constexpr const char *kSandbox           = "E_SANDBOX";
+inline constexpr const char *kInternal          = "E_INTERNAL";
+} // namespace error_code
+
+// Tool-level failure.  Serialized as isError:true with
+// structuredContent = {code, message, detail?}.
+struct ToolError {
+    std::string code;    // one of error_code::*
+    std::string message; // self-describing: "<tool>: <what happened>"
+    std::optional<nlohmann::json> detail; // optional machine-readable payload
+};
+
+// One MCP image content block (already resized/encoded, base64 payload).
+struct ImagePart {
+    std::string data;
+    std::string mime_type;
+};
+
+// Unified tool result.  Every tool produces one of these; serialization is
+// done in exactly one place (rpc_serialize_tool_result).
+struct ToolResult {
+    std::optional<std::string>    text;       // model-readable representation
+    std::optional<nlohmann::json> structured; // MUST match the tool's outputSchema
+    std::vector<ImagePart>        images;     // non-empty => text MUST be set
+    std::optional<ToolError>      error;      // tool failure (isError:true)
+};
+
+// Convenience constructors.
+ToolResult tool_error_result(const std::string &code,
+                             const std::string &message,
+                             std::optional<nlohmann::json> detail = std::nullopt);
 
 // ---------------------------------------------------------------------------
 // RpcRequest
@@ -42,6 +88,9 @@ struct RpcRequest {
     std::optional<int> offset; // 1-indexed start line
     std::optional<int> limit;  // max lines to return
 
+    // tool = "view_image"
+    std::string image_detail = "auto"; // "auto" | "low"
+
     // tool = "write"
     std::string content; // file content to write
     std::string encoding = "text"; // "text" (default) or "base64"
@@ -61,6 +110,8 @@ struct RpcRequest {
 // ---------------------------------------------------------------------------
 
 // Result to be serialized as a single JSON line to stdout.
+// Used for shell command (bash) results and protocol-level errors; built-in
+// tool results go through ToolResult / rpc_serialize_tool_result instead.
 struct RpcResponse {
     nlohmann::json id;
     ToolKind tool = ToolKind::None;
@@ -72,9 +123,7 @@ struct RpcResponse {
     uint64_t duration_ms = 0;
     bool stdout_truncated = false;
     bool stderr_truncated = false;
-
-    // Built-in tool result
-    std::string tool_content; // read: file text; write: confirmation
+    bool timed_out = false;
 
     // Present on any failure (shell crash or tool error)
     int error_code = -32000; // JSON-RPC 2.0 error code
@@ -93,6 +142,15 @@ struct RpcResponse {
 
 // Serialize a response to a single JSON line (no trailing newline).
 std::string rpc_serialize_response(const RpcResponse &resp);
+
+// Serialize a unified tool result as one JSON-RPC 2.0 response line
+// (no trailing newline).  is_error must be true for failures — either a tool
+// error (tr.error) or a non-zero command exit (bash).
+std::string rpc_serialize_tool_result(const nlohmann::json &id,
+                                      const ToolResult &tr, bool is_error);
+
+// Build the unified result for a shell command (bash tool) response.
+ToolResult tool_result_from_bash(const RpcResponse &resp);
 
 // Parse one JSON line into an RpcRequest.
 // Returns false and sets parse_error on failure.

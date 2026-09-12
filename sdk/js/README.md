@@ -61,21 +61,37 @@ const [a, b, c] = await Promise.all([
 
 ## File operations
 
-boxsh has three built-in file tools — `read`, `write`, and `edit`. They run on background threads and never block the RPC event loop.
+boxsh has four built-in file tools — `read`, `view_image`, `write`, and `edit`. They run on background threads and never block the RPC event loop.
 
 ```js
 // Read a text file — returns { content, encoding, mime_type, ... }
 const result = await client.read('/workspace/src/main.cpp');
-console.log(result.content); // file text
-console.log(result.mime_type); // e.g. "text/x-c++"
+console.log(result.content);   // file text
+console.log(result.mime_type); // "text/plain"
 
 // Read a slice (1-indexed start line + line limit)
 const first50 = await client.read('/workspace/src/main.cpp', 1, 50);
 
-// Binary files are returned as base64
-const img = await client.read('/workspace/logo.png');
-console.log(img.encoding);  // "base64"
-console.log(img.mime_type); // "image/png"
+// Truncated reads report how to continue
+if (first50.truncated) {
+    const next = await client.read('/workspace/src/main.cpp', first50.next_offset);
+}
+
+// Images are read through view_image, which returns an image block + metadata
+const img = await client.viewImage('/workspace/logo.png');
+console.log(img.mimeType);    // "image/png"
+console.log(img.data);        // base64 payload
+console.log(img.text);        // "[Image: image/png, 200x133]"
+const preview = await client.viewImage('/workspace/photo.jpg', 'low'); // 512px
+
+// Binary files cannot be read as text: the server rejects them with a
+// BoxshToolError whose `code` is E_NOT_TEXT (or E_NOT_IMAGE for images).
+try {
+    await client.read('/workspace/archive.zip');
+} catch (err) {
+    console.log(err.code);   // "E_NOT_TEXT"
+    console.log(err.detail); // { mime: 'application/zip', size: 1234 }
+}
 
 // Write a file — creates or overwrites; parent dirs are created automatically
 await client.write('/workspace/output.txt', 'hello\n');
@@ -233,7 +249,13 @@ Execute a shell command. `timeout` is in seconds.
 
 ### `client.read(path, offset?, limit?) → Promise<ReadResult>`
 
-Read file contents. For text files, `offset` is the 1-based start line and `limit` is the maximum number of lines. Binary files are returned as base64. `ReadResult` has fields: `content`, `encoding` (`"text"` or `"base64"`), `mime_type`, and optionally `line_count`, `truncated` (text) or `size` (binary).
+Read a text file. `offset` is the 1-based start line and `limit` is the maximum number of lines (default 2000, also capped at 50 KiB per call). `ReadResult` has fields: `content` (the file text), `encoding` (always `"text"`), `mime_type`, and optionally `line_count`, `truncated`, `total_lines`, `next_offset`.
+
+Binary files are rejected: images with `E_NOT_IMAGE` (use `viewImage`) and other binaries with `E_NOT_TEXT` (use `exec` with `file`/`xxd`/`strings`). Failures throw a `BoxshToolError` carrying `code` and `detail`.
+
+### `client.viewImage(path, detail?) → Promise<ViewImageResult>`
+
+View an image (png, jpeg, gif, bmp, tiff, webp). `detail: 'low'` returns a 512px preview instead of the 2000px default. Animated GIF/APNG/WebP sources are re-encoded so only the first frame comes back. Other image formats (avif, heic, jxl, …) are rejected with `E_UNSUPPORTED_FORMAT`. `ViewImageResult` has fields: `data` (base64), `mimeType`, `width`, `height`, `original_width`, `original_height`, `was_resized`, `size`, `animated`, and the model-facing `text`.
 
 ### `client.write(path, content) → Promise<void>`
 

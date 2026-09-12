@@ -61,7 +61,237 @@ static std::string utf8_safe_truncate(const std::string &s, size_t max_bytes) {
     return result;
 }
 
+// Move pos backwards to the start of a UTF-8 sequence (never cuts a
+// multi-byte character in half).
+static size_t utf8_floor(const std::string &s, size_t pos) {
+    if (pos >= s.size()) return s.size();
+    while (pos > 0 && (static_cast<unsigned char>(s[pos]) & 0xC0) == 0x80)
+        --pos;
+    return pos;
+}
+
+// True when the buffer is valid UTF-8 (no invalid/overlong sequences, no
+// stray continuation bytes).  Used to decide whether a file that looked like
+// text can actually be returned as text.
+static bool is_valid_utf8(const std::string &s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t n;
+        if (c < 0x80)            n = 1;
+        else if ((c & 0xE0) == 0xC0) n = 2;
+        else if ((c & 0xF0) == 0xE0) n = 3;
+        else if ((c & 0xF8) == 0xF0) n = 4;
+        else return false;
+
+        if (i + n > s.size()) return false;
+        for (size_t k = 1; k < n; ++k) {
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80)
+                return false;
+        }
+        // Reject overlong encodings and surrogate halves.
+        if (n == 2 && c < 0xC2) return false;
+        if (n == 3) {
+            unsigned char c1 = static_cast<unsigned char>(s[i + 1]);
+            if (c == 0xE0 && c1 < 0xA0) return false;
+            if (c == 0xED && c1 >= 0xA0) return false;
+        }
+        if (n == 4) {
+            unsigned char c1 = static_cast<unsigned char>(s[i + 1]);
+            if (c == 0xF0 && c1 < 0x90) return false;
+            if (c == 0xF4 && c1 >= 0x90) return false;
+            if (c > 0xF4) return false;
+        }
+        i += n;
+    }
+    return true;
+}
+
+// Model-facing text budget for shell command output.  The structured payload
+// keeps the full streams; only the readable text is reduced.
+constexpr size_t kTextHeadBytes = 24u * 1024u;
+constexpr size_t kTextTailBytes = 24u * 1024u;
+
+// Reduce s to head_bytes + tail_bytes, snapping both cuts to line boundaries
+// and joining the halves with a single marker line.
+static std::string head_tail_reduce(const std::string &s,
+                                    size_t head_bytes, size_t tail_bytes) {
+    if (s.size() <= head_bytes + tail_bytes) return s;
+
+    size_t head_end = utf8_floor(s, head_bytes);
+    auto nl = s.rfind('\n', head_end);
+    if (nl != std::string::npos && nl + 1 <= head_end) head_end = nl + 1;
+
+    size_t tail_start = utf8_floor(s, s.size() - tail_bytes);
+    auto nl2 = s.find('\n', tail_start);
+    // Snap the tail to the next line start, but never let a single trailing
+    // newline (or a line break late in the tail) collapse the tail to nothing.
+    if (nl2 != std::string::npos && nl2 + 1 < s.size()) {
+        size_t snapped = nl2 + 1;
+        size_t tail_floor = s.size() - tail_bytes / 2;
+        if (snapped <= tail_floor) tail_start = snapped;
+    }
+
+    if (tail_start <= head_end) tail_start = head_end; // degenerate inputs
+
+    size_t omitted = tail_start - head_end;
+    std::string marker = "\n\xe2\x80\xa6 [truncated: " +
+        std::to_string(omitted) + " bytes of " + std::to_string(s.size()) +
+        " omitted] \xe2\x80\xa6\n";
+    return s.substr(0, head_end) + marker + s.substr(tail_start);
+}
+
+// Format a shell command result as model-facing text:
+//   stdout (labelled when stderr follows) / [stderr] section / markers.
+static std::string bash_result_text(int exit_code, const std::string &out,
+                                    const std::string &err, bool timed_out,
+                                    bool out_truncated, bool err_truncated) {
+    std::string body;
+    if (!out.empty()) {
+        if (!err.empty()) body += "[stdout]\n";
+        body += out;
+        if (body.back() != '\n') body += '\n';
+    }
+    if (!err.empty()) {
+        body += "[stderr]\n";
+        body += err;
+        if (body.back() != '\n') body += '\n';
+    }
+    if (out_truncated) body += "[stdout truncated at 10 MiB by boxsh]\n";
+    if (err_truncated) body += "[stderr truncated at 10 MiB by boxsh]\n";
+    if (timed_out)     body += "[timeout]\n";
+    if (exit_code != 0) body += "[exit code: " + std::to_string(exit_code) + "]\n";
+    if (body.empty()) body = "(no output)\n";
+    return head_tail_reduce(body, kTextHeadBytes, kTextTailBytes);
+}
+
+// Detect animation for the formats we decode: GIF frames and PNG (APNG acTL).
+static bool image_is_animated(const std::string &raw, const std::string &mime);
+
+// GIF frame count — a GIF is animated when it holds more than one image
+// descriptor.  Parses block structure so pixel data cannot be mistaken for a
+// descriptor.
+static int gif_frame_count(const std::string &s) {
+    if (s.size() < 13 || s.compare(0, 3, "GIF") != 0) return 0;
+    size_t p = 6;                          // header
+    unsigned char packed = static_cast<unsigned char>(s[p + 4]);
+    p += 7;                                // logical screen descriptor
+    if (packed & 0x80) p += 3u * (1u << ((packed & 0x07) + 1)); // global color table
+    int frames = 0;
+    auto skip_sub_blocks = [&](size_t &q) {
+        while (q < s.size()) {
+            size_t n = static_cast<unsigned char>(s[q++]);
+            if (n == 0) return true;
+            q += n;
+        }
+        return false;
+    };
+    while (p < s.size()) {
+        unsigned char b = static_cast<unsigned char>(s[p]);
+        if (b == 0x3B) break;              // trailer
+        if (b == 0x21) {                   // extension
+            p += 2;                        // introducer + label
+            if (!skip_sub_blocks(p)) break;
+        } else if (b == 0x2C) {            // image descriptor
+            if (p + 10 > s.size()) break;
+            ++frames;
+            unsigned char lp = static_cast<unsigned char>(s[p + 9]);
+            p += 10;
+            if (lp & 0x80) p += 3u * (1u << ((lp & 0x07) + 1)); // local color table
+            if (p >= s.size()) break;
+            p += 1;                        // LZW minimum code size
+            if (!skip_sub_blocks(p)) break;
+        } else {
+            break;                         // unknown block — stop parsing
+        }
+    }
+    return frames;
+}
+
+// APNG: an acTL chunk appearing before IDAT marks an animated PNG.
+static bool png_is_apng(const std::string &s) {
+    if (s.size() < 8 || s.compare(0, 8, "\x89PNG\r\n\x1a\n") != 0) return false;
+    size_t p = 8;
+    while (p + 8 <= s.size()) {
+        std::string type = s.substr(p + 4, 4);
+        uint32_t len = (static_cast<unsigned char>(s[p]) << 24) |
+                       (static_cast<unsigned char>(s[p + 1]) << 16) |
+                       (static_cast<unsigned char>(s[p + 2]) << 8) |
+                        static_cast<unsigned char>(s[p + 3]);
+        if (type == "acTL") return true;
+        if (type == "IDAT" || type == "IEND") return false;
+
+        // Advance past this chunk (length + type + data + crc).  The length is
+        // attacker-controlled: bail out instead of wrapping the offset (a
+        // wrapped offset would spin forever in this loop).
+        const size_t remaining = s.size() - p;
+        if (remaining < 12u || len > remaining - 12u) break;
+        p += 12u + static_cast<size_t>(len);
+    }
+    return false;
+}
+
+// WebP: a VP8X chunk with the ANIMATION flag set, or an ANIM chunk, marks an
+// animated file.  Pure byte inspection, so it also works when the build has no
+// WebP decoder.
+static bool webp_is_animated(const std::string &s) {
+    if (s.size() < 12 || s.compare(0, 4, "RIFF") != 0 ||
+        s.compare(8, 4, "WEBP") != 0)
+        return false;
+    size_t p = 12;
+    while (p + 8 <= s.size()) {
+        uint32_t len = static_cast<unsigned char>(s[p + 4]) |
+                       (static_cast<unsigned char>(s[p + 5]) << 8) |
+                       (static_cast<unsigned char>(s[p + 6]) << 16) |
+                       (static_cast<unsigned char>(s[p + 7]) << 24);
+        if (s.compare(p, 4, "ANIM") == 0) return true;
+        if (s.compare(p, 4, "VP8X") == 0 && len >= 10 && p + 10 <= s.size())
+            return (static_cast<unsigned char>(s[p + 8]) & 0x02) != 0;
+        if (s.compare(p, 4, "VP8 ") == 0 || s.compare(p, 4, "VP8L") == 0)
+            return false;                  // still image data comes first
+
+        // Advance past this chunk (id + length + even-padded payload).  The
+        // length is attacker-controlled: bail out instead of wrapping the
+        // offset (a wrapped offset would spin forever in this loop).
+        const size_t remaining = s.size() - p;
+        if (len > remaining - 8u) break;
+        size_t adv = 8u + static_cast<size_t>(len);
+        if ((len & 1u) != 0) {
+            if (adv + 1u > remaining) break;
+            adv += 1u;
+        }
+        p += adv;
+    }
+    return false;
+}
+
+static bool image_is_animated(const std::string &raw, const std::string &mime) {
+    if (mime == "image/gif")  return gif_frame_count(raw) > 1;
+    if (mime == "image/png")  return png_is_apng(raw);
+    if (mime == "image/webp") return webp_is_animated(raw);
+    return false;
+}
+
+// Image formats this build can decode (kept in sync with image_resize.cpp).
+static std::string supported_image_formats() {
+    return "png, jpeg, gif, bmp, tiff"
+#ifdef BOXSH_HAVE_WEBP
+           ", webp"
+#endif
+        ;
+}
+
 } // namespace
+
+// Convenience constructor for a failed tool result.
+ToolResult tool_error_result(const std::string &code,
+                             const std::string &message,
+                             std::optional<json> detail) {
+    ToolResult tr;
+    tr.error = ToolError{code, message, std::move(detail)};
+    tr.text  = code + ": " + message;
+    return tr;
+}
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -133,8 +363,13 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
                 return false;
             }
             req.cmd = args["command"].get<std::string>();
-            if (args.contains("timeout") && args["timeout"].is_number())
-                req.timeout_sec = args["timeout"].get<int>();
+            if (args.contains("timeout")) {
+                if (!args["timeout"].is_number() || args["timeout"].get<double>() < 0) {
+                    parse_error = "bash tool timeout must be a non-negative number of seconds";
+                    return false;
+                }
+                req.timeout_sec = (int)args["timeout"].get<double>();
+            }
             return true;
         }
         if (tool_name == "read" || tool_name == "write" || tool_name == "edit") {
@@ -146,10 +381,22 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
 
             if (tool_name == "read") {
                 req.tool = ToolKind::Read;
-                if (args.contains("offset") && args["offset"].is_number_integer())
+                if (args.contains("offset")) {
+                    if (!args["offset"].is_number_integer() ||
+                        args["offset"].get<int>() < 1) {
+                        parse_error = "read tool offset must be an integer >= 1";
+                        return false;
+                    }
                     req.offset = args["offset"].get<int>();
-                if (args.contains("limit") && args["limit"].is_number_integer())
+                }
+                if (args.contains("limit")) {
+                    if (!args["limit"].is_number_integer() ||
+                        args["limit"].get<int>() < 1) {
+                        parse_error = "read tool limit must be an integer >= 1";
+                        return false;
+                    }
                     req.limit = args["limit"].get<int>();
+                }
             } else if (tool_name == "write") {
                 req.tool = ToolKind::Write;
                 if (!args.contains("content") || !args["content"].is_string()) {
@@ -180,6 +427,27 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
                     req.edits.push_back({op["oldText"].get<std::string>(),
                                          op["newText"].get<std::string>()});
                 }
+            }
+            return true;
+        }
+        if (tool_name == "view_image") {
+            req.tool = ToolKind::ViewImage;
+            if (!args.contains("path") || !args["path"].is_string()) {
+                parse_error = "view_image tool missing string field: path";
+                return false;
+            }
+            req.path = args["path"].get<std::string>();
+            if (args.contains("detail")) {
+                if (!args["detail"].is_string()) {
+                    parse_error = "view_image detail must be a string";
+                    return false;
+                }
+                std::string detail = args["detail"].get<std::string>();
+                if (detail != "auto" && detail != "low") {
+                    parse_error = "view_image detail must be 'auto' or 'low'";
+                    return false;
+                }
+                req.image_detail = detail;
             }
             return true;
         }
@@ -246,73 +514,119 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
 // Serialization
 // ---------------------------------------------------------------------------
 
-std::string rpc_serialize_response(const RpcResponse &resp) {
-    json j;
-    j["jsonrpc"] = "2.0";
+namespace {
 
-    // Sanitize the id: if the request carried a string id with invalid
-    // UTF-8, nlohmann::json::dump() will throw type_error.316.
-    json safe_id = resp.id;
+// Sanitize the id: if the request carried a string id with invalid UTF-8,
+// nlohmann::json::dump() will throw type_error.316.
+json safe_id_value(const json &id) {
+    json safe_id = id;
     if (safe_id.is_string())
         safe_id = ensure_valid_utf8(safe_id.get<std::string>());
-    j["id"] = safe_id;
+    return safe_id;
+}
 
-    // Guard every user-supplied string: nlohmann::json will throw type_error.316
-    // if any string contains invalid UTF-8, so we sanitize defensively.
-    if (resp.is_protocol_error && !resp.error.empty()) {
-        // JSON-RPC 2.0 protocol error (parse error, unknown method, etc.).
-        j["error"] = {{"code", resp.error_code},
-                        {"message", ensure_valid_utf8(resp.error)}};
+} // namespace
+
+// Build the unified result for a shell command (bash tool).
+ToolResult tool_result_from_bash(const RpcResponse &resp) {
+    std::string out = ensure_valid_utf8(resp.stdout_data);
+    std::string err = ensure_valid_utf8(resp.stderr_data);
+
+    ToolResult tr;
+    tr.text = bash_result_text(resp.exit_code, out, err, resp.timed_out,
+                               resp.stdout_truncated, resp.stderr_truncated);
+
+    json sc = {
+        {"exit_code",   resp.exit_code},
+        {"stdout",      out},
+        {"stderr",      err},
+        {"duration_ms", resp.duration_ms}
+    };
+    if (resp.stdout_truncated) sc["stdout_truncated"] = true;
+    if (resp.stderr_truncated) sc["stderr_truncated"] = true;
+    if (resp.timed_out)        sc["timed_out"] = true;
+    tr.structured = std::move(sc);
+    return tr;
+}
+
+std::string rpc_serialize_tool_result(const json &id, const ToolResult &tr,
+                                      bool is_error) {
+    json j;
+    j["jsonrpc"] = "2.0";
+    j["id"] = safe_id_value(id);
+
+    json result;
+
+    if (tr.error.has_value()) {
+        // Tool failure: isError + readable text + {code, message, detail?}.
+        const ToolError &e = tr.error.value();
+        std::string text = e.code + ": " + e.message;
+        result["content"] = json::array({{{"type", "text"},
+            {"text", ensure_valid_utf8(text)}}});
+        json sc = {{"code", e.code}, {"message", ensure_valid_utf8(e.message)}};
+        if (e.detail.has_value()) sc["detail"] = e.detail.value();
+        result["structuredContent"] = std::move(sc);
+        result["isError"] = true;
     } else {
-        // MCP CallToolResult format.
-        json result;
-        bool is_error = !resp.error.empty();
-
-        if (resp.tool == ToolKind::None) {
-            // Bash command result.
-            if (is_error) {
-                result["content"] = json::array({{{"type", "text"},
-                    {"text", ensure_valid_utf8(resp.error)}}});
-            } else {
-                std::string safe_stdout = ensure_valid_utf8(resp.stdout_data);
-                std::string safe_stderr = ensure_valid_utf8(resp.stderr_data);
-                json sc = {
-                    {"exit_code",   resp.exit_code},
-                    {"stdout",      safe_stdout},
-                    {"stderr",      safe_stderr},
-                    {"duration_ms", resp.duration_ms}
-                };
-                if (resp.stdout_truncated)
-                    sc["stdout_truncated"] = true;
-                if (resp.stderr_truncated)
-                    sc["stderr_truncated"] = true;
-                result["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
-                result["structuredContent"] = sc;
-                if (resp.exit_code != 0)
-                    is_error = true;
-            }
-        } else if (resp.tool == ToolKind::Write) {
-            std::string text = is_error ? ensure_valid_utf8(resp.error)
-                                        : ensure_valid_utf8(resp.tool_content);
-            result["content"] = json::array({{{"type", "text"}, {"text", text}}});
-        } else if (resp.tool == ToolKind::Edit) {
-            std::string text = is_error ? ensure_valid_utf8(resp.error) : "OK";
-            result["content"] = json::array({{{"type", "text"}, {"text", text}}});
+        json content = json::array();
+        content.push_back({{"type", "text"},
+            {"text", ensure_valid_utf8(tr.text.value_or(std::string()))}});
+        for (const auto &img : tr.images) {
+            content.push_back({{"type", "image"}, {"data", img.data},
+                               {"mimeType", img.mime_type}});
         }
-
+        result["content"] = std::move(content);
+        if (tr.structured.has_value())
+            result["structuredContent"] = tr.structured.value();
         if (is_error)
             result["isError"] = true;
-        j["result"] = result;
     }
 
+    j["result"] = std::move(result);
     return j.dump();
+}
+
+std::string rpc_serialize_response(const RpcResponse &resp) {
+    // JSON-RPC 2.0 protocol error (parse error, unknown method, etc.).
+    if (resp.is_protocol_error && !resp.error.empty()) {
+        json j;
+        j["jsonrpc"] = "2.0";
+        j["id"] = safe_id_value(resp.id);
+        j["error"] = {{"code", resp.error_code},
+                      {"message", ensure_valid_utf8(resp.error)}};
+        return j.dump();
+    }
+
+    // Shell command result (bash) — every other tool goes through
+    // rpc_serialize_tool_result().
+    if (!resp.error.empty())
+        return rpc_serialize_tool_result(
+            resp.id,
+            tool_error_result(error_code::kInternal, resp.error),
+            /*is_error=*/true);
+
+    return rpc_serialize_tool_result(resp.id, tool_result_from_bash(resp),
+                                     /*is_error=*/resp.exit_code != 0);
 }
 
 static std::string mcp_initialize_response(const json &id,
                                             const std::string &client_version) {
-    // Echo the client's protocolVersion so the handshake succeeds.
-    // Fall back to a known baseline if the client didn't supply one.
-    std::string version = client_version.empty() ? "2024-11-05" : client_version;
+    // Protocol version negotiation (docs/analysis-tool-result-contract.md §6):
+    //  - client sent nothing        → our baseline (2025-06-18, the revision
+    //                                  that standardizes structuredContent)
+    //  - client sent a known older
+    //    revision                   → echo it back, the added result fields
+    //                                  (structuredContent/outputSchema) are
+    //                                  additive and ignored by old clients
+    //  - anything else              → our baseline
+    static const char *kBaselineVersion = "2025-06-18";
+    static const char *kLegacyVersions[] = {
+        "2024-10-07", "2024-11-05", "2025-03-26"
+    };
+    std::string version = kBaselineVersion;
+    for (const char *legacy : kLegacyVersions) {
+        if (client_version == legacy) { version = legacy; break; }
+    }
 
     // Sanitize id in case it contains invalid UTF-8.
     json safe_id = id;
@@ -325,7 +639,10 @@ static std::string mcp_initialize_response(const json &id,
     j["result"] = {
         {"protocolVersion", version},
         {"capabilities", {
-            {"tools", json::object()}
+            // The tool list is static (compiled in), so no
+            // notifications/tools/list_changed is ever sent; restart the
+            // server to pick up new tool definitions.
+            {"tools", {{"listChanged", false}}}
         }},
         {"serverInfo", {
             {"name", "boxsh"},
@@ -338,12 +655,31 @@ static std::string mcp_initialize_response(const json &id,
 static std::string mcp_tools_list_response(const json &id) {
     json tools = json::array();
 
+    // Shared outputSchema for the three tools that return a screen snapshot
+    // plus the session's live/exited state.
+    auto terminal_output_schema = []() {
+        return json{
+            {"type", "object"},
+            {"properties", {
+                {"id",        {{"type", "string"},  {"description", "Terminal session id"}}},
+                {"output",    {{"type", "string"},  {"description", "Current terminal screen snapshot"}}},
+                {"exited",    {{"type", "boolean"}, {"description", "Whether the process has exited"}}},
+                {"exit_code", {{"type", json::array({"integer", "null"})},
+                               {"description", "Exit code when exited, null while it is still running"}}}
+            }},
+            {"required", json::array({"id", "output", "exited", "exit_code"})}
+        };
+    };
+
     // bash tool
     tools.push_back({
         {"name", "bash"},
+        {"title", "Bash"},
         {"description",
-         "Execute a bash command in the sandbox. "
-         "Returns stdout and stderr. Output is truncated to 10MB per stream."},
+         "Execute a shell command in the sandbox. Returns the exit code plus the "
+         "command's stdout and stderr (each capped at 10 MiB). Pass `timeout` to "
+         "kill the command after N seconds. For large output, narrow the command "
+         "(head/tail/grep/sed) instead of relying on truncation."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
@@ -355,10 +691,13 @@ static std::string mcp_tools_list_response(const json &id) {
         {"outputSchema", {
             {"type", "object"},
             {"properties", {
-                {"exit_code", {{"type", "integer"}, {"description", "Process exit code (0 = success)"}}},
-                {"stdout",    {{"type", "string"},  {"description", "Standard output"}}},
-                {"stderr",    {{"type", "string"},  {"description", "Standard error"}}},
-                {"duration_ms", {{"type", "integer"}, {"description", "Execution time in milliseconds"}}}
+                {"exit_code", {{ "type", "integer"}, {"description", "Process exit code (0 = success; -1 when timed out or killed)"}}},
+                {"stdout",    {{ "type", "string"},  {"description", "Standard output (up to 10 MiB)"}}},
+                {"stderr",    {{ "type", "string"},  {"description", "Standard error (up to 10 MiB)"}}},
+                {"duration_ms", { {"type", "integer"}, {"description", "Wall-clock execution time in milliseconds"}}},
+                {"stdout_truncated", { {"type", "boolean"}, {"description", "stdout hit the 10 MiB cap"}}},
+                {"stderr_truncated", { {"type", "boolean"}, {"description", "stderr hit the 10 MiB cap"}}},
+                {"timed_out", { {"type", "boolean"}, {"description", "The command was killed after its timeout expired"}}}
             }},
             {"required", json::array({"exit_code", "stdout", "stderr", "duration_ms"})}
         }},
@@ -369,32 +708,35 @@ static std::string mcp_tools_list_response(const json &id) {
         }}
     });
 
-    // read tool
+    // read tool — text files only (images go to view_image).
     tools.push_back({
         {"name", "read"},
+        {"title", "Read File"},
         {"description",
-         "Read the contents of a file. Binary files are returned as base64. "
-         "Use offset/limit for large text files."},
+         "Read a text file. Returns the file's text, capped at 2000 lines or 50 KiB "
+         "per call; use offset/limit to page through larger files. Binary files "
+         "(including images) cannot be read as text and return an error — use "
+         "view_image for images and bash (file/xxd/strings) for other binaries."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
                 {"path", {{"type", "string"}, {"description", "Path to the file to read (relative or absolute)"}}},
-                {"offset", {{"type", "number"}, {"description", "Line number to start reading from (1-indexed, text files only)"}}},
-                {"limit", {{"type", "number"}, {"description", "Maximum number of lines to read (text files only)"}}}
+                {"offset", {{"type", "number"}, {"description", "Line number to start reading from (1-indexed, default 1)"}}},
+                {"limit", {{"type", "number"}, {"description", "Maximum number of lines to read (default 2000)"}}}
             }},
             {"required", json::array({"path"})}
         }},
         {"outputSchema", {
             {"type", "object"},
             {"properties", {
-                {"content",   {{"type", "string"}, {"description", "File content (text or base64-encoded binary)"}}},
-                {"encoding",  {{"type", "string"}, {"description", "\"text\" or \"base64\""}}},
-                {"mime_type", {{"type", "string"}, {"description", "Detected MIME type"}}},
-                {"line_count", {{"type", "integer"}, {"description", "Number of lines returned (text only)"}}},
-                {"truncated", {{"type", "boolean"}, {"description", "Whether the output was truncated (text only)"}}},
-                {"size",      {{"type", "integer"}, {"description", "File size in bytes (binary only)"}}}
+                {"encoding",  {{"type", "string"}, {"enum", json::array({"text"})}, {"description", "Always \"text\" — read only serves text output"}}},
+                {"mime_type", {{"type", "string"}, {"description", "Detected MIME type of the text file (e.g. text/plain)"}}},
+                {"line_count", {{ "type", "integer"}, {"description", "Number of lines returned"}}},
+                {"truncated", {{"type", "boolean"}, {"description", "Whether the output was truncated"}}},
+                {"total_lines", {{"type", "integer"}, {"description", "Total lines in the file (only when truncated)"}}},
+                {"next_offset", {{"type", "integer"}, {"description", "Offset to pass to continue reading (only when truncated)"}}}
             }},
-            {"required", json::array({"content", "encoding", "mime_type"})}
+            {"required", json::array({"encoding", "mime_type", "line_count", "truncated"})}
         }},
         {"annotations", {
             {"title", "Read File"},
@@ -403,9 +745,52 @@ static std::string mcp_tools_list_response(const json &id) {
         }}
     });
 
+    // view_image tool — the only way to get image content.
+    tools.push_back({
+        {"name", "view_image"},
+        {"title", "View Image"},
+        {"description",
+         std::string("View an image file (") + supported_image_formats() +
+         "). Returns the image itself plus its metadata; oversized images are "
+         "downscaled to a 2000px longest edge. Use detail=\"low\" for a 512px "
+         "preview. Animated sources return their first frame only. Other image "
+         "formats (avif, heic, jxl, psd, \xe2\x80\xa6) are reported as unsupported."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}, {"description", "Path to the image file (relative or absolute)"}}},
+                {"detail", {{"type", "string"}, {"enum", json::array({"auto", "low"})},
+                            {"description", "\"auto\" (default, up to 2000px) or \"low\" (up to 512px, fewer tokens)"}}}
+            }},
+            {"required", json::array({"path"})}
+        }},
+        {"outputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"encoding",  {{"type", "string"}, {"enum", json::array({"image"})}}},
+                {"mime_type", {{"type", "string"}, {"description", "MIME type of the returned image (may differ from the file after re-encoding)"}}},
+                {"width",     {{"type", "integer"}, {"description", "Width of the returned image"}}},
+                {"height",    {{"type", "integer"}, {"description", "Height of the returned image"}}},
+                {"original_width",  {{"type", "integer"}, {"description", "Width of the file's image before resizing"}}},
+                {"original_height", {{"type", "integer"}, {"description", "Height of the file's image before resizing"}}},
+                {"was_resized", {{"type", "boolean"}, {"description", "Whether the image was downscaled"}}},
+                {"size", {{"type", "integer"}, {"description", "Size of the original file in bytes"}}},
+                {"animated", {{"type", "boolean"}, {"description", "Animated source — only the first frame is returned"}}}
+            }},
+            {"required", json::array({"encoding", "mime_type", "width", "height",
+                                     "original_width", "original_height", "was_resized", "size"})}
+        }},
+        {"annotations", {
+            {"title", "View Image"},
+            {"readOnlyHint", true},
+            {"destructiveHint", false}
+        }}
+    });
+
     // write tool
     tools.push_back({
         {"name", "write"},
+        {"title", "Write File"},
         {"description",
          "Create or overwrite a file with the given content. "
          "Parent directories are created automatically if needed. "
@@ -415,9 +800,19 @@ static std::string mcp_tools_list_response(const json &id) {
             {"properties", {
                 {"path", {{"type", "string"}, {"description", "Path to the file to write (relative or absolute)"}}},
                 {"content", {{"type", "string"}, {"description", "Content to write to the file. When encoding is base64, this is the base64-encoded binary data."}}},
-                {"encoding", {{"type", "string"}, {"description", "Content encoding: \"text\" (default) or \"base64\""}}}
+                {"encoding", {{"type", "string"}, {"enum", json::array({"text", "base64"})},
+                             {"description", "Content encoding: \"text\" (default) or \"base64\""}}}
             }},
             {"required", json::array({"path", "content"})}
+        }},
+        {"outputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"path",  {{"type", "string"},  {"description", "Path written"}}},
+                {"bytes", {{"type", "integer"}, {"description", "Number of bytes written"}}},
+                {"created", {{"type", "boolean"}, {"description", "True when the file did not exist before"}}}
+            }},
+            {"required", json::array({"path", "bytes", "created"})}
         }},
         {"annotations", {
             {"title", "Write File"},
@@ -429,6 +824,7 @@ static std::string mcp_tools_list_response(const json &id) {
     // edit tool
     tools.push_back({
         {"name", "edit"},
+        {"title", "Edit File"},
         {"description",
          "Edit a file using exact text replacement. "
          "Every edits[].oldText must match a unique, non-overlapping region of the original file."},
@@ -453,18 +849,25 @@ static std::string mcp_tools_list_response(const json &id) {
         }},
         {"outputSchema", {
             {"type", "object"},
-            {"properties", json::object()}
+            {"properties", {
+                {"path", {{"type", "string"}, {"description", "Path edited"}}},
+                {"lines_added", {{"type", "integer"}, {"description", "Lines added"}}},
+                {"lines_removed", {{"type", "integer"}, {"description", "Lines removed"}}},
+                {"first_changed_line", {{"type", "integer"}, {"description", "1-indexed line of the first change"}}}
+            }},
+            {"required", json::array({"path", "lines_added", "lines_removed", "first_changed_line"})}
         }},
         {"annotations", {
             {"title", "Edit File"},
             {"readOnlyHint", false},
-            {"destructiveHint", false}
+            {"destructiveHint", true}
         }}
     });
 
     // run_in_terminal tool
     tools.push_back({
         {"name", "run_in_terminal"},
+        {"title", "Run in Terminal"},
         {"description",
          "Start a persistent PTY session running the given command (e.g. \"bash\"). "
          "Returns a session id, initial screen output, exit status, and exit code. "
@@ -475,20 +878,24 @@ static std::string mcp_tools_list_response(const json &id) {
             {"properties", {
                 {"command",     {{"type", "string"}, {"description", "Command to run in the PTY (e.g. bash)"}}},
                 {"explanation", {{"type", "string"}, {"description", "Why this terminal is needed"}}},
-                {"goal",        {{"type", "string"}, {"description", "What you intend to accomplish"}}}
+                {"goal",        {{"type", "string"}, {"description", "What you intend to accomplish"}}},
+                {"cols",        {{"type", "number"}, {"description", "Terminal columns (default 220)"}}},
+                {"rows",        {{"type", "number"}, {"description", "Terminal rows (default 50)"}}}
             }},
             {"required", json::array({"command"})}
         }},
+        {"outputSchema", terminal_output_schema()},
         {"annotations", {
             {"title", "Run in Terminal"},
             {"readOnlyHint", false},
-            {"destructiveHint", false}
+            {"destructiveHint", true}
         }}
     });
 
     // send_to_terminal tool
     tools.push_back({
         {"name", "send_to_terminal"},
+        {"title", "Send to Terminal"},
         {"description",
          "Send text to an existing terminal session's PTY stdin, then wait up to 500ms "
          "for new output. Returns the updated screen snapshot, exit status, and exit code. "
@@ -501,16 +908,18 @@ static std::string mcp_tools_list_response(const json &id) {
             }},
             {"required", json::array({"id", "command"})}
         }},
+        {"outputSchema", terminal_output_schema()},
         {"annotations", {
             {"title", "Send to Terminal"},
             {"readOnlyHint", false},
-            {"destructiveHint", false}
+            {"destructiveHint", true}
         }}
     });
 
     // get_terminal_output tool
     tools.push_back({
         {"name", "get_terminal_output"},
+        {"title", "Get Terminal Output"},
         {"description",
          "Wait up to 500ms for new output from a terminal session, then return the current "
          "screen snapshot together with exit status and exit code. "
@@ -522,6 +931,7 @@ static std::string mcp_tools_list_response(const json &id) {
             }},
             {"required", json::array({"id"})}
         }},
+        {"outputSchema", terminal_output_schema()},
         {"annotations", {
             {"title", "Get Terminal Output"},
             {"readOnlyHint", true},
@@ -532,6 +942,7 @@ static std::string mcp_tools_list_response(const json &id) {
     // kill_terminal tool
     tools.push_back({
         {"name", "kill_terminal"},
+        {"title", "Kill Terminal"},
         {"description",
          "Kill a terminal session and free its resources. Returns the final screen snapshot."},
         {"inputSchema", {
@@ -540,6 +951,15 @@ static std::string mcp_tools_list_response(const json &id) {
                 {"id", {{"type", "string"}, {"description", "Terminal session id"}}}
             }},
             {"required", json::array({"id"})}
+        }},
+        {"outputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"id",     {{"type", "string"},  {"description", "Terminal session id"}}},
+                {"killed", {{"type", "boolean"}, {"description", "True when the session was killed"}}},
+                {"output", {{"type", "string"},  {"description", "Final screen snapshot"}}}
+            }},
+            {"required", json::array({"id", "killed", "output"})}
         }},
         {"annotations", {
             {"title", "Kill Terminal"},
@@ -551,11 +971,34 @@ static std::string mcp_tools_list_response(const json &id) {
     // list_terminals tool
     tools.push_back({
         {"name", "list_terminals"},
+        {"title", "List Terminals"},
         {"description", "List all active terminal sessions."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", json::object()},
             {"required", json::array()}
+        }},
+        {"outputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"sessions", {
+                    {"type", "array"},
+                    {"items", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"id",      {{"type", "string"},  {"description", "Terminal session id"}}},
+                            {"command", {{"type", "string"},  {"description", "Command the session runs"}}},
+                            {"alive",   {{"type", "boolean"}, {"description", "Whether the session is still alive"}}},
+                            {"exited",  {{"type", "boolean"}, {"description", "Whether the process has exited"}}},
+                            {"exit_code", {{"type", json::array({"integer", "null"})}}},
+                            {"cols",    {{"type", "integer"}}},
+                            {"rows",    {{"type", "integer"}}}
+                        }},
+                        {"required", json::array({"id", "command", "alive", "exited", "exit_code"})}
+                    }}
+                }}
+            }},
+            {"required", json::array({"sessions"})}
         }},
         {"annotations", {
             {"title", "List Terminals"},
@@ -577,116 +1020,128 @@ static std::string mcp_tools_list_response(const json &id) {
 }
 
 // ---------------------------------------------------------------------------
-// Terminal tool handlers
+// Tool handlers
+//
+// Every handler returns a ToolResult; serialization happens in exactly one
+// place (rpc_serialize_tool_result).
 // ---------------------------------------------------------------------------
 
-static std::string tool_terminal_run(const RpcRequest &req) {
-    json j;
-    j["jsonrpc"] = "2.0";
-    j["id"] = req.id;
-    json r;
+// One-line state header for terminal results.
+static std::string terminal_state_line(const std::string &id,
+                                       const std::string &command,
+                                       bool exited, int exit_code) {
+    std::string line = "terminal " + id;
+    if (!command.empty()) line += " (" + command + ")";
+    line += exited ? (", exited, code " + std::to_string(exit_code))
+                   : ", running";
+    return line;
+}
+
+// Map a terminal_* exception message to a stable error code.
+static ToolResult terminal_exception_result(const std::string &what) {
+    if (what.rfind("unknown terminal session", 0) == 0 ||
+        what.rfind("terminal session has exited", 0) == 0)
+        return tool_error_result(error_code::kNotFound, what);
+    return tool_error_result(error_code::kInternal, what);
+}
+
+static ToolResult tool_terminal_run(const RpcRequest &req) {
     try {
         auto result = terminal_create(req.terminal_command,
                                       req.terminal_cols, req.terminal_rows);
-        json sc = {
+        ToolResult tr;
+        std::string out = ensure_valid_utf8(result.output);
+        tr.text = terminal_state_line(result.id, req.terminal_command,
+                                      result.exited, result.exit_code) +
+                  "\n\n" + out;
+        tr.structured = json{
             {"id",        result.id},
-            {"output",    ensure_valid_utf8(result.output)},
+            {"output",    out},
             {"exited",    result.exited},
             {"exit_code", result.exited ? json(result.exit_code) : json(nullptr)},
         };
-        r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
-        r["structuredContent"] = sc;
+        return tr;
     } catch (const std::exception &e) {
-        r["content"] = json::array({{{"type", "text"},
-            {"text", ensure_valid_utf8(e.what())}}});
-        r["isError"] = true;
+        return terminal_exception_result(e.what());
     }
-    j["result"] = r;
-    return j.dump();
 }
 
-static std::string tool_terminal_send(const RpcRequest &req) {
-    json j;
-    j["jsonrpc"] = "2.0";
-    j["id"] = req.id;
-    json r;
+static ToolResult tool_terminal_send(const RpcRequest &req) {
     try {
         terminal_send(req.session_id, req.terminal_command);
         auto out = terminal_output(req.session_id);
-        json sc = {
-            {"output",    ensure_valid_utf8(out.output)},
+        ToolResult tr;
+        std::string text = ensure_valid_utf8(out.output);
+        tr.text = text.empty() ? "(no new output)\n" : text;
+        tr.structured = json{
+            {"id",        req.session_id},
+            {"output",    text},
             {"exited",    out.exited},
             {"exit_code", out.exited ? json(out.exit_code) : json(nullptr)},
         };
-        r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
-        r["structuredContent"] = sc;
+        return tr;
     } catch (const std::exception &e) {
-        r["content"] = json::array({{{"type", "text"},
-            {"text", ensure_valid_utf8(e.what())}}});
-        r["isError"] = true;
+        return terminal_exception_result(e.what());
     }
-    j["result"] = r;
-    return j.dump();
 }
 
-static std::string tool_terminal_output(const RpcRequest &req) {
-    json j;
-    j["jsonrpc"] = "2.0";
-    j["id"] = req.id;
-    json r;
+static ToolResult tool_terminal_output(const RpcRequest &req) {
     try {
         auto out = terminal_output(req.session_id);
-        json sc = {
-            {"output",    ensure_valid_utf8(out.output)},
+        ToolResult tr;
+        std::string text = ensure_valid_utf8(out.output);
+        tr.text = text.empty() ? "(no new output)\n" : text;
+        tr.structured = json{
+            {"id",        req.session_id},
+            {"output",    text},
             {"exited",    out.exited},
             {"exit_code", out.exited ? json(out.exit_code) : json(nullptr)},
         };
-        r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
-        r["structuredContent"] = sc;
+        return tr;
     } catch (const std::exception &e) {
-        r["content"] = json::array({{{"type", "text"},
-            {"text", ensure_valid_utf8(e.what())}}});
-        r["isError"] = true;
+        return terminal_exception_result(e.what());
     }
-    j["result"] = r;
-    return j.dump();
 }
 
-static std::string tool_terminal_kill(const RpcRequest &req) {
-    json j;
-    j["jsonrpc"] = "2.0";
-    j["id"] = req.id;
-    json r;
+static ToolResult tool_terminal_kill(const RpcRequest &req) {
     try {
-        std::string snap = terminal_kill(req.session_id);
-        json sc = {{"output", ensure_valid_utf8(snap)}};
-        r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
-        r["structuredContent"] = sc;
+        std::string snap = ensure_valid_utf8(terminal_kill(req.session_id));
+        ToolResult tr;
+        tr.text = "terminal " + req.session_id + " killed\n\n" + snap;
+        tr.structured = json{
+            {"id",     req.session_id},
+            {"killed", true},
+            {"output", snap},
+        };
+        return tr;
     } catch (const std::exception &e) {
-        r["content"] = json::array({{{"type", "text"},
-            {"text", ensure_valid_utf8(e.what())}}});
-        r["isError"] = true;
+        return terminal_exception_result(e.what());
     }
-    j["result"] = r;
-    return j.dump();
 }
 
-static std::string tool_terminal_list(const RpcRequest &req) {
+static ToolResult tool_terminal_list(const RpcRequest &) {
     auto sessions = terminal_list();
     json arr = json::array();
+    std::string text;
     for (auto &s : sessions) {
-        arr.push_back({{"id", ensure_valid_utf8(s.id)}, {"command", ensure_valid_utf8(s.command)},
-                       {"alive", s.alive}, {"cols", s.cols}, {"rows", s.rows}});
+        std::string id      = ensure_valid_utf8(s.id);
+        std::string command = ensure_valid_utf8(s.command);
+        // terminal_list() reports sessions that are alive or already exited.
+        bool exited = !s.alive;
+        arr.push_back({
+            {"id", id}, {"command", command}, {"alive", s.alive},
+            {"exited", exited},
+            {"exit_code", exited ? json(s.exit_code) : json(nullptr)},
+            {"cols", s.cols}, {"rows", s.rows}
+        });
+        text += id + "  " + (s.alive ? "running" : "exited") + "  " + command + "\n";
     }
-    std::string text = arr.dump();
-    json j;
-    j["jsonrpc"] = "2.0";
-    j["id"] = req.id;
-    json r;
-    r["content"] = json::array({{{"type", "text"}, {"text", text}}});
-    r["structuredContent"] = {{"sessions", arr}};
-    j["result"] = r;
-    return j.dump();
+    if (text.empty()) text = "(no terminal sessions)\n";
+
+    ToolResult tr;
+    tr.text = std::move(text);
+    tr.structured = json{{"sessions", arr}};
+    return tr;
 }
 
 // ---------------------------------------------------------------------------
@@ -780,167 +1235,233 @@ static int stat_normalized(const std::string &path, struct stat *st,
 // RPC run loop
 // ---------------------------------------------------------------------------
 
-static std::string tool_read_json(const RpcRequest &req) {
-    json j;
-    j["jsonrpc"] = "2.0";
-    j["id"] = req.id;
-    json r;
+// Map errno to a stable error code.
+static const char *errno_error_code(int err) {
+    switch (err) {
+        case ENOENT: return error_code::kNotFound;
+        case EACCES:
+        case EPERM:  return error_code::kSandbox;
+        default:     return error_code::kInternal;
+    }
+}
 
+// read — text files only.  Images are view_image's job; anything binary is an
+// error (docs/analysis-tool-result-contract.md §5).
+static ToolResult tool_read(const RpcRequest &req) {
     // Check file existence first, with macOS path normalization fallback.
     struct stat st;
     std::string resolved_path;
     if (stat_normalized(req.path, &st, resolved_path) != 0) {
-        r["content"] = json::array({{{"type", "text"},
-            {"text", std::string("read: cannot open file: ") + req.path +
-                     ": " + strerror(errno)}}});
-        r["isError"] = true;
-        j["result"] = r;
-        return j.dump();
+        int err = errno;
+        return tool_error_result(errno_error_code(err),
+            "read: cannot open file: " + req.path + ": " + strerror(err));
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        return tool_error_result(error_code::kInvalidArgument,
+            "read: " + req.path + " is a directory; use bash (ls/find) to list it");
     }
 
     // Detect binary via magic bytes.
     auto ft = detect_file_type(resolved_path);
 
     if (ft.binary) {
-        bool is_image = (ft.mime.rfind("image/", 0) == 0);
-
-        if (is_image) {
-            // Image: read, resize if needed, return as MCP image content.
-            std::ifstream f(resolved_path, std::ios::binary);
-            if (!f) {
-                r["content"] = json::array({{{"type", "text"},
-                    {"text", std::string("read: cannot open file: ") + req.path +
-                             ": " + strerror(errno)}}});
-                r["isError"] = true;
-                j["result"] = r;
-                return j.dump();
-            }
-            std::string raw((std::istreambuf_iterator<char>(f)),
-                             std::istreambuf_iterator<char>());
-
-            auto img = resize_image(raw, ft.mime);
-            if (img.data.empty()) {
-                // Resize failed or unsupported image format — return metadata only.
-                std::string text = std::string("[Image: ") + ft.mime +
-                    ", " + std::to_string(raw.size()) +
-                    " bytes — could not be processed for inline display]";
-                json sc = {{"encoding", "metadata"}, {"mime_type", ft.mime},
-                           {"size", (uint64_t)raw.size()}};
-                r["content"] = json::array({{{"type", "text"}, {"text", text}}});
-                r["structuredContent"] = std::move(sc);
-            } else {
-                // Return resized image via MCP image content block.
-                std::string text = std::string("[Image: ") + img.mime_type + ", " +
-                    std::to_string(img.width) + "x" + std::to_string(img.height);
-                if (img.was_resized)
-                    text += ", resized from " + std::to_string(img.original_width) +
-                            "x" + std::to_string(img.original_height);
-                text += "]";
-                r["content"] = json::array({
-                    {{"type", "text"}, {"text", text}},
-                    {{"type", "image"}, {"data", std::move(img.data)},
-                     {"mimeType", img.mime_type}},
-                });
-                json sc = {{"encoding", "image"}, {"mime_type", img.mime_type},
-                           {"width", img.width}, {"height", img.height},
-                           {"original_width", img.original_width},
-                           {"original_height", img.original_height},
-                           {"was_resized", img.was_resized},
-                           {"size", (uint64_t)raw.size()}};
-                r["structuredContent"] = std::move(sc);
-            }
-        } else {
-            // Non-image binary: return metadata only (base64 is useless for LLMs).
-            std::string text = std::string("[Binary file: ") + ft.mime +
-                               ", " + std::to_string(st.st_size) + " bytes]";
-            json sc = {{"encoding", "metadata"}, {"mime_type", ft.mime},
-                       {"size", (uint64_t)st.st_size}};
-            r["content"] = json::array({{{"type", "text"}, {"text", text}}});
-            r["structuredContent"] = std::move(sc);
+        json detail = {{"mime", ft.mime}, {"size", (uint64_t)st.st_size}};
+        if (ft.mime.rfind("image/", 0) == 0) {
+            return tool_error_result(error_code::kNotImage,
+                "read: " + req.path + " is an image file (" + ft.mime +
+                "); use view_image to view it", std::move(detail));
         }
-    } else {
-        // Text mode: line-based reading with offset/limit.
-        // Default safety limits: 2000 lines AND 50KB, whichever triggers first.
-        static constexpr int    DEFAULT_MAX_LINES = 2000;
-        static constexpr size_t DEFAULT_MAX_BYTES = 50 * 1024;  // 50KB
-
-        std::ifstream f(resolved_path);
-        if (!f) {
-            r["content"] = json::array({{{"type", "text"},
-                {"text", std::string("read: cannot open file: ") + req.path +
-                         ": " + strerror(errno)}}});
-            r["isError"] = true;
-            j["result"] = r;
-            return j.dump();
-        }
-
-        std::string line;
-        std::ostringstream out;
-        int line_no   = 0;
-        int start     = req.offset.value_or(1);
-        int max_lines = req.limit.value_or(DEFAULT_MAX_LINES);
-        int collected = 0;
-        size_t total_bytes = 0;
-        bool truncated = false;
-
-        while (std::getline(f, line)) {
-            ++line_no;
-            if (line_no < start) continue;
-            if (collected >= max_lines) { truncated = true; break; }
-            size_t line_bytes = line.size() + 1;  // +1 for '\n'
-            if (collected > 0 && total_bytes + line_bytes > DEFAULT_MAX_BYTES) {
-                truncated = true;
-                break;
-            }
-            out << line << '\n';
-            total_bytes += line_bytes;
-            ++collected;
-        }
-
-        // Count remaining lines to get total_lines.
-        int total_lines = line_no;
-        if (truncated) {
-            while (std::getline(f, line))
-                ++line_no;
-            total_lines = line_no;
-        }
-
-        std::string text_content = out.str();
-        // Validate UTF-8: nlohmann::json will reject invalid UTF-8 strings.
-        // If the content is not valid UTF-8 (e.g. latin-1 detected as text
-        // by libmagic), fall back to metadata only.
-        try {
-            json sc = {{"content", text_content}, {"encoding", "text"},
-                       {"mime_type", ft.mime}, {"line_count", collected},
-                       {"truncated", truncated}};
-            if (truncated) {
-                sc["total_lines"] = total_lines;
-                sc["next_offset"] = start + collected;
-            }
-            // content[].text = plain text for LLM readability.
-            // structuredContent carries the same content + metadata for programmatic access.
-            r["content"] = json::array({{{"type", "text"}, {"text", text_content}}});
-            r["structuredContent"] = std::move(sc);
-        } catch (const json::exception &) {
-            // Not valid UTF-8 — treat as binary, return metadata only.
-            std::string summary = std::string("[Binary file: ") + ft.mime +
-                                  ", " + std::to_string(st.st_size) + " bytes]";
-            json sc = {{"encoding", "metadata"}, {"mime_type", ft.mime},
-                       {"size", (uint64_t)st.st_size}};
-            r["content"] = json::array({{{"type", "text"}, {"text", std::move(summary)}}});
-            r["structuredContent"] = std::move(sc);
-        }
+        return tool_error_result(error_code::kNotText,
+            "read: " + req.path + " is a binary file (" + ft.mime + ", " +
+            std::to_string(st.st_size) +
+            " bytes); use bash (file/xxd/strings) to inspect it",
+            std::move(detail));
     }
 
-    j["result"] = r;
-    return j.dump();
+    // Text mode: line-based reading with offset/limit.
+    // Default safety limits: 2000 lines AND 50KB, whichever triggers first.
+    static constexpr int    DEFAULT_MAX_LINES = 2000;
+    static constexpr size_t DEFAULT_MAX_BYTES = 50 * 1024;  // 50KB
+
+    std::ifstream f(resolved_path);
+    if (!f) {
+        int err = errno;
+        return tool_error_result(errno_error_code(err),
+            "read: cannot open file: " + req.path + ": " + strerror(err));
+    }
+
+    std::string line;
+    std::ostringstream out;
+    int line_no   = 0;
+    int start     = req.offset.value_or(1);
+    int max_lines = req.limit.value_or(DEFAULT_MAX_LINES);
+    int collected = 0;
+    size_t total_bytes = 0;
+    bool truncated = false;
+    bool line_capped = false;  // a single line exceeded the per-call byte budget
+
+    while (std::getline(f, line)) {
+        ++line_no;
+        if (line_no < start) continue;
+        if (collected >= max_lines) { truncated = true; break; }
+        size_t line_bytes = line.size() + 1;  // +1 for '\n'
+        if (total_bytes + line_bytes > DEFAULT_MAX_BYTES) {
+            // Lines are never split except for the first line: a single line
+            // bigger than the whole byte budget (minified bundles, machine
+            // generated logs) would otherwise bypass the limit entirely and
+            // flood the caller.
+            if (collected == 0) {
+                static const size_t kReserve = 256;  // room for the hint text
+                out << utf8_safe_truncate(line, DEFAULT_MAX_BYTES > kReserve
+                                                ? DEFAULT_MAX_BYTES - kReserve
+                                                : DEFAULT_MAX_BYTES)
+                    << '\n';
+                total_bytes = DEFAULT_MAX_BYTES;
+                ++collected;
+                line_capped = true;
+            }
+            truncated = true;
+            break;
+        }
+        out << line << '\n';
+        total_bytes += line_bytes;
+        ++collected;
+    }
+
+    // Count remaining lines to get total_lines.
+    int total_lines = line_no;
+    if (truncated) {
+        while (std::getline(f, line))
+            ++line_no;
+        total_lines = line_no;
+    }
+
+    std::string text_content = out.str();
+
+    // The file sniffed as text but the bytes are not valid UTF-8 (e.g.
+    // latin-1): it cannot be represented as JSON text.  Report it as a
+    // non-text file instead of silently mangling bytes.
+    if (!is_valid_utf8(text_content)) {
+        return tool_error_result(error_code::kNotText,
+            "read: " + req.path + " is not valid UTF-8 text; "
+            "use bash (iconv/xxd/strings) to inspect it",
+            json{{"mime", ft.mime}, {"size", (uint64_t)st.st_size}});
+    }
+
+    ToolResult tr;
+    std::string text = text_content;
+    if (truncated) {
+        if (!text.empty() && text.back() != '\n') text += '\n';
+        if (line_capped) {
+            text += "[truncated: line " + std::to_string(start) +
+                    " is longer than the 50 KiB per-call limit; showing its "
+                    "beginning — use bash (cut -c/sed) to read the rest]";
+        } else {
+            int last_line = start + collected - 1;
+            if (last_line < start) last_line = start;  // zero lines returned
+            text += "[truncated: showing lines " + std::to_string(start) + "-" +
+                    std::to_string(last_line) + " of " + std::to_string(total_lines) +
+                    "; continue with offset=" + std::to_string(start + collected) + "]";
+        }
+    }
+    tr.text = std::move(text);
+
+    json sc = {{"encoding", "text"}, {"mime_type", ft.mime},
+               {"line_count", collected}, {"truncated", truncated}};
+    if (truncated) {
+        sc["total_lines"] = total_lines;
+        sc["next_offset"] = start + collected;
+    }
+    tr.structured = std::move(sc);
+    return tr;
 }
 
-static RpcResponse tool_write(const RpcRequest &req) {
-    RpcResponse resp;
-    resp.id   = req.id;
-    resp.tool = ToolKind::Write;
+// view_image — the only tool that returns image content.
+static ToolResult tool_view_image(const RpcRequest &req) {
+    struct stat st;
+    std::string resolved_path;
+    if (stat_normalized(req.path, &st, resolved_path) != 0) {
+        int err = errno;
+        return tool_error_result(errno_error_code(err),
+            "view_image: cannot open file: " + req.path + ": " + strerror(err));
+    }
 
+    if (S_ISDIR(st.st_mode)) {
+        return tool_error_result(error_code::kInvalidArgument,
+            "view_image: " + req.path + " is a directory, not an image file");
+    }
+
+    auto ft = detect_file_type(resolved_path);
+    if (ft.mime.rfind("image/", 0) != 0) {
+        return tool_error_result(error_code::kNotImage,
+            "view_image: " + req.path + " is not an image file (" + ft.mime + ")",
+            json{{"mime", ft.mime}});
+    }
+
+    std::ifstream f(resolved_path, std::ios::binary);
+    if (!f) {
+        return tool_error_result(error_code::kInternal,
+            "view_image: cannot read file: " + req.path);
+    }
+    std::string raw((std::istreambuf_iterator<char>(f)),
+                     std::istreambuf_iterator<char>());
+
+    const bool low_detail = (req.image_detail == "low");
+    const int  max_edge   = low_detail ? 512 : 2000;
+
+    // Animated sources must return their first frame only: re-encode instead
+    // of handing back the original (possibly animated) file bytes.
+    const bool animated = image_is_animated(raw, ft.mime);
+    auto img = resize_image(raw, ft.mime, max_edge, max_edge,
+                            kMaxImageBase64Bytes, /*always_reencode=*/animated);
+
+    if (img.status == ImageResizeStatus::TooLarge) {
+        return tool_error_result(error_code::kTooLarge,
+            "view_image: " + req.path + " is too large to inline (" +
+            std::to_string(raw.size()) + " bytes, still over 4.5 MB after "
+            "downscaling); retry with detail=\"low\"",
+            json{{"mime", ft.mime}, {"size", (uint64_t)raw.size()}});
+    }
+    if (img.status != ImageResizeStatus::Ok || img.data.empty()) {
+        return tool_error_result(error_code::kUnsupportedFormat,
+            "view_image: cannot decode " + ft.mime + " (" + req.path +
+            "); supported formats: " + supported_image_formats(),
+            json{{"mime", ft.mime},
+                 {"supported", json::array({"image/png", "image/jpeg",
+                                            "image/gif", "image/bmp",
+                                            "image/tiff"
+#ifdef BOXSH_HAVE_WEBP
+                                            , "image/webp"
+#endif
+                 })}});
+    }
+
+    ToolResult tr;
+    std::string text = "[Image: " + img.mime_type + ", " +
+        std::to_string(img.width) + "x" + std::to_string(img.height);
+    if (img.was_resized)
+        text += ", resized from " + std::to_string(img.original_width) +
+                "x" + std::to_string(img.original_height);
+    if (low_detail) text += ", low detail";
+    if (animated)   text += ", animated, first frame";
+    text += "]";
+    tr.text = std::move(text);
+
+    tr.images.push_back({std::move(img.data), img.mime_type});
+
+    json sc = {{"encoding", "image"}, {"mime_type", img.mime_type},
+               {"width", img.width}, {"height", img.height},
+               {"original_width", img.original_width},
+               {"original_height", img.original_height},
+               {"was_resized", img.was_resized},
+               {"size", (uint64_t)raw.size()},
+               {"animated", animated}};
+    tr.structured = std::move(sc);
+    return tr;
+}
+
+static ToolResult tool_write(const RpcRequest &req) {
     // Determine the raw bytes to write.
     std::string raw;
     if (req.encoding == "base64") {
@@ -961,8 +1482,8 @@ static RpcResponse tool_write(const RpcRequest &req) {
         for (unsigned char c : s) {
             if (c == '=' || c == '\n' || c == '\r') continue;
             if (c >= 128 || kDecodeTable[c] == -1) {
-                resp.error = "write: invalid base64 character";
-                return resp;
+                return tool_error_result(error_code::kInvalidArgument,
+                    "write: content is not valid base64");
             }
             acc = (acc << 6) | (unsigned char)kDecodeTable[c];
             bits += 6;
@@ -975,6 +1496,11 @@ static RpcResponse tool_write(const RpcRequest &req) {
     } else {
         raw = req.content;
     }
+
+    // Did the file exist before this call?
+    struct stat st;
+    std::string resolved;
+    bool existed = (stat_normalized(req.path, &st, resolved) == 0);
 
     std::ofstream f(req.path, std::ios::binary | std::ios::trunc);
     if (!f && errno == ENOENT) {
@@ -993,27 +1519,31 @@ static RpcResponse tool_write(const RpcRequest &req) {
         }
     }
     if (!f) {
-        resp.error = std::string("write: cannot create file: ") + req.path +
-                     ": " + strerror(errno);
-        return resp;
+        int err = errno;
+        return tool_error_result(errno_error_code(err),
+            "write: cannot create file: " + req.path + ": " + strerror(err));
     }
 
     f.write(raw.data(), (std::streamsize)raw.size());
     if (!f) {
-        resp.error = std::string("write: failed writing to: ") + req.path +
-                     ": " + strerror(errno);
-        return resp;
+        int err = errno;
+        return tool_error_result(errno_error_code(err),
+            "write: failed writing to: " + req.path + ": " + strerror(err));
     }
     f.close();
-    resp.tool_content = "written " + std::to_string(raw.size()) + " bytes";
-    return resp;
+
+    bool created = !existed;
+    ToolResult tr;
+    tr.text = "write: " + req.path + " (" +
+              (created ? "created" : "overwrote existing") + ", " +
+              std::to_string(raw.size()) + " bytes)";
+    tr.structured = json{{"path", req.path},
+                         {"bytes", (uint64_t)raw.size()},
+                         {"created", created}};
+    return tr;
 }
 
-static RpcResponse tool_edit(const RpcRequest &req) {
-    RpcResponse resp;
-    resp.id   = req.id;
-    resp.tool = ToolKind::Edit;
-
+static ToolResult tool_edit(const RpcRequest &req) {
     // Resolve path with macOS normalization fallback.
     std::string resolved_path = req.path;
     {
@@ -1026,9 +1556,9 @@ static RpcResponse tool_edit(const RpcRequest &req) {
     // Read existing content.
     std::ifstream fin(resolved_path, std::ios::binary);
     if (!fin) {
-        resp.error = std::string("edit: cannot open file: ") + req.path +
-                     ": " + strerror(errno);
-        return resp;
+        int err = errno;
+        return tool_error_result(errno_error_code(err),
+            "edit: cannot open file: " + req.path + ": " + strerror(err));
     }
     std::ostringstream buf;
     buf << fin.rdbuf();
@@ -1107,8 +1637,8 @@ static RpcResponse tool_edit(const RpcRequest &req) {
 
     for (const auto &op : req.edits) {
         if (op.old_text.empty()) {
-            resp.error = "edit: oldText must not be empty";
-            return resp;
+            return tool_error_result(error_code::kInvalidArgument,
+                "edit: oldText must not be empty");
         }
         // Normalize oldText line endings to match content (already LF-normalized).
         std::string old_normalized = op.old_text;
@@ -1135,15 +1665,15 @@ static RpcResponse tool_edit(const RpcRequest &req) {
             std::string stripped_old = strip_trailing_ws(old_normalized);
             size_t spos = stripped_content.find(stripped_old);
             if (spos == std::string::npos) {
-                resp.error = "edit: oldText not found in file: " +
-                             utf8_safe_truncate(op.old_text, 40);
-                return resp;
+                return tool_error_result(error_code::kInvalidArgument,
+                    "edit: oldText not found in file: " +
+                    utf8_safe_truncate(op.old_text, 40));
             }
             // Check uniqueness in stripped space.
             if (stripped_content.find(stripped_old, spos + 1) != std::string::npos) {
-                resp.error = "edit: oldText is not unique in file: " +
-                             utf8_safe_truncate(op.old_text, 40);
-                return resp;
+                return tool_error_result(error_code::kInvalidArgument,
+                    "edit: oldText is not unique in file: " +
+                    utf8_safe_truncate(op.old_text, 40));
             }
             // Map stripped position back to original content position.
             auto pos_map = build_pos_map(content, stripped_content);
@@ -1153,9 +1683,9 @@ static RpcResponse tool_edit(const RpcRequest &req) {
         } else {
             // Check uniqueness for exact match.
             if (content.find(old_normalized, pos + 1) != std::string::npos) {
-                resp.error = "edit: oldText is not unique in file: " +
-                             utf8_safe_truncate(op.old_text, 40);
-                return resp;
+                return tool_error_result(error_code::kInvalidArgument,
+                    "edit: oldText is not unique in file: " +
+                    utf8_safe_truncate(op.old_text, 40));
             }
         }
         matches.push_back({pos, match_len, &op});
@@ -1167,8 +1697,29 @@ static RpcResponse tool_edit(const RpcRequest &req) {
     for (size_t i = 1; i < matches.size(); ++i) {
         size_t prev_end = matches[i-1].pos + matches[i-1].old_len;
         if (matches[i].pos < prev_end) {
-            resp.error = "edit: overlapping edits are not allowed";
-            return resp;
+            return tool_error_result(error_code::kInvalidArgument,
+                "edit: overlapping edits are not allowed");
+        }
+    }
+
+    // Result statistics, measured against the original text.
+    auto count_lines = [](const std::string &s) -> size_t {
+        if (s.empty()) return 0;
+        size_t lines = 1;
+        for (char c : s) if (c == '\n') ++lines;
+        if (s.back() == '\n') --lines;
+        return lines;
+    };
+    size_t lines_added = 0, lines_removed = 0, first_changed_line = 0;
+    for (size_t i = 0; i < matches.size(); ++i) {
+        const Match &m = matches[i];
+        lines_removed += count_lines(original.substr(m.pos, m.old_len));
+        lines_added   += count_lines(m.op->new_text);
+        if (i == 0) {
+            size_t line = 1;
+            for (size_t k = 0; k < m.pos && k < original.size(); ++k)
+                if (original[k] == '\n') ++line;
+            first_changed_line = line;
         }
     }
 
@@ -1209,14 +1760,48 @@ static RpcResponse tool_edit(const RpcRequest &req) {
     // Write result.
     std::ofstream fout(resolved_path, std::ios::binary | std::ios::trunc);
     if (!fout) {
-        resp.error = std::string("edit: cannot write file: ") + req.path +
-                     ": " + strerror(errno);
-        return resp;
+        int err = errno;
+        return tool_error_result(errno_error_code(err),
+            "edit: cannot write file: " + req.path + ": " + strerror(err));
     }
     fout << content;
     fout.close();
 
-    return resp;
+    ToolResult tr;
+    tr.text = "edit: " + req.path + " (+" + std::to_string(lines_added) +
+              " -" + std::to_string(lines_removed) +
+              ", first change at line " + std::to_string(first_changed_line) + ")";
+    tr.structured = json{{"path", req.path},
+                         {"lines_added", (int64_t)lines_added},
+                         {"lines_removed", (int64_t)lines_removed},
+                         {"first_changed_line", (int64_t)first_changed_line}};
+    return tr;
+}
+
+// ---------------------------------------------------------------------------
+// Tool dispatch
+// ---------------------------------------------------------------------------
+
+// Run one built-in tool and serialize its result through the single
+// result-serialization path.
+static std::string run_builtin_tool(const RpcRequest &req) {
+    ToolResult tr;
+    switch (req.tool) {
+        case ToolKind::Read:           tr = tool_read(req);            break;
+        case ToolKind::ViewImage:      tr = tool_view_image(req);      break;
+        case ToolKind::Write:          tr = tool_write(req);           break;
+        case ToolKind::Edit:           tr = tool_edit(req);            break;
+        case ToolKind::TerminalRun:    tr = tool_terminal_run(req);    break;
+        case ToolKind::TerminalSend:   tr = tool_terminal_send(req);   break;
+        case ToolKind::TerminalOutput: tr = tool_terminal_output(req); break;
+        case ToolKind::TerminalKill:   tr = tool_terminal_kill(req);   break;
+        case ToolKind::TerminalList:   tr = tool_terminal_list(req);   break;
+        default:
+            tr = tool_error_result(error_code::kInvalidArgument,
+                                   "unknown tool");
+            break;
+    }
+    return rpc_serialize_tool_result(req.id, tr, tr.error.has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,7 +1859,14 @@ public:
     bool has_line() {
         detect_mode();
         if (framed_) return has_framed();
-        return buf_.find('\n') != std::string::npos;
+        // Incremental scan: remember how much of buf_ is already known to
+        // hold no newline, so a multi-MiB single line is not rescanned on
+        // every poll iteration (that made the reader O(n^2)).
+        if (buf_.find('\n', scanned_) == std::string::npos) {
+            scanned_ = buf_.size();
+            return false;
+        }
+        return true;
     }
 
     bool eof()    const { return eof_; }
@@ -1287,6 +1879,7 @@ private:
 
     int         fd_;
     std::string buf_;
+    size_t      scanned_   = 0;   // bytes at the front of buf_ known to hold no '\n'
     bool        eof_       = false;
     bool        framed_    = false;
     bool        detected_  = false;
@@ -1310,11 +1903,15 @@ private:
 
     // Newline-delimited mode: return content up to '\n'.
     bool get_newline(std::string &line) {
-        auto pos = buf_.find('\n');
-        if (pos == std::string::npos) return false;
+        auto pos = buf_.find('\n', scanned_);
+        if (pos == std::string::npos) {
+            scanned_ = buf_.size();
+            return false;
+        }
         size_t end = (pos > 0 && buf_[pos - 1] == '\r') ? pos - 1 : pos;
         line = buf_.substr(0, end);
         buf_.erase(0, pos + 1);
+        scanned_ = (scanned_ > pos + 1) ? scanned_ - (pos + 1) : 0;
         return true;
     }
 
@@ -1426,25 +2023,7 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
             // Extremely unlikely (fd exhaustion). Fall back to synchronous execution.
             try {
-                RpcResponse resp;
-                switch (req.tool) {
-                    case ToolKind::Write: resp = tool_write(req); break;
-                    case ToolKind::Edit:  resp = tool_edit(req);  break;
-                    default: break;
-                }
-                // Tools that produce pre-serialized JSON strings.
-                std::string direct_payload;
-                switch (req.tool) {
-                    case ToolKind::Read:           direct_payload = tool_read_json(req);       break;
-                    case ToolKind::TerminalRun:    direct_payload = tool_terminal_run(req);    break;
-                    case ToolKind::TerminalSend:   direct_payload = tool_terminal_send(req);   break;
-                    case ToolKind::TerminalOutput: direct_payload = tool_terminal_output(req); break;
-                    case ToolKind::TerminalKill:   direct_payload = tool_terminal_kill(req);   break;
-                    case ToolKind::TerminalList:   direct_payload = tool_terminal_list(req);   break;
-                    default: break;
-                }
-                if (!direct_payload.empty()) { write_msg(direct_payload); return; }
-                write_resp(resp);
+                write_msg(run_builtin_tool(req));
             } catch (...) {
                 RpcResponse err;
                 err.id = req.id;
@@ -1460,27 +2039,7 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
         int write_fd = sv[1];
         std::thread([req, write_fd]() {
             try {
-                // Tools that produce pre-serialized JSON.
-                std::string direct_payload;
-                switch (req.tool) {
-                    case ToolKind::Read:           direct_payload = tool_read_json(req);       break;
-                    case ToolKind::TerminalRun:    direct_payload = tool_terminal_run(req);    break;
-                    case ToolKind::TerminalSend:   direct_payload = tool_terminal_send(req);   break;
-                    case ToolKind::TerminalOutput: direct_payload = tool_terminal_output(req); break;
-                    case ToolKind::TerminalKill:   direct_payload = tool_terminal_kill(req);   break;
-                    case ToolKind::TerminalList:   direct_payload = tool_terminal_list(req);   break;
-                    default: break;
-                }
-                RpcResponse resp;
-                if (direct_payload.empty()) {
-                    switch (req.tool) {
-                        case ToolKind::Write: resp = tool_write(req); break;
-                        case ToolKind::Edit:  resp = tool_edit(req);  break;
-                        default: break;
-                    }
-                    direct_payload = rpc_serialize_response(resp);
-                }
-                std::string payload = direct_payload + '\n';
+                std::string payload = run_builtin_tool(req) + '\n';
                 uint32_t len = (uint32_t)payload.size();
                 (void)write_all(write_fd, &len, sizeof(len));
                 (void)write_all(write_fd, payload.data(), len);
