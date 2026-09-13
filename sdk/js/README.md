@@ -249,7 +249,7 @@ Execute a shell command. `timeout` is in seconds.
 
 ### `client.read(path, offset?, limit?) → Promise<ReadResult>`
 
-Read a text file. `offset` is the 1-based start line and `limit` is the maximum number of lines (default 2000, also capped at 50 KiB per call). `ReadResult` has fields: `content` (the file text), `encoding` (always `"text"`), `mime_type`, and optionally `line_count`, `truncated`, `total_lines`, `next_offset`.
+Read a text file. `offset` is the 1-based start line and `limit` is the maximum number of lines (default 2000, also capped at 50 KiB per call). `ReadResult` has fields: `content` (the file text), `encoding` (always `"text"`), `mime_type`, and optionally `line_count`, `truncated`, `file_size` (bytes, always present), `total_lines`, `next_offset` (only when a further line exists) and `empty_reason` (`empty_file` | `offset_beyond_eof`). Targets must be regular files: FIFOs and sockets are rejected with `E_INVALID_ARGUMENT` (+ `detail.kind`).
 
 Binary files are rejected: images with `E_NOT_IMAGE` (use `viewImage`) and other binaries with `E_NOT_TEXT` (use `exec` with `file`/`xxd`/`strings`). Failures throw a `BoxshToolError` carrying `code` and `detail`.
 

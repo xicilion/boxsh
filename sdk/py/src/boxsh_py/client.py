@@ -91,8 +91,10 @@ class ReadResult:
     mime_type: str
     line_count: Optional[int] = None
     truncated: Optional[bool] = None
+    file_size: Optional[int] = None
     total_lines: Optional[int] = None
     next_offset: Optional[int] = None
+    empty_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -368,8 +370,10 @@ class BoxshClient:
             mime_type=str(structured.get("mime_type", "")),
             line_count=structured.get("line_count") if isinstance(structured.get("line_count"), int) else None,
             truncated=structured.get("truncated") if isinstance(structured.get("truncated"), bool) else None,
+            file_size=structured.get("file_size") if isinstance(structured.get("file_size"), int) else None,
             total_lines=structured.get("total_lines") if isinstance(structured.get("total_lines"), int) else None,
             next_offset=structured.get("next_offset") if isinstance(structured.get("next_offset"), int) else None,
+            empty_reason=structured.get("empty_reason") if isinstance(structured.get("empty_reason"), str) else None,
         )
 
     def view_image(self, file_path: PathLike, detail: Optional[str] = None) -> ViewImageResult:

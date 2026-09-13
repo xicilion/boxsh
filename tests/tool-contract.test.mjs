@@ -136,6 +136,29 @@ describe('tool contract — descriptors', () => {
       'bash description must not promise JSON');
   });
 
+  test('file-tool descriptors declare the hardened behaviour', () => {
+    // Contract §2.5/§四: the model only sees these strings, so the guarantees
+    // added on 2026-09-14 must be visible.
+    for (const name of ['read', 'view_image', 'write', 'edit']) {
+      const schema = toolByName(name).inputSchema;
+      assert.equal(schema.properties.path.minLength, 1,
+        `${name}: inputSchema.path must require a non-empty path`);
+    }
+    const read = toolByName('read');
+    assert.match(read.description, /regular files/i,
+      'read must state that FIFOs/sockets are rejected');
+    // read results gained file_size / empty_reason: they must be declared.
+    assert.ok(read.outputSchema.properties.file_size, 'read outputSchema must declare file_size');
+    assert.deepEqual(read.outputSchema.properties.empty_reason.enum,
+      ['empty_file', 'offset_beyond_eof']);
+    assert.ok(read.outputSchema.required.includes('file_size'),
+      'file_size is always returned and must be required');
+    assert.match(toolByName('write').description, /in place/i,
+      'write must state that the write is in place');
+    assert.match(toolByName('edit').description, /no-op|no op/i,
+      'edit must mention that a no-op edit leaves the file untouched');
+  });
+
   test('outputSchema stays inside the documented keyword subset', () => {
     const allowed = new Set([
       'type', 'properties', 'required', 'items', 'enum', 'anyOf', 'description',

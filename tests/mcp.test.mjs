@@ -188,8 +188,10 @@ describe('mcp — tools/list', () => {
     // structuredContent, and there is no base64/binary payload any more.
     assert.ok(!('content' in read.outputSchema.properties),
       'read outputSchema must not carry a body copy');
+    // file_size is always returned (contract §四, 2026-09-14).
+    assert.ok('file_size' in read.outputSchema.properties);
     assert.deepEqual(read.outputSchema.required.sort(),
-      ['encoding', 'line_count', 'mime_type', 'truncated']);
+      ['encoding', 'file_size', 'line_count', 'mime_type', 'truncated']);
   });
 
   test('view_image tool has outputSchema and image annotations', () => {

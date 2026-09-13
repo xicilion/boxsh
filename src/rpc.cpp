@@ -2,6 +2,7 @@
 #include "file_type.h"
 #include "image_resize.h"
 #include "io_utils.h"
+#include "sandbox.h"
 #include "terminal.h"
 #include "worker_pool.h"
 
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -281,6 +283,23 @@ static std::string supported_image_formats() {
         ;
 }
 
+// MIME types this build can actually decode.  Drives the "corrupt file" vs
+// "format not in the decode set" distinction in view_image errors
+// (contract §2.3): both keep E_UNSUPPORTED_FORMAT, only the former gets
+// detail.reason = "decode_failed".
+static bool mime_is_decodable(const std::string &mime) {
+    static const char *const kMimes[] = {
+        "image/png", "image/jpeg", "image/gif", "image/bmp", "image/tiff",
+#ifdef BOXSH_HAVE_WEBP
+        "image/webp",
+#endif
+        nullptr
+    };
+    for (int i = 0; kMimes[i]; ++i)
+        if (mime == kMimes[i]) return true;
+    return false;
+}
+
 } // namespace
 
 // Convenience constructor for a failed tool result.
@@ -378,6 +397,12 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
                 return false;
             }
             req.path = args["path"].get<std::string>();
+            // An empty path is a caller mistake, not a missing file: report it
+            // through the same channel as offset/limit (contract §2.2).
+            if (req.path.empty()) {
+                parse_error = tool_name + " tool path must not be empty";
+                return false;
+            }
 
             if (tool_name == "read") {
                 req.tool = ToolKind::Read;
@@ -437,6 +462,10 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
                 return false;
             }
             req.path = args["path"].get<std::string>();
+            if (req.path.empty()) {
+                parse_error = "view_image tool path must not be empty";
+                return false;
+            }
             if (args.contains("detail")) {
                 if (!args["detail"].is_string()) {
                     parse_error = "view_image detail must be a string";
@@ -716,11 +745,13 @@ static std::string mcp_tools_list_response(const json &id) {
          "Read a text file. Returns the file's text, capped at 2000 lines or 50 KiB "
          "per call; use offset/limit to page through larger files. Binary files "
          "(including images) cannot be read as text and return an error — use "
-         "view_image for images and bash (file/xxd/strings) for other binaries."},
+         "view_image for images and bash (file/xxd/strings) for other binaries. "
+         "Targets must be regular files: FIFOs and sockets are rejected. An empty "
+         "result explains itself through empty_reason."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"path", {{"type", "string"}, {"description", "Path to the file to read (relative or absolute)"}}},
+                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "Path to the file to read (relative or absolute)"}}},
                 {"offset", {{"type", "number"}, {"description", "Line number to start reading from (1-indexed, default 1)"}}},
                 {"limit", {{"type", "number"}, {"description", "Maximum number of lines to read (default 2000)"}}}
             }},
@@ -733,10 +764,13 @@ static std::string mcp_tools_list_response(const json &id) {
                 {"mime_type", {{"type", "string"}, {"description", "Detected MIME type of the text file (e.g. text/plain)"}}},
                 {"line_count", {{ "type", "integer"}, {"description", "Number of lines returned"}}},
                 {"truncated", {{"type", "boolean"}, {"description", "Whether the output was truncated"}}},
-                {"total_lines", {{"type", "integer"}, {"description", "Total lines in the file (only when truncated)"}}},
-                {"next_offset", {{"type", "integer"}, {"description", "Offset to pass to continue reading (only when truncated)"}}}
+                {"file_size", {{ "type", "integer"}, {"description", "Size of the file in bytes (always present)"}}},
+                {"total_lines", {{"type", "integer"}, {"description", "Total lines in the file (only when truncated, or when offset is past the end)"}}},
+                {"next_offset", {{"type", "integer"}, {"description", "Offset to pass to continue reading (only when a further line exists)"}}},
+                {"empty_reason", {{"type", "string"}, {"enum", json::array({"empty_file", "offset_beyond_eof"})},
+                                   {"description", "Why the body is empty (only when line_count is 0)"}}}
             }},
-            {"required", json::array({"encoding", "mime_type", "line_count", "truncated"})}
+            {"required", json::array({"encoding", "mime_type", "line_count", "truncated", "file_size"})}
         }},
         {"annotations", {
             {"title", "Read File"},
@@ -754,11 +788,13 @@ static std::string mcp_tools_list_response(const json &id) {
          "). Returns the image itself plus its metadata; oversized images are "
          "downscaled to a 2000px longest edge. Use detail=\"low\" for a 512px "
          "preview. Animated sources return their first frame only. Other image "
-         "formats (avif, heic, jxl, psd, \xe2\x80\xa6) are reported as unsupported."},
+         "formats (avif, heic, jxl, psd, \xe2\x80\xa6) are reported as unsupported. "
+         "The target must be a regular image file; files above 100 MP are "
+         "rejected without being decoded."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"path", {{"type", "string"}, {"description", "Path to the image file (relative or absolute)"}}},
+                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "Path to the image file (relative or absolute)"}}},
                 {"detail", {{"type", "string"}, {"enum", json::array({"auto", "low"})},
                             {"description", "\"auto\" (default, up to 2000px) or \"low\" (up to 512px, fewer tokens)"}}}
             }},
@@ -794,11 +830,13 @@ static std::string mcp_tools_list_response(const json &id) {
         {"description",
          "Create or overwrite a file with the given content. "
          "Parent directories are created automatically if needed. "
-         "Use encoding=base64 for binary content."},
+         "Use encoding=base64 for binary content. "
+         "The write is in place: existing permissions, hard links and symlinks "
+         "are preserved. Targets must not be directories, FIFOs or sockets."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"path", {{"type", "string"}, {"description", "Path to the file to write (relative or absolute)"}}},
+                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "Path to the file to write (relative or absolute)"}}},
                 {"content", {{"type", "string"}, {"description", "Content to write to the file. When encoding is base64, this is the base64-encoded binary data."}}},
                 {"encoding", {{"type", "string"}, {"enum", json::array({"text", "base64"})},
                              {"description", "Content encoding: \"text\" (default) or \"base64\""}}}
@@ -827,11 +865,13 @@ static std::string mcp_tools_list_response(const json &id) {
         {"title", "Edit File"},
         {"description",
          "Edit a file using exact text replacement. "
-         "Every edits[].oldText must match a unique, non-overlapping region of the original file."},
+         "Every edits[].oldText must match a unique, non-overlapping region of the original file. "
+         "The file is rewritten in place only when the bytes actually change (a no-op "
+         "edit leaves the file untouched); targets above 16 MiB are rejected."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"path", {{"type", "string"}, {"description", "Path to the file to edit (relative or absolute)"}}},
+                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "Path to the file to edit (relative or absolute)"}}},
                 {"edits", {
                     {"type", "array"},
                     {"items", {
@@ -1235,14 +1275,93 @@ static int stat_normalized(const std::string &path, struct stat *st,
 // RPC run loop
 // ---------------------------------------------------------------------------
 
-// Map errno to a stable error code.
+// Map errno to a stable error code (docs/analysis-tool-result-contract.md §2.2).
 static const char *errno_error_code(int err) {
     switch (err) {
-        case ENOENT: return error_code::kNotFound;
+        case ENOENT:
+        case ELOOP:   return error_code::kNotFound;
+        case EISDIR:
+        case ENOTDIR:
+        case ENAMETOOLONG:
+        case EINVAL:  return error_code::kInvalidArgument;
         case EACCES:
-        case EPERM:  return error_code::kSandbox;
-        default:     return error_code::kInternal;
+        case EPERM:   return error_code::kSandbox;
+        default:      return error_code::kInternal;
     }
+}
+
+// Human-readable errno text.  Permission failures carry the missing piece of
+// information: whether a sandbox is active (the path may simply not be
+// exposed) or this is a plain file-permission problem (contract §2.2).
+static std::string errno_message(int err) {
+    std::string msg = strerror(err);
+    if (err == EACCES || err == EPERM) {
+        msg += sandbox_active()
+            ? " (denied by the sandbox; expose the path with --bind)"
+            : " (file permissions; no sandbox is active)";
+    }
+    return msg;
+}
+
+// `detail` payload for permission failures: lets a caller (and the model)
+// tell the two denial sources apart without a separate error code.
+static std::optional<json> errno_detail(int err) {
+    if (err != EACCES && err != EPERM) return std::nullopt;
+    return json{{"sandbox", sandbox_active()}, {"errno", err}};
+}
+
+// File types whose open()/read() would block the tool thread forever.  A FIFO
+// with no writer blocks in open(); a unix socket cannot be opened as a file.
+// Both must be rejected before the open (contract §2.5).
+static const char *blocking_file_kind(mode_t mode) {
+    if (S_ISFIFO(mode)) return "fifo";
+    if (S_ISSOCK(mode)) return "socket";
+    return nullptr;
+}
+
+// Reject blocking targets.  Returns true when 'out' holds the error result.
+static bool reject_blocking_target(const char *tool, const std::string &path,
+                                   mode_t mode, ToolResult &out) {
+    const char *kind = blocking_file_kind(mode);
+    if (!kind) return false;
+    out = tool_error_result(error_code::kInvalidArgument,
+        std::string(tool) + ": " + path + " is a " + kind +
+        "; file tools only handle regular files — use bash (cat/ls) instead",
+        json{{"kind", kind}});
+    return true;
+}
+
+// Best-effort rollback after a failed write (contract §四): remove the file we
+// just created, or put the kept bytes back into an existing one.
+static bool restore_file(const std::string &path, const std::string &previous,
+                         bool existed) {
+    if (!existed) return remove(path.c_str()) == 0;
+    if (previous.empty()) return false;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(previous.data(), static_cast<std::streamsize>(previous.size()));
+    return static_cast<bool>(out);
+}
+
+// Read one line without ever buffering more than buf.size()-1 bytes.  A
+// physical line longer than the buffer is reported via 'clipped' and the rest
+// of it is discarded (so memory stays decoupled from the input's line
+// length — see contract §四 “输入侧单行上限”).  Returns false at end of input.
+static bool read_line_capped(std::istream &f, std::vector<char> &buf,
+                             std::string &line, bool &clipped) {
+    clipped = false;
+    f.getline(buf.data(), static_cast<std::streamsize>(buf.size()));
+    // gcount() would include the delimiter that getline extracts and discards;
+    // the NUL it always writes is the unambiguous end of the stored data (text
+    // lines cannot contain NUL — such files are rejected as binary).
+    line.assign(buf.data());
+    const bool at_eof = f.eof();
+    if (f.fail() && !at_eof && line.size() + 1 == buf.size()) {
+        clipped = true;   // buffer filled up: the line continues
+        f.clear();
+        f.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
+    return !line.empty() || !at_eof;
 }
 
 // read — text files only.  Images are view_image's job; anything binary is an
@@ -1254,12 +1373,18 @@ static ToolResult tool_read(const RpcRequest &req) {
     if (stat_normalized(req.path, &st, resolved_path) != 0) {
         int err = errno;
         return tool_error_result(errno_error_code(err),
-            "read: cannot open file: " + req.path + ": " + strerror(err));
+            "read: cannot open file: " + req.path + ": " + errno_message(err),
+            errno_detail(err));
     }
 
     if (S_ISDIR(st.st_mode)) {
         return tool_error_result(error_code::kInvalidArgument,
             "read: " + req.path + " is a directory; use bash (ls/find) to list it");
+    }
+    {
+        ToolResult blocked;
+        if (reject_blocking_target("read", req.path, st.st_mode, blocked))
+            return blocked;
     }
 
     // Detect binary via magic bytes.
@@ -1283,14 +1408,20 @@ static ToolResult tool_read(const RpcRequest &req) {
     // Default safety limits: 2000 lines AND 50KB, whichever triggers first.
     static constexpr int    DEFAULT_MAX_LINES = 2000;
     static constexpr size_t DEFAULT_MAX_BYTES = 50 * 1024;  // 50KB
+    // Input-side cap: a single physical line is never buffered in full, so a
+    // machine-generated one-line file cannot blow up memory before the output
+    // budget applies (contract §四).
+    static constexpr size_t MAX_LINE_INPUT = 1024 * 1024;   // 1 MiB
 
     std::ifstream f(resolved_path);
     if (!f) {
         int err = errno;
         return tool_error_result(errno_error_code(err),
-            "read: cannot open file: " + req.path + ": " + strerror(err));
+            "read: cannot open file: " + req.path + ": " + errno_message(err),
+            errno_detail(err));
     }
 
+    std::vector<char> line_buf(MAX_LINE_INPUT);
     std::string line;
     std::ostringstream out;
     int line_no   = 0;
@@ -1301,7 +1432,9 @@ static ToolResult tool_read(const RpcRequest &req) {
     bool truncated = false;
     bool line_capped = false;  // a single line exceeded the per-call byte budget
 
-    while (std::getline(f, line)) {
+    for (;;) {
+        bool clipped = false;
+        if (!read_line_capped(f, line_buf, line, clipped)) break;
         ++line_no;
         if (line_no < start) continue;
         if (collected >= max_lines) { truncated = true; break; }
@@ -1329,11 +1462,15 @@ static ToolResult tool_read(const RpcRequest &req) {
         ++collected;
     }
 
-    // Count remaining lines to get total_lines.
+    // Count remaining lines to get total_lines (bounded reader: the tail may
+    // contain another huge line).
     int total_lines = line_no;
     if (truncated) {
-        while (std::getline(f, line))
+        for (;;) {
+            bool clipped = false;
+            if (!read_line_capped(f, line_buf, line, clipped)) break;
             ++line_no;
+        }
         total_lines = line_no;
     }
 
@@ -1351,12 +1488,18 @@ static ToolResult tool_read(const RpcRequest &req) {
 
     ToolResult tr;
     std::string text = text_content;
+    // next_offset is only offered when a further line really exists; for a
+    // capped final line the old code pointed past EOF (contract §四).
+    const bool has_next_line = truncated && (start + collected <= total_lines);
     if (truncated) {
         if (!text.empty() && text.back() != '\n') text += '\n';
         if (line_capped) {
             text += "[truncated: line " + std::to_string(start) +
                     " is longer than the 50 KiB per-call limit; showing its "
-                    "beginning — use bash (cut -c/sed) to read the rest]";
+                    "beginning — use bash (cut -c/sed) to read the rest";
+            if (has_next_line)
+                text += "; continue with offset=" + std::to_string(start + collected);
+            text += "]";
         } else {
             int last_line = start + collected - 1;
             if (last_line < start) last_line = start;  // zero lines returned
@@ -1368,10 +1511,21 @@ static ToolResult tool_read(const RpcRequest &req) {
     tr.text = std::move(text);
 
     json sc = {{"encoding", "text"}, {"mime_type", ft.mime},
-               {"line_count", collected}, {"truncated", truncated}};
+               {"line_count", collected}, {"truncated", truncated},
+               {"file_size", (uint64_t)st.st_size}};
     if (truncated) {
         sc["total_lines"] = total_lines;
-        sc["next_offset"] = start + collected;
+        if (has_next_line) sc["next_offset"] = start + collected;
+    }
+    if (collected == 0) {
+        // An empty body must say why: an empty file and an offset past the end
+        // used to be indistinguishable (contract §四).
+        if (st.st_size == 0) {
+            sc["empty_reason"] = "empty_file";
+        } else {
+            sc["empty_reason"] = "offset_beyond_eof";
+            sc["total_lines"] = line_no;
+        }
     }
     tr.structured = std::move(sc);
     return tr;
@@ -1384,25 +1538,35 @@ static ToolResult tool_view_image(const RpcRequest &req) {
     if (stat_normalized(req.path, &st, resolved_path) != 0) {
         int err = errno;
         return tool_error_result(errno_error_code(err),
-            "view_image: cannot open file: " + req.path + ": " + strerror(err));
+            "view_image: cannot open file: " + req.path + ": " + errno_message(err),
+            errno_detail(err));
     }
 
     if (S_ISDIR(st.st_mode)) {
         return tool_error_result(error_code::kInvalidArgument,
-            "view_image: " + req.path + " is a directory, not an image file");
+            "view_image: " + req.path +
+            " is a directory, not an image file; use bash (ls) to list it");
+    }
+    {
+        ToolResult blocked;
+        if (reject_blocking_target("view_image", req.path, st.st_mode, blocked))
+            return blocked;
     }
 
     auto ft = detect_file_type(resolved_path);
     if (ft.mime.rfind("image/", 0) != 0) {
         return tool_error_result(error_code::kNotImage,
-            "view_image: " + req.path + " is not an image file (" + ft.mime + ")",
+            "view_image: " + req.path + " is not an image file (" + ft.mime +
+            "); use read for text files, or bash (file/xxd/strings) for other data",
             json{{"mime", ft.mime}});
     }
 
     std::ifstream f(resolved_path, std::ios::binary);
     if (!f) {
-        return tool_error_result(error_code::kInternal,
-            "view_image: cannot read file: " + req.path);
+        int err = errno;
+        return tool_error_result(errno_error_code(err),
+            "view_image: cannot read file: " + req.path + ": " + errno_message(err),
+            errno_detail(err));
     }
     std::string raw((std::istreambuf_iterator<char>(f)),
                      std::istreambuf_iterator<char>());
@@ -1416,6 +1580,18 @@ static ToolResult tool_view_image(const RpcRequest &req) {
     auto img = resize_image(raw, ft.mime, max_edge, max_edge,
                             kMaxImageBase64Bytes, /*always_reencode=*/animated);
 
+    if (img.status == ImageResizeStatus::TooManyPixels) {
+        // Header-declared dimensions exceeded the pixel budget; nothing was
+        // decoded (contract §2.3).
+        return tool_error_result(error_code::kTooLarge,
+            "view_image: " + req.path + " declares " +
+            std::to_string(img.declared_pixels) + " pixels, above the " +
+            std::to_string(img.pixel_limit) +
+            "-pixel decode limit; use bash (sips/convert) to downscale it first",
+            json{{"mime", ft.mime},
+                 {"pixels", img.declared_pixels},
+                 {"limit", img.pixel_limit}});
+    }
     if (img.status == ImageResizeStatus::TooLarge) {
         return tool_error_result(error_code::kTooLarge,
             "view_image: " + req.path + " is too large to inline (" +
@@ -1424,17 +1600,28 @@ static ToolResult tool_view_image(const RpcRequest &req) {
             json{{"mime", ft.mime}, {"size", (uint64_t)raw.size()}});
     }
     if (img.status != ImageResizeStatus::Ok || img.data.empty()) {
-        return tool_error_result(error_code::kUnsupportedFormat,
-            "view_image: cannot decode " + ft.mime + " (" + req.path +
-            "); supported formats: " + supported_image_formats(),
-            json{{"mime", ft.mime},
-                 {"supported", json::array({"image/png", "image/jpeg",
-                                            "image/gif", "image/bmp",
-                                            "image/tiff"
+        // Same stable code for both cases; detail.reason separates a corrupt
+        // file of a decodable format from a format outside the decode set
+        // (contract §2.3).
+        const bool decodable = mime_is_decodable(ft.mime);
+        json detail = {{"mime", ft.mime},
+                       {"supported", json::array({"image/png", "image/jpeg",
+                                                   "image/gif", "image/bmp",
+                                                   "image/tiff"
 #ifdef BOXSH_HAVE_WEBP
-                                            , "image/webp"
+                                                   , "image/webp"
 #endif
-                 })}});
+                 })}};
+        if (decodable) detail["reason"] = "decode_failed";
+        return tool_error_result(error_code::kUnsupportedFormat,
+            "view_image: cannot decode " + ft.mime + " (" + req.path + ")" +
+            (decodable
+                 ? "; the file looks truncated or corrupt — use bash (file/xxd) "
+                   "to inspect it"
+                 : "; this format is outside the decodable set — convert it "
+                   "with bash (sips/convert) first") +
+            "; supported formats: " + supported_image_formats(),
+            std::move(detail));
     }
 
     ToolResult tr;
@@ -1501,6 +1688,27 @@ static ToolResult tool_write(const RpcRequest &req) {
     struct stat st;
     std::string resolved;
     bool existed = (stat_normalized(req.path, &st, resolved) == 0);
+    if (existed) {
+        if (S_ISDIR(st.st_mode)) {
+            return tool_error_result(error_code::kInvalidArgument,
+                "write: " + req.path + " is a directory; use bash to write "
+                "inside it (for example " + req.path + "/file.txt)");
+        }
+        ToolResult blocked;
+        if (reject_blocking_target("write", req.path, st.st_mode, blocked))
+            return blocked;
+    }
+
+    // Keep the previous bytes so a failed write can be rolled back
+    // (contract §四).  Bounded so the rollback copy cannot grow unbounded.
+    static constexpr uint64_t kMaxRollbackBytes = 16ull * 1024 * 1024;  // 16 MiB
+    std::string previous;
+    if (existed && st.st_size > 0 && (uint64_t)st.st_size <= kMaxRollbackBytes) {
+        std::ifstream in(resolved, std::ios::binary);
+        if (in) previous.assign(std::istreambuf_iterator<char>(in),
+                                std::istreambuf_iterator<char>());
+    }
+    const std::string &target = existed ? resolved : req.path;
 
     std::ofstream f(req.path, std::ios::binary | std::ios::trunc);
     if (!f && errno == ENOENT) {
@@ -1521,16 +1729,22 @@ static ToolResult tool_write(const RpcRequest &req) {
     if (!f) {
         int err = errno;
         return tool_error_result(errno_error_code(err),
-            "write: cannot create file: " + req.path + ": " + strerror(err));
+            "write: cannot create file: " + req.path + ": " + errno_message(err),
+            errno_detail(err));
     }
 
     f.write(raw.data(), (std::streamsize)raw.size());
+    f.close();
     if (!f) {
         int err = errno;
+        const bool restored = restore_file(target, previous, existed);
+        json detail = {{"restored", restored}};
         return tool_error_result(errno_error_code(err),
-            "write: failed writing to: " + req.path + ": " + strerror(err));
+            "write: failed writing to: " + req.path + ": " + errno_message(err) +
+            (restored ? " (previous content restored)"
+                      : " (the file may be incomplete)"),
+            std::move(detail));
     }
-    f.close();
 
     bool created = !existed;
     ToolResult tr;
@@ -1545,24 +1759,58 @@ static ToolResult tool_write(const RpcRequest &req) {
 
 static ToolResult tool_edit(const RpcRequest &req) {
     // Resolve path with macOS normalization fallback.
+    struct stat st;
     std::string resolved_path = req.path;
+    bool exists = (stat_normalized(req.path, &st, resolved_path) == 0);
+    if (!exists) {
+        int err = errno;   // ENOENT / ELOOP
+        return tool_error_result(errno_error_code(err),
+            "edit: cannot open file: " + req.path + ": " + errno_message(err),
+            errno_detail(err));
+    }
+    if (S_ISDIR(st.st_mode)) {
+        return tool_error_result(error_code::kInvalidArgument,
+            "edit: " + req.path + " is a directory; use bash (ls/find) to "
+            "inspect it and pick a file to edit");
+    }
     {
-        struct stat st;
-        std::string rp;
-        if (stat_normalized(req.path, &st, rp) == 0)
-            resolved_path = rp;
+        ToolResult blocked;
+        if (reject_blocking_target("edit", req.path, st.st_mode, blocked))
+            return blocked;
+    }
+    // Editing reads the whole file and keeps a copy for rollback; refuse
+    // targets beyond a documented bound (contract §四).
+    static constexpr uint64_t kMaxEditFileBytes = 16ull * 1024 * 1024;  // 16 MiB
+    if ((uint64_t)st.st_size > kMaxEditFileBytes) {
+        return tool_error_result(error_code::kTooLarge,
+            "edit: " + req.path + " is " + std::to_string(st.st_size) +
+            " bytes, above the " + std::to_string(kMaxEditFileBytes) +
+            "-byte edit limit; use bash (sed/perl) to change it in place",
+            json{{"size", (uint64_t)st.st_size},
+                 {"limit", kMaxEditFileBytes}});
     }
 
-    // Read existing content.
+    // No edits requested: nothing to read, nothing to write (contract §四).
+    if (req.edits.empty()) {
+        ToolResult tr;
+        tr.text = "edit: " + req.path + " (no changes)";
+        tr.structured = json{{"path", req.path}, {"lines_added", 0},
+                             {"lines_removed", 0}, {"first_changed_line", 0}};
+        return tr;
+    }
+
+    // Read existing content (bounded by the size check above).
     std::ifstream fin(resolved_path, std::ios::binary);
     if (!fin) {
         int err = errno;
         return tool_error_result(errno_error_code(err),
-            "edit: cannot open file: " + req.path + ": " + strerror(err));
+            "edit: cannot open file: " + req.path + ": " + errno_message(err),
+            errno_detail(err));
     }
     std::ostringstream buf;
     buf << fin.rdbuf();
-    std::string content = buf.str();
+    const std::string original_bytes = buf.str();
+    std::string content = original_bytes;
     fin.close();
 
     // BOM handling: strip UTF-8 BOM before matching, restore when writing.
@@ -1757,15 +2005,35 @@ static ToolResult tool_edit(const RpcRequest &req) {
     if (has_bom)
         content.insert(0, utf8_bom);
 
-    // Write result.
+    // Write result.  The write is in place on purpose: it keeps the inode,
+    // hard links, the mode bits and the symlink itself, which callers rely on
+    // (tests assert all four).  A no-op edit never reaches this point.
+    if (content == original_bytes) {
+        ToolResult tr;
+        tr.text = "edit: " + req.path + " (no changes)";
+        tr.structured = json{{"path", req.path}, {"lines_added", 0},
+                             {"lines_removed", 0}, {"first_changed_line", 0}};
+        return tr;
+    }
+
     std::ofstream fout(resolved_path, std::ios::binary | std::ios::trunc);
     if (!fout) {
         int err = errno;
         return tool_error_result(errno_error_code(err),
-            "edit: cannot write file: " + req.path + ": " + strerror(err));
+            "edit: cannot write file: " + req.path + ": " + errno_message(err),
+            errno_detail(err));
     }
     fout << content;
     fout.close();
+    if (!fout) {
+        int err = errno;
+        const bool restored = restore_file(resolved_path, original_bytes, true);
+        return tool_error_result(errno_error_code(err),
+            "edit: failed writing to: " + req.path + ": " + errno_message(err) +
+            (restored ? " (original content restored)"
+                      : " (the file may be incomplete)"),
+            json{{"restored", restored}});
+    }
 
     ToolResult tr;
     tr.text = "edit: " + req.path + " (+" + std::to_string(lines_added) +

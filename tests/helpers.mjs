@@ -268,6 +268,35 @@ export function makePng(width, height, { solid = false } = {}) {
   ]);
 }
 
+/**
+ * Build a PNG that *declares* large dimensions while carrying almost no image
+ * data: the IHDR (with a valid CRC) says width×height, the IDAT is a tiny
+ * deflate stream that cannot produce those scanlines.
+ *
+ * Used to exercise the decode-time resource guard: a decoder that trusts IHDR
+ * will try to allocate width×height×channels before discovering the data is
+ * bad ("decompression bomb").  Never call makePng() with huge dimensions — it
+ * allocates the full pixel buffer.
+ *
+ * @param {number} width
+ * @param {number} height
+ * @param {{ colourType?: number }} [opts]
+ * @returns {Buffer}
+ */
+export function makePngDeclared(width, height, { colourType = 2 } = {}) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;                // bit depth
+  ihdr[9] = colourType;       // 2 = truecolour (3 bytes/pixel)
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(Buffer.alloc(1024, 0x11))),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
 // ---------------------------------------------------------------------------
 // Synchronous helpers
 // ---------------------------------------------------------------------------

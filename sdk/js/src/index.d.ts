@@ -42,10 +42,14 @@ export interface ReadResult {
     mime_type: string;
     line_count?: number;
     truncated?: boolean;
-    /** Total lines in the file (only when truncated). */
+    /** Size of the file in bytes (always present). */
+    file_size?: number;
+    /** Total lines in the file (only when truncated, or when offset is past the end). */
     total_lines?: number;
-    /** Offset to pass back to read() to continue (only when truncated). */
+    /** Offset to pass back to read() to continue (only when a further line exists). */
     next_offset?: number;
+    /** Why the body is empty (only when line_count is 0). */
+    empty_reason?: 'empty_file' | 'offset_beyond_eof';
 }
 
 /** Result of the view_image tool. */

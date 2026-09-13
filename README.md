@@ -181,9 +181,9 @@ Response (MCP `CallToolResult` format):
  "params":{"name":"read", "arguments":{"path":"/etc/hostname", "offset":1, "limit":10}}}
 ```
 
-`offset` (1-indexed start line) and `limit` (max lines) are optional; the default cap is 2000 lines / 50 KiB per call. Text lives in `content[0].text` (the model representation); `structuredContent` carries metadata only — `{encoding:"text", mime_type, line_count, truncated, total_lines?, next_offset?}`.
+`offset` (1-indexed start line) and `limit` (max lines) are optional; the default cap is 2000 lines / 50 KiB per call. Text lives in `content[0].text` (the model representation); `structuredContent` carries metadata only — `{encoding:"text", mime_type, line_count, truncated, file_size, total_lines?, next_offset?, empty_reason?}`. `file_size` is always present; `next_offset` appears only when a further line really exists, and `empty_reason` (`empty_file` | `offset_beyond_eof`) explains an empty body. A single physical line is never buffered beyond 1 MiB, so machine-generated one-line files cannot blow up memory.
 
-Binary files cannot be read as text: images fail with `E_NOT_IMAGE` (use `view_image`) and other binaries with `E_NOT_TEXT` (use `bash` with `file`, `xxd` or `strings`).
+Binary files cannot be read as text: images fail with `E_NOT_IMAGE` (use `view_image`) and other binaries with `E_NOT_TEXT` (use `bash` with `file`, `xxd` or `strings`). Targets must be regular files or readable devices — FIFOs and sockets fail fast with `E_INVALID_ARGUMENT` and `detail.kind` (use `bash` for those).
 
 #### `view_image` — View an image
 
@@ -192,7 +192,7 @@ Binary files cannot be read as text: images fail with `E_NOT_IMAGE` (use `view_i
  "params":{"name":"view_image", "arguments":{"path":"/tmp/chart.png", "detail":"auto"}}}
 ```
 
-Returns the image as an MCP `image` content block plus `structuredContent` metadata `{encoding:"image", mime_type, width, height, original_width, original_height, was_resized, size, animated}`. Images are downscaled to a 2000px longest edge (`detail:"low"` → 512px) and capped at 4.5 MB of base64; animated GIF/APNG/WebP sources report `animated: true` and are re-encoded so only their first frame is returned. Decodable formats are png, jpeg, gif, bmp, tiff and webp (vendored libwebp decoder) — other image formats (avif, heic, jxl, psd, …) fail with `E_UNSUPPORTED_FORMAT` and list the supported ones in `detail.supported`.
+Returns the image as an MCP `image` content block plus `structuredContent` metadata `{encoding:"image", mime_type, width, height, original_width, original_height, was_resized, size, animated}`. Images are downscaled to a 2000px longest edge (`detail:"low"` → 512px) and capped at 4.5 MB of base64; animated GIF/APNG/WebP sources report `animated: true` and are re-encoded so only their first frame is returned. Decodable formats are png, jpeg, gif, bmp, tiff and webp (vendored libwebp decoder) — other image formats (avif, heic, jxl, psd, …) fail with `E_UNSUPPORTED_FORMAT` and list the supported ones in `detail.supported`. A corrupt file of a decodable format carries the same code plus `detail.reason: "decode_failed"` (formats outside the decode set only carry `detail.supported`), and headers declaring more than 100 MP are rejected with `E_TOO_LARGE` before any pixel buffer is allocated.
 
 #### `write` — Create or overwrite a file
 
@@ -270,9 +270,11 @@ boxsh distinguishes two kinds of errors per the MCP spec:
 
 Stable tool error codes: `E_INVALID_ARGUMENT`, `E_NOT_FOUND`, `E_NOT_TEXT`, `E_NOT_IMAGE`, `E_UNSUPPORTED_FORMAT`, `E_TOO_LARGE`, `E_TIMEOUT`, `E_SANDBOX`, `E_INTERNAL`. The full contract lives in [`docs/analysis-tool-result-contract.md`](docs/analysis-tool-result-contract.md).
 
+Two `detail` fields disambiguate the cases where the code alone is not enough: `detail.sandbox` (with `detail.errno`) tells a sandbox denial from a file-permission denial on `E_SANDBOX`, and `detail.reason: "decode_failed"` tells a corrupt image from an unsupported format on `E_UNSUPPORTED_FORMAT`. `write`/`edit` report `detail.restored` when a failed write was rolled back.
+
 ### Client configuration
 
-`--sandbox` enforces minimal privileges — only system directories are accessible. You must explicitly `--bind` any project directories the agent needs.
+`--sandbox` enforces minimal privileges — reads stay inside system-maintained directories (`/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/Applications`, `/opt`, `/dev`, `/private` and the `/var`, `/tmp`, `/etc` symlink aliases), while writes are only possible through `--bind`. A path can therefore be readable but not writable; expose project data with `--bind` (`ro:`, `wr:`, `cow:`).
 
 **VS Code** (`.vscode/mcp.json`):
 
@@ -434,7 +436,7 @@ boxsh --sandbox --bind wr:/data -c 'ls /'
 
 | Flag | Effect |
 |---|---|
-| `--sandbox` | Isolated environment; only system directories accessible; all project access requires explicit `--bind`; current UID mapped as root inside (Linux) |
+| `--sandbox` | Isolated environment; reads are limited to system-maintained directories (`/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/Applications`, `/opt`, `/dev`, `/private` and its `/var`, `/tmp`, `/etc` aliases) while **writes are only possible through `--bind`**; current UID mapped as root inside (Linux) |
 | `--new-net-ns` | Loopback-only; outbound network blocked |
 | `--bind ro:PATH` | Expose a host path read-only inside the sandbox |
 | `--bind wr:PATH` | Expose a host path read-write inside the sandbox |
@@ -527,6 +529,7 @@ node --test tests/index.test.mjs
 | `concurrent.test.mjs` | Concurrent correctness, out-of-order responses, isolation, stress |
 | `overlay.test.mjs` | COW bind mounts, copy-on-write, delete/whiteout |
 | `tools.test.mjs` | Built-in tools: read (offset/limit), write, edit (uniqueness checks) |
+| `file-tools-robustness.test.mjs` | Hardening: FIFO/socket/directory targets, `empty_reason`/`next_offset`/`file_size`, 32 MiB single line, declared-pixel image bombs, write-path semantics (mode/hard links/symlinks, no-op edits), errno→code mapping |
 | `view-image.test.mjs` | `view_image`: image block + metadata, 2000px/512px downscaling, animated flag, image error codes |
 | `tool-contract.test.mjs` | Result contract: descriptors, `outputSchema` conformance, error codes, readable `content`, bash text budget |
 | `mcp.test.mjs` | MCP protocol: initialize, tools/list, tools/call, notifications, handshake |

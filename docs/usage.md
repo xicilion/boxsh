@@ -922,12 +922,14 @@ echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"read","a
 | `offset` | number | 1 | 1-based start line |
 | `limit` | number | 2000 | Maximum lines to return |
 
-The file body is the model-facing `content[0].text`; when the result is truncated the server appends `[truncated: showing lines A-B of T; continue with offset=N]`. `structuredContent` carries metadata only: `encoding` (always `"text"`), `mime_type`, `line_count`, `truncated`, and `total_lines`/`next_offset` when truncated.
+The file body is the model-facing `content[0].text`; when the result is truncated the server appends `[truncated: showing lines A-B of T; continue with offset=N]`. `structuredContent` carries metadata only: `encoding` (always `"text"`), `mime_type`, `line_count`, `truncated`, `file_size` (always), plus `total_lines`, `next_offset` and `empty_reason` when they apply. `next_offset` is present only when a further line really exists, and `empty_reason` (`empty_file` | `offset_beyond_eof`) explains an empty body. A single physical line is never buffered beyond 1 MiB.
 
 Binary files are rejected instead of returning a base64 blob:
 
 - images → `E_NOT_IMAGE` ("use view_image")
 - everything else → `E_NOT_TEXT` ("use bash: file/xxd/strings")
+
+Targets must be regular files or readable devices: directories, FIFOs and sockets fail fast with `E_INVALID_ARGUMENT` (a FIFO would otherwise block the tool thread forever); `detail.kind` names the type and the message points at `bash`.
 
 **`view_image`** — View an image file (png, jpeg, gif, bmp, tiff, webp).
 
@@ -940,9 +942,9 @@ echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"view_ima
 | `path` | string | — | Image file to view |
 | `detail` | `"auto"` \| `"low"` | `"auto"` | `"low"` returns a 512px preview instead of the 2000px default |
 
-Returns an MCP `image` content block plus `structuredContent`: `encoding` (`"image"`), `mime_type`, `width`, `height`, `original_width`, `original_height`, `was_resized`, `size`, `animated`. Oversized images are downscaled and re-encoded (PNG/JPEG, whichever is smaller) under a 4.5 MB base64 budget; animated GIF/APNG/WebP sources are re-encoded to their first frame with `animated: true`. Other image formats (avif, heic, jxl, …) return `E_UNSUPPORTED_FORMAT`.
+Returns an MCP `image` content block plus `structuredContent`: `encoding` (`"image"`), `mime_type`, `width`, `height`, `original_width`, `original_height`, `was_resized`, `size`, `animated`. Oversized images are downscaled and re-encoded (PNG/JPEG, whichever is smaller) under a 4.5 MB base64 budget; animated GIF/APNG/WebP sources are re-encoded to their first frame with `animated: true`. Other image formats (avif, heic, jxl, …) return `E_UNSUPPORTED_FORMAT`. A corrupt or truncated file *of a decodable format* returns the same code with `detail.reason: "decode_failed"`, and headers declaring more than 100 MP are rejected with `E_TOO_LARGE` (`detail.pixels`) before any pixel buffer is allocated.
 
-**`write`** — Create or overwrite a file. Parent directories are created automatically.
+**`write`** — Create or overwrite a file. Parent directories are created automatically. The write is in place: existing permissions, hard links and symlinks are preserved, and a failed write is rolled back on a best-effort basis (`detail.restored`). Directories, FIFOs and sockets are rejected.
 
 ```sh
 echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"write","arguments":{"path":"/tmp/hello.txt","content":"hello\n"}}}' | boxsh --rpc
@@ -969,6 +971,8 @@ Rules:
 - All matches are found against the **original** content, not intermediate results
 - Edits must not overlap
 - `oldText` must not be empty
+- A no-op edit (`edits: []` or replacements that do not change the bytes) never touches the file: it returns `edit: PATH (no changes)` and leaves mtime/inode alone
+- Files above 16 MiB are rejected with `E_TOO_LARGE` (`detail.size`/`detail.limit`); use `bash` (`sed`/`perl`) for those
 
 #### Error Model
 
@@ -981,6 +985,8 @@ boxsh distinguishes three kinds of failures per the MCP spec:
 | **Command failure** | `isError: true` with the normal command `structuredContent` (no `code`) | Non-zero exit code, timeout (`timed_out: true`) |
 
 Stable error codes: `E_INVALID_ARGUMENT`, `E_NOT_FOUND`, `E_NOT_TEXT`, `E_NOT_IMAGE`, `E_UNSUPPORTED_FORMAT`, `E_TOO_LARGE`, `E_TIMEOUT`, `E_SANDBOX`, `E_INTERNAL`.
+
+The code set is intentionally stable, so two `detail` fields carry the finer distinctions: `detail.sandbox` (+ `detail.errno`) separates a sandbox denial from a file-permission denial on `E_SANDBOX`, and `detail.reason: "decode_failed"` separates a corrupt image from an unsupported format. `errno`-derived mapping: `ENOENT`/`ELOOP` → `E_NOT_FOUND`; `EISDIR`/`ENOTDIR`/`ENAMETOOLONG`/`EINVAL` → `E_INVALID_ARGUMENT`; `EACCES`/`EPERM` → `E_SANDBOX`; anything else → `E_INTERNAL`.
 
 #### Concurrency
 

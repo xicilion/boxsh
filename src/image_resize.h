@@ -8,10 +8,18 @@ namespace boxsh {
 // Default inline-image budget: 4.5 MB of base64 payload.
 inline constexpr size_t kMaxImageBase64Bytes = 4718592;
 
+// Upper bound on the *declared* pixel count of an image.  Headers are checked
+// before any pixel buffer is allocated, so a small file claiming huge
+// dimensions ("decompression bomb") cannot push the process into OOM
+// (contract §2.3).  100 MP is far beyond what a screenshot or diagram needs,
+// and still allows downscaling to the 2000px budget.
+inline constexpr long long kMaxImagePixels = 100LL * 1000 * 1000;
+
 enum class ImageResizeStatus {
     Ok,            // data holds a usable base64 image
     DecodeFailed,  // the input could not be decoded (unsupported/corrupt)
     TooLarge,      // decoded fine but no encoding fits max_bytes
+    TooManyPixels, // declared dimensions exceed kMaxImagePixels (not decoded)
 };
 
 struct ResizedImage {
@@ -23,6 +31,10 @@ struct ResizedImage {
     int original_height = 0;
     bool was_resized = false;
     ImageResizeStatus status = ImageResizeStatus::DecodeFailed;
+    // Header-declared dimensions of the source; set for TooManyPixels so the
+    // caller can report {pixels, limit} without re-parsing the header.
+    long long declared_pixels = 0;
+    long long pixel_limit = 0;
 };
 
 // Resize an image to fit within max dimensions and base64 size limit.

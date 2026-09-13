@@ -468,7 +468,7 @@ static constexpr size_t kProbeSize = 8192;
 
 FileType detect_file_type(const unsigned char *buf, size_t len) {
     if (len == 0)
-        return {false, "inode/x-empty"};
+        return {false, "text/plain"};   // empty file (and /dev/null): no content, no binary evidence
 
     const char *mime = detect_mime(buf, len);
     if (mime)

@@ -323,6 +323,7 @@ int main(int argc, char **argv) {
                              sr.error.c_str());
                 return 1;
             }
+            boxsh::sandbox_active_ref() = true;
         }
 
         bool stdin_is_tty = isatty(STDIN_FILENO);
@@ -455,6 +456,7 @@ int main(int argc, char **argv) {
                          sr.error.c_str());
             return 1;
         }
+        boxsh::sandbox_active_ref() = true;
     }
 
     int rpc_fd_in = dup(STDIN_FILENO);

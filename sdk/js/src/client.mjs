@@ -201,7 +201,7 @@ export class BoxshClient {
      * @param {string} filePath    Absolute path to the file
      * @param {number} [offset]   1-based line number to start reading from
      * @param {number} [limit]    Maximum number of lines to return
-     * @returns {Promise<{ content: string, encoding: string, mime_type: string, line_count?: number, truncated?: boolean, total_lines?: number, next_offset?: number }>}
+     * @returns {Promise<{ content: string, encoding: string, mime_type: string, line_count?: number, truncated?: boolean, file_size?: number, total_lines?: number, next_offset?: number, empty_reason?: 'empty_file'|'offset_beyond_eof' }>}
      */
     async read(filePath, offset, limit) {
         const args = { path: filePath };
@@ -218,10 +218,12 @@ export class BoxshClient {
             content:    textOf(result),
             encoding:   sc.encoding ?? 'text',
             mime_type:  sc.mime_type ?? '',
-            ...(sc.line_count  !== undefined ? { line_count: sc.line_count }   : {}),
-            ...(sc.truncated   !== undefined ? { truncated: sc.truncated }     : {}),
-            ...(sc.total_lines !== undefined ? { total_lines: sc.total_lines } : {}),
-            ...(sc.next_offset !== undefined ? { next_offset: sc.next_offset } : {}),
+            ...(sc.line_count   !== undefined ? { line_count: sc.line_count }     : {}),
+            ...(sc.truncated    !== undefined ? { truncated: sc.truncated }       : {}),
+            ...(sc.file_size    !== undefined ? { file_size: sc.file_size }       : {}),
+            ...(sc.total_lines  !== undefined ? { total_lines: sc.total_lines }   : {}),
+            ...(sc.next_offset  !== undefined ? { next_offset: sc.next_offset }   : {}),
+            ...(sc.empty_reason !== undefined ? { empty_reason: sc.empty_reason } : {}),
         };
     }
 

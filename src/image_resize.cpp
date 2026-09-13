@@ -183,9 +183,50 @@ static Candidate best_encoding(const unsigned char *pixels,
     return (png_c.data.size() <= jpg_c.data.size()) ? std::move(png_c) : std::move(jpg_c);
 }
 
+// Read the dimensions declared in the header *without* decoding any pixels.
+// Used to reject decompression bombs before stb/libwebp allocate a buffer
+// (contract §2.3).
+static bool probe_dimensions(const std::string &raw, const std::string &mime,
+                             int &w, int &h) {
+#ifdef BOXSH_HAVE_WEBP
+    if (mime == "image/webp") {
+        WebPBitstreamFeatures features;
+        if (WebPGetFeatures(reinterpret_cast<const uint8_t *>(raw.data()),
+                            raw.size(), &features) != VP8_STATUS_OK)
+            return false;
+        w = features.width;
+        h = features.height;
+        return w > 0 && h > 0;
+    }
+#else
+    (void)mime;
+#endif
+    int channels = 0;
+    if (!stbi_info_from_memory(reinterpret_cast<const unsigned char *>(raw.data()),
+                               static_cast<int>(raw.size()), &w, &h, &channels))
+        return false;
+    return w > 0 && h > 0;
+}
+
 ResizedImage resize_image(const std::string &raw, const std::string &mime,
                           int max_width, int max_height, size_t max_bytes,
                           bool always_reencode) {
+    // Reject declared-huge images before touching the pixel data.
+    int declared_w = 0, declared_h = 0;
+    if (probe_dimensions(raw, mime, declared_w, declared_h)) {
+        const long long pixels = static_cast<long long>(declared_w) *
+                                 static_cast<long long>(declared_h);
+        if (pixels > kMaxImagePixels) {
+            ResizedImage out;
+            out.status = ImageResizeStatus::TooManyPixels;
+            out.original_width = declared_w;
+            out.original_height = declared_h;
+            out.declared_pixels = pixels;
+            out.pixel_limit = kMaxImagePixels;
+            return out;
+        }
+    }
+
     DecodedPixels decoded;
     if (!decode_image(raw, mime, decoded))
         return {};  // status stays DecodeFailed
