@@ -523,14 +523,27 @@ describe('write — semantics', () => {
     }
   });
 
-  test('a sandbox denial reports detail.sandbox=true', () => {
+  test('a sandboxed write outside the exposed paths never reaches the host', () => {
+    // The security property is portable: the host file must not appear.  The
+    // *mechanism* differs per platform, so the denial assertions are scoped:
+    //   - macOS Seatbelt denies the write (E_SANDBOX + detail.sandbox);
+    //   - the Linux mount namespace gives the sandbox its own /tmp, so the
+    //     write succeeds but lands in a throwaway tmpfs.
     const outside = path.join(ROOT, 'sandbox-denied.txt');
     const resp = rpcRaw({ id: '1', tool: 'write', path: outside, content: 'x' },
       { sandbox: true, timeout_ms: 15000 });
-    assertToolError(resp, 'E_SANDBOX', 'sandboxed write');
-    assert.equal(detailOf(resp).sandbox, true, 'the sandbox is active in this run');
-    assert.match(textOf(resp), /--bind/, 'message should mention how to expose the path');
-    assert.equal(fs.existsSync(outside), false, 'sandboxed write must not create the file');
+    assert.equal(fs.existsSync(outside), false,
+      'a sandboxed write must never touch the host filesystem');
+    assert.ok(!resp.error, `sandboxed write returned a protocol error: ${JSON.stringify(resp.error)}`);
+
+    if (resp.result?.isError) {
+      assertToolError(resp, 'E_SANDBOX', 'sandboxed write');
+      assert.equal(detailOf(resp).sandbox, true, 'the sandbox is active in this run');
+      assert.match(textOf(resp), /--bind/, 'message should mention how to expose the path');
+    } else {
+      assert.equal(process.platform, 'linux',
+        'only the Linux sandbox isolates /tmp instead of denying writes');
+    }
   });
 });
 
