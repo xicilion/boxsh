@@ -15,7 +15,7 @@
  *             structuredContent?, isError? }
  *
  * Tool errors are rejected with a BoxshToolError carrying the stable `code`
- * from structuredContent (see docs/analysis-tool-result-contract.md).
+ * from structuredContent (see the README's "Error model" section).
  */
 
 import { spawn } from 'node:child_process';

@@ -5,7 +5,7 @@
  * resizing rules (2000px / 512px for detail=low), the animated marker and the
  * image error codes (E_NOT_IMAGE, E_NOT_FOUND, E_UNSUPPORTED_FORMAT).
  *
- * Contract: docs/analysis-tool-result-contract.md §2.3, §4, §5.
+ * Contract: README.md ("view_image"), enforced by tests/tool-contract.test.mjs.
  */
 
 import { test, describe } from 'node:test';

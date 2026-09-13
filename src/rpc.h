@@ -22,7 +22,8 @@ struct EditOp {
 };
 
 // ---------------------------------------------------------------------------
-// Tool result contract (single source: docs/analysis-tool-result-contract.md)
+// Tool result contract — documented in README.md ("Error model") and enforced
+// by tests/tool-contract.test.mjs + tests/file-tools-robustness.test.mjs.
 // ---------------------------------------------------------------------------
 
 // Error codes are stable — do not add new ones without updating the contract

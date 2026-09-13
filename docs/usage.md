@@ -944,7 +944,7 @@ echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"view_ima
 
 Returns an MCP `image` content block plus `structuredContent`: `encoding` (`"image"`), `mime_type`, `width`, `height`, `original_width`, `original_height`, `was_resized`, `size`, `animated`. Oversized images are downscaled and re-encoded (PNG/JPEG, whichever is smaller) under a 4.5 MB base64 budget; animated GIF/APNG/WebP sources are re-encoded to their first frame with `animated: true`. Other image formats (avif, heic, jxl, …) return `E_UNSUPPORTED_FORMAT`. A corrupt or truncated file *of a decodable format* returns the same code with `detail.reason: "decode_failed"`, and headers declaring more than 100 MP are rejected with `E_TOO_LARGE` (`detail.pixels`) before any pixel buffer is allocated.
 
-**`write`** — Create or overwrite a file. Parent directories are created automatically. The write is in place: existing permissions, hard links and symlinks are preserved, and a failed write is rolled back on a best-effort basis (`detail.restored`). Directories, FIFOs and sockets are rejected.
+**`write`** — Create or overwrite a file. Parent directories are created automatically. The write is in place: existing permissions, hard links and symlinks are preserved, and a failed write is rolled back on a best-effort basis (`detail.restored`). A failed call leaves nothing behind — directories created for it are removed again, and a trailing slash on a path that is not an existing directory is refused before anything is created. Directories, FIFOs and sockets are rejected.
 
 ```sh
 echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"write","arguments":{"path":"/tmp/hello.txt","content":"hello\n"}}}' | boxsh --rpc
@@ -986,7 +986,7 @@ boxsh distinguishes three kinds of failures per the MCP spec:
 
 Stable error codes: `E_INVALID_ARGUMENT`, `E_NOT_FOUND`, `E_NOT_TEXT`, `E_NOT_IMAGE`, `E_UNSUPPORTED_FORMAT`, `E_TOO_LARGE`, `E_TIMEOUT`, `E_SANDBOX`, `E_INTERNAL`.
 
-The code set is intentionally stable, so two `detail` fields carry the finer distinctions: `detail.sandbox` (+ `detail.errno`) separates a sandbox denial from a file-permission denial on `E_SANDBOX`, and `detail.reason: "decode_failed"` separates a corrupt image from an unsupported format. `errno`-derived mapping: `ENOENT`/`ELOOP` → `E_NOT_FOUND`; `EISDIR`/`ENOTDIR`/`ENAMETOOLONG`/`EINVAL` → `E_INVALID_ARGUMENT`; `EACCES`/`EPERM` → `E_SANDBOX`; anything else → `E_INTERNAL`.
+The code set is intentionally stable, so two `detail` fields carry the finer distinctions: `detail.sandbox` (+ `detail.errno`/`detail.errno_name`) separates a sandbox denial from a file-permission denial on `E_SANDBOX`, and `detail.reason: "decode_failed"` separates a corrupt image from an unsupported format. `errno`-derived mapping: `ENOENT` → `E_NOT_FOUND`; `ELOOP` (symbolic link loop), `EISDIR`/`ENOTDIR`/`ENAMETOOLONG`/`EINVAL` → `E_INVALID_ARGUMENT`; `EACCES`/`EPERM` → `E_SANDBOX`; anything else → `E_INTERNAL`. Raw errno text lives in `detail`, not in the human message.
 
 #### Concurrency
 

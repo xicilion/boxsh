@@ -2,8 +2,8 @@
  * file-tools-robustness.test.mjs — L3 hardening suite for the file tools
  * (read / view_image / write / edit).
  *
- * Scope (docs/analysis-tool-result-contract.md §2.2, §2.3, §2.5, §四; plan
- * docs/plan/file-tools-hardening-plan-2026-09-14.md §5):
+ * Scope (README.md "Tools" / "Error model"; the guarantees added on
+ * 2026-09-14):
  *   - target types that would block a tool thread (FIFO / socket) or that are
  *     not files at all (directory), and symlink resolution;
  *   - `read` result self-consistency: empty_reason / total_lines / next_offset /
@@ -23,10 +23,11 @@ import { test, describe, after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
-import { BOXSH, TEMPDIR, rpcRaw, makePng, makePngDeclared } from './helpers.mjs';
+import { BOXSH, rpcRaw, makePng, makePngDeclared } from './helpers.mjs';
 
 /** Checked-in fixture directory (images used by the file-type and image suites). */
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixture');
@@ -35,7 +36,14 @@ const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtur
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const ROOT = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-robust-'));
+// Fixtures live in the OS temp dir, NOT in helpers' TEMPDIR: the sandbox suite
+// uses TEMPDIR as the copy-on-write source for `boxsh --try`, and a leftover
+// symlink loop in that tree makes its manifest walk fail (ELOOP) — and a
+// module-level after() hook in an imported suite only runs at the very end of
+// the aggregated run, so the loop would be visible to every suite after this
+// one.  Everything is still removed in after() and each case cleans up after
+// itself.
+const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-robust-'));
 after(() => {
   try { fs.chmodSync(ROOT, 0o755); } catch { /* ignore */ }
   fs.rmSync(ROOT, { recursive: true, force: true });
@@ -523,6 +531,98 @@ describe('write — semantics', () => {
     assert.equal(detailOf(resp).sandbox, true, 'the sandbox is active in this run');
     assert.match(textOf(resp), /--bind/, 'message should mention how to expose the path');
     assert.equal(fs.existsSync(outside), false, 'sandboxed write must not create the file');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// write: a failed call must not leave any side effect (v2 report P0-1)
+// ---------------------------------------------------------------------------
+
+describe('write — no side effects on failure', () => {
+  test('a trailing slash on a new path fails without creating a directory', () => {
+    // Pre-fix: "write newdir/" returned E_INVALID_ARGUMENT but mkdir -p had
+    // already created filetest/newdir/ — a failure with a side effect.
+    const resp = call('write', { path: 'slash-new/', content: 'x' });
+    assertToolError(resp, 'E_INVALID_ARGUMENT', 'trailing slash');
+    assert.match(textOf(resp), /trailing slash/);
+    assert.equal(fs.existsSync(p('slash-new')), false,
+      'a failed write must not create a directory');
+  });
+
+  test('a nested trailing slash leaves nothing behind', () => {
+    const resp = call('write', { path: 'slash-deep/a/b/', content: 'x' });
+    assertToolError(resp, 'E_INVALID_ARGUMENT', 'nested trailing slash');
+    assert.equal(fs.existsSync(p('slash-deep')), false,
+      'no intermediate directory may survive a failed write');
+  });
+
+  test('a write that fails after mkdir -p removes the directories it created', () => {
+    // The parent path is missing (open → ENOENT, so mkdir -p runs) while the
+    // final component is over-long, which makes the retry fail with
+    // ENAMETOOLONG.  Every directory created on the way must be removed again.
+    const long = 'z'.repeat(300) + '.txt';
+    const resp = call('write', { path: p('rollback-dir', 'deep', long), content: 'x' });
+    assertToolError(resp, 'E_INVALID_ARGUMENT', 'over-long final component');
+    assert.equal(fs.existsSync(p('rollback-dir')), false,
+      'directories created for a failed write must be removed');
+  });
+
+  test('a successful nested write still creates the directories', () => {
+    const resp = call('write', { path: p('ok-dir', 'a', 'b.txt'), content: 'kept\n' });
+    assert.ok(!isToolError(resp), `unexpected error: ${textOf(resp)}`);
+    assert.equal(fs.readFileSync(p('ok-dir', 'a', 'b.txt'), 'utf8'), 'kept\n');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// symlink loops and permission consistency (v2 report P1-1 / P1-3)
+// ---------------------------------------------------------------------------
+
+describe('file tools — loops and permissions', () => {
+  test('a symlink loop reports E_INVALID_ARGUMENT with an explicit message', () => {
+    // Pre-fix: ELOOP was mapped to E_NOT_FOUND, so a loop looked like a
+    // retryable missing file.
+    const a = p('loop-a');
+    const b = p('loop-b');
+    fs.symlinkSync(b, a);
+    fs.symlinkSync(a, b);
+    try {
+      for (const [name, args] of [
+        ['read', { path: a }],
+        ['view_image', { path: a }],
+        ['write', { path: a, content: 'x' }],
+        ['edit', { path: a, edits: [{ oldText: 'a', newText: 'b' }] }],
+      ]) {
+        const resp = call(name, args);
+        assertToolError(resp, 'E_INVALID_ARGUMENT', `${name} symlink loop`);
+        assert.match(textOf(resp), /symbolic link loop/, `${name}: message must name the loop`);
+        assert.equal(detailOf(resp).errno_name, 'ELOOP', `${name}: raw errno belongs in detail`);
+      }
+    } finally {
+      // Never leave a loop behind: recursive directory walks (COW manifests,
+      // rm -r) treat it as an error.
+      fs.rmSync(a, { force: true });
+      fs.rmSync(b, { force: true });
+    }
+  });
+
+  test('an unreadable file is reported identically by read and view_image', () => {
+    // Pre-fix: read said "E_SANDBOX: Permission denied" while view_image said
+    // "E_NOT_IMAGE (application/octet-stream)" — same root cause, two answers.
+    const f = write('noperm.txt', 'secret\n');
+    fs.chmodSync(f, 0o000);
+    try {
+      const read = call('read', { path: f });
+      const view = call('view_image', { path: f });
+      assertToolError(read, 'E_SANDBOX', 'read unreadable file');
+      assertToolError(view, 'E_SANDBOX', 'view_image unreadable file');
+      assert.match(textOf(view), /permission/i, 'the real cause must be named');
+      assert.equal(detailOf(view).sandbox, false);
+      assert.equal(detailOf(read).errno, detailOf(view).errno,
+        'the same root cause must carry the same errno');
+    } finally {
+      fs.chmodSync(f, 0o644);
+    }
   });
 });
 

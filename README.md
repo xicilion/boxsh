@@ -201,7 +201,7 @@ Returns the image as an MCP `image` content block plus `structuredContent` metad
  "params":{"name":"write", "arguments":{"path":"/tmp/hello.txt", "content":"hello\n"}}}
 ```
 
-Creates or overwrites the file. Parent directories are created automatically if needed.
+Creates or overwrites the file. Parent directories are created automatically if needed. The write is in place (timestamps aside, the file's identity, mode bits, hard links and symlinks are preserved) and a failed call leaves nothing behind: directories created for it are removed again, a trailing slash on a path that is not an existing directory is refused up front, and a partially written file is rolled back on a best-effort basis (`detail.restored`). The result reports `created`, `bytes` and the model-facing text `write: PATH (created|overwrote existing, N bytes)`.
 
 #### `edit` — Search-and-replace edit
 
@@ -211,7 +211,7 @@ Creates or overwrites the file. Parent directories are created automatically if 
    "edits":[{"oldText":"debug = false", "newText":"debug = true"}]}}}
 ```
 
-Each `oldText` must appear exactly once in the original file. Edits must not overlap.
+Each `oldText` must appear exactly once in the original file. Edits must not overlap. The file is rewritten in place only when the bytes actually change — a no-op edit returns `edit: PATH (no changes)` and leaves mtime and inode untouched — and targets above 16 MiB are rejected with `E_TOO_LARGE`.
 
 #### `run_in_terminal` — Start a persistent PTY session
 
@@ -268,9 +268,9 @@ boxsh distinguishes two kinds of errors per the MCP spec:
 | **Tool error** | `{"result": {"content": [{"type":"text","text":"E_...: ..."}], "structuredContent": {"code": "E_...", "message": "..."}, "isError": true}}` | File not found, not an image, unsupported format, bad base64 |
 | **Command failure** | `isError: true` with the normal command `structuredContent` (no `code`) | Non-zero exit code, timeout (`timed_out: true`) |
 
-Stable tool error codes: `E_INVALID_ARGUMENT`, `E_NOT_FOUND`, `E_NOT_TEXT`, `E_NOT_IMAGE`, `E_UNSUPPORTED_FORMAT`, `E_TOO_LARGE`, `E_TIMEOUT`, `E_SANDBOX`, `E_INTERNAL`. The full contract lives in [`docs/analysis-tool-result-contract.md`](docs/analysis-tool-result-contract.md).
+Stable tool error codes: `E_INVALID_ARGUMENT`, `E_NOT_FOUND`, `E_NOT_TEXT`, `E_NOT_IMAGE`, `E_UNSUPPORTED_FORMAT`, `E_TOO_LARGE`, `E_TIMEOUT`, `E_SANDBOX`, `E_INTERNAL`. Descriptions and examples are in the per-tool sections above; the contract is enforced by `tests/tool-contract.test.mjs` and `tests/file-tools-robustness.test.mjs`.
 
-Two `detail` fields disambiguate the cases where the code alone is not enough: `detail.sandbox` (with `detail.errno`) tells a sandbox denial from a file-permission denial on `E_SANDBOX`, and `detail.reason: "decode_failed"` tells a corrupt image from an unsupported format on `E_UNSUPPORTED_FORMAT`. `write`/`edit` report `detail.restored` when a failed write was rolled back.
+Two `detail` fields disambiguate the cases where the code alone is not enough: `detail.sandbox` (with `detail.errno`/`detail.errno_name`) tells a sandbox denial from a file-permission denial on `E_SANDBOX`, and `detail.reason: "decode_failed"` tells a corrupt image from an unsupported format on `E_UNSUPPORTED_FORMAT`. `write`/`edit` report `detail.restored` when a failed write was rolled back, and a symbolic link loop is `E_INVALID_ARGUMENT` (with `detail.errno_name: "ELOOP"`), not a missing file.
 
 ### Client configuration
 

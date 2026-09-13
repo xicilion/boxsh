@@ -6,7 +6,7 @@
  * live in ./fixture/.
  *
  * Two result shapes are valid after the contract refactor
- * (docs/analysis-tool-result-contract.md):
+ * (README.md "Built-in file tools"):
  *   - text files  → read returns the body, mime_type in structuredContent
  *   - everything else → read fails with E_NOT_TEXT / E_NOT_IMAGE and the
  *     detected MIME type in detail.mime

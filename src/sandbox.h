@@ -48,8 +48,8 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg);
 // Process-wide marker set by main() once sandbox_apply() has succeeded (the
 // restrictions are inherited by forked workers and shared by tool threads).
 // File tools use it when reporting EACCES/EPERM so that a caller can tell a
-// sandbox denial apart from a plain file-permission denial
-// (docs/analysis-tool-result-contract.md §2.2, `detail.sandbox`).
+// sandbox denial apart from a plain file-permission denial (reported as
+// `detail.sandbox` on the error result).
 inline bool &sandbox_active_ref() {
     static bool active = false;
     return active;

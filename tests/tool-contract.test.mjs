@@ -1,6 +1,6 @@
 /**
- * tool-contract.test.mjs — the tool result contract
- * (docs/analysis-tool-result-contract.md).
+ * tool-contract.test.mjs — the tool result contract (README.md "Error model";
+ * this file is its executable form).
  *
  * Verifies, without any external dependency:
  *   1. descriptors: every tool has title/description/inputSchema/outputSchema
@@ -180,7 +180,7 @@ describe('tool contract — descriptors', () => {
   });
 
   test('annotations match the contract table', () => {
-    // readOnlyHint / destructiveHint per docs/analysis-tool-result-contract.md §4
+    // readOnlyHint / destructiveHint per README.md ("Tools")
     const expected = {
       bash: [false, true],
       read: [true, false],

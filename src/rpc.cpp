@@ -640,7 +640,7 @@ std::string rpc_serialize_response(const RpcResponse &resp) {
 
 static std::string mcp_initialize_response(const json &id,
                                             const std::string &client_version) {
-    // Protocol version negotiation (docs/analysis-tool-result-contract.md §6):
+    // Protocol version negotiation (README.md "MCP server"):
     //  - client sent nothing        → our baseline (2025-06-18, the revision
     //                                  that standardizes structuredContent)
     //  - client sent a known older
@@ -1275,39 +1275,68 @@ static int stat_normalized(const std::string &path, struct stat *st,
 // RPC run loop
 // ---------------------------------------------------------------------------
 
-// Map errno to a stable error code (docs/analysis-tool-result-contract.md §2.2).
+// Map errno to a stable error code (README.md "Error model").
 static const char *errno_error_code(int err) {
     switch (err) {
-        case ENOENT:
-        case ELOOP:   return error_code::kNotFound;
+        case ENOENT:  return error_code::kNotFound;
         case EISDIR:
         case ENOTDIR:
         case ENAMETOOLONG:
-        case EINVAL:  return error_code::kInvalidArgument;
+        case EINVAL:
+        case ELOOP:   return error_code::kInvalidArgument;
         case EACCES:
         case EPERM:   return error_code::kSandbox;
         default:      return error_code::kInternal;
     }
 }
 
-// Human-readable errno text.  Permission failures carry the missing piece of
-// information: whether a sandbox is active (the path may simply not be
-// exposed) or this is a plain file-permission problem (contract §2.2).
-static std::string errno_message(int err) {
-    std::string msg = strerror(err);
-    if (err == EACCES || err == EPERM) {
-        msg += sandbox_active()
-            ? " (denied by the sandbox; expose the path with --bind)"
-            : " (file permissions; no sandbox is active)";
+// errno name for machine-readable detail payloads.
+static const char *errno_name(int err) {
+    switch (err) {
+        case ENOENT:        return "ENOENT";
+        case ELOOP:         return "ELOOP";
+        case EISDIR:        return "EISDIR";
+        case ENOTDIR:       return "ENOTDIR";
+        case ENAMETOOLONG:  return "ENAMETOOLONG";
+        case EINVAL:        return "EINVAL";
+        case EACCES:        return "EACCES";
+        case EPERM:         return "EPERM";
+        default:            return nullptr;
     }
-    return msg;
 }
 
-// `detail` payload for permission failures: lets a caller (and the model)
-// tell the two denial sources apart without a separate error code.
+// Human-readable errno text.  The message stays human (“what happened, what to
+// do next”); the raw errno travels in `detail` (contract §2.2) — so a sandbox
+// denial and a plain permission problem are told apart by errno, not guessed
+// from the fact that a sandbox happens to be active.
+static std::string errno_message(int err) {
+    switch (err) {
+        case EACCES:
+            return sandbox_active()
+                ? "Permission denied (file permissions; a sandbox is active, so "
+                  "the path may also need --bind to be writable)"
+                : "Permission denied (file permissions; no sandbox is active)";
+        case EPERM:
+            return sandbox_active()
+                ? "Operation not permitted (denied by the sandbox; expose the "
+                  "path with --bind)"
+                : "Operation not permitted (blocked by the OS)";
+        case ELOOP:
+            return "Too many levels of symbolic links (symbolic link loop)";
+        default:
+            return strerror(err);
+    }
+}
+
+// `detail` payload for failures where the code alone is not enough.
 static std::optional<json> errno_detail(int err) {
-    if (err != EACCES && err != EPERM) return std::nullopt;
-    return json{{"sandbox", sandbox_active()}, {"errno", err}};
+    if (err == EACCES || err == EPERM) {
+        json d = {{"sandbox", sandbox_active()}, {"errno", err}};
+        if (const char *name = errno_name(err)) d["errno_name"] = name;
+        return d;
+    }
+    if (err == ELOOP) return json{{"errno", err}, {"errno_name", "ELOOP"}};
+    return std::nullopt;
 }
 
 // File types whose open()/read() would block the tool thread forever.  A FIFO
@@ -1365,7 +1394,7 @@ static bool read_line_capped(std::istream &f, std::vector<char> &buf,
 }
 
 // read — text files only.  Images are view_image's job; anything binary is an
-// error (docs/analysis-tool-result-contract.md §5).
+// error (README.md "Built-in file tools").
 static ToolResult tool_read(const RpcRequest &req) {
     // Check file existence first, with macOS path normalization fallback.
     struct stat st;
@@ -1553,14 +1582,6 @@ static ToolResult tool_view_image(const RpcRequest &req) {
             return blocked;
     }
 
-    auto ft = detect_file_type(resolved_path);
-    if (ft.mime.rfind("image/", 0) != 0) {
-        return tool_error_result(error_code::kNotImage,
-            "view_image: " + req.path + " is not an image file (" + ft.mime +
-            "); use read for text files, or bash (file/xxd/strings) for other data",
-            json{{"mime", ft.mime}});
-    }
-
     std::ifstream f(resolved_path, std::ios::binary);
     if (!f) {
         int err = errno;
@@ -1570,6 +1591,19 @@ static ToolResult tool_view_image(const RpcRequest &req) {
     }
     std::string raw((std::istreambuf_iterator<char>(f)),
                      std::istreambuf_iterator<char>());
+
+    // Type detection runs on bytes we already read, so an unreadable file is
+    // reported as a permission/access problem instead of being misjudged as
+    // "not an image" (contract §2.5: same root cause, same code per tool).
+    const size_t probe_len = raw.size() < 8192 ? raw.size() : 8192;
+    auto ft = detect_file_type(reinterpret_cast<const unsigned char *>(raw.data()),
+                               probe_len);
+    if (ft.mime.rfind("image/", 0) != 0) {
+        return tool_error_result(error_code::kNotImage,
+            "view_image: " + req.path + " is not an image file (" + ft.mime +
+            "); use read for text files, or bash (file/xxd/strings) for other data",
+            json{{"mime", ft.mime}});
+    }
 
     const bool low_detail = (req.image_detail == "low");
     const int  max_edge   = low_detail ? 512 : 2000;
@@ -1710,6 +1744,18 @@ static ToolResult tool_write(const RpcRequest &req) {
     }
     const std::string &target = existed ? resolved : req.path;
 
+    // A trailing slash on something that is not an existing directory is a
+    // caller mistake: refuse it before creating anything (contract §四).
+    if (!existed && req.path.size() > 1 && req.path.back() == '/') {
+        return tool_error_result(error_code::kInvalidArgument,
+            "write: " + req.path + ": trailing slash on a path that is not an "
+            "existing directory; drop the slash to write a file there");
+    }
+
+    // Directories created by mkdir -p below; removed again if the write fails,
+    // so a failed call leaves no side effects (contract §四).
+    std::vector<std::string> created_dirs;
+
     std::ofstream f(req.path, std::ios::binary | std::ios::trunc);
     if (!f && errno == ENOENT) {
         // Auto-create parent directories (mkdir -p).
@@ -1720,7 +1766,8 @@ static ToolResult tool_write(const RpcRequest &req) {
             for (size_t i = 1; i <= dir.size(); ++i) {
                 if (i == dir.size() || dir[i] == '/') {
                     std::string part = dir.substr(0, i);
-                    mkdir(part.c_str(), 0755);
+                    if (mkdir(part.c_str(), 0755) == 0)
+                        created_dirs.push_back(part);
                 }
             }
             f.open(req.path, std::ios::binary | std::ios::trunc);
@@ -1728,6 +1775,9 @@ static ToolResult tool_write(const RpcRequest &req) {
     }
     if (!f) {
         int err = errno;
+        // rmdir only removes empty directories, so this cannot delete data.
+        for (auto it = created_dirs.rbegin(); it != created_dirs.rend(); ++it)
+            rmdir(it->c_str());
         return tool_error_result(errno_error_code(err),
             "write: cannot create file: " + req.path + ": " + errno_message(err),
             errno_detail(err));
@@ -1738,6 +1788,10 @@ static ToolResult tool_write(const RpcRequest &req) {
     if (!f) {
         int err = errno;
         const bool restored = restore_file(target, previous, existed);
+        if (!existed) {
+            for (auto it = created_dirs.rbegin(); it != created_dirs.rend(); ++it)
+                rmdir(it->c_str());
+        }
         json detail = {{"restored", restored}};
         return tool_error_result(errno_error_code(err),
             "write: failed writing to: " + req.path + ": " + errno_message(err) +
