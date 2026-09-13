@@ -295,12 +295,14 @@ export function run(args, input = '', timeout_ms = 5000) {
  * Like rpc() but returns the untouched JSON-RPC 2.0 response, so tests can
  * assert on the exact MCP shape (content array, structuredContent, isError).
  * @param {object} req
- * @param {{ workers?: number, timeout_ms?: number }} [opts]
+ * @param {{ workers?: number, timeout_ms?: number, sandbox?: boolean }} [opts]
  * @returns {object}
  */
-export function rpcRaw(req, { workers = 2, timeout_ms = 5000 } = {}) {
+export function rpcRaw(req, { workers = 2, timeout_ms = 5000, sandbox = false } = {}) {
   const line = JSON.stringify(toJsonRpc(req)) + '\n';
-  const r = run(['--rpc', '--workers', String(workers)], line, timeout_ms);
+  const args = ['--rpc', '--workers', String(workers)];
+  if (sandbox) args.push('--sandbox');
+  const r = run(args, line, timeout_ms);
   assert.equal(r.signal, null, `boxsh killed by signal ${r.signal}`);
   const trimmed = r.stdout.trim();
   assert.ok(trimmed.length > 0, 'boxsh produced no stdout');
@@ -342,12 +344,14 @@ export function rpcSandboxed(req, { workers = 2, timeout_ms = 8000 } = {}) {
  * Run boxsh in --rpc mode with multiple requests (written all at once via stdin).
  * Returns array of parsed responses in arrival order.
  * @param {object[]} requests
- * @param {{ workers?: number, timeout_ms?: number }} [opts]
+ * @param {{ workers?: number, timeout_ms?: number, sandbox?: boolean }} [opts]
  * @returns {object[]}
  */
-export function rpcMany(requests, { workers = 4, timeout_ms = 8000 } = {}) {
+export function rpcMany(requests, { workers = 4, timeout_ms = 8000, sandbox = false } = {}) {
   const input = requests.map(r => JSON.stringify(toJsonRpc(r))).join('\n') + '\n';
-  const r = run(['--rpc', '--workers', String(workers)], input, timeout_ms);
+  const args = ['--rpc', '--workers', String(workers)];
+  if (sandbox) args.push('--sandbox');
+  const r = run(args, input, timeout_ms);
   assert.equal(r.signal, null, `boxsh killed by signal ${r.signal}`);
   return r.stdout
     .trim()

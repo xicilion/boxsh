@@ -7,7 +7,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { rpc, rpcMany, rpcConcurrent, byId } from './helpers.mjs';
+import { rpc, rpcMany, rpcRaw, rpcConcurrent, rpcSandboxed, byId } from './helpers.mjs';
 
 // ---------------------------------------------------------------------------
 // --workers flag
@@ -247,5 +247,117 @@ describe('worker pool — large batches', () => {
       assert.ok(!String(resp.stderr).includes('worker crash, respawned'),
         `worker respawn detected in stderr for ${id}`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sandboxed exit codes — SIGCHLD inheritance regression
+// ---------------------------------------------------------------------------
+
+// In sandbox mode the coordinator becomes PID 1 of a new PID namespace and
+// installs a SIGCHLD handler that reaps every finished child (see the
+// "As PID 1, we must reap orphaned child processes" block in sandbox.cpp).
+// Signal dispositions are inherited across fork(), so the pre-forked workers
+// used to inherit that reaper.  When a worker's command child exited, the
+// inherited handler reaped it before the worker's own waitpid() in
+// run_shell_command() could collect it; waitpid() then failed with ECHILD,
+// the (previously unchecked) status stayed 0 and every sandboxed command
+// reported exit_code 0 — non-zero exits were silently reported as success.
+//
+// Reproduced against the pre-fix build:
+//   printf '%s\n' '{"jsonrpc":"2.0","id":"1","method":"tools/call",
+//     "params":{"name":"bash","arguments":{"command":"exit 42"}}}' \
+//     | build/boxsh --rpc --workers 1 --sandbox
+//   → "exit_code":0   (real exit code: 42)
+//
+// The fix (spawn_worker) resets SIGCHLD to SIG_DFL in the forked worker, and
+// run_shell_command() reports -1 rather than 0 when waitpid() fails.  These
+// tests must fail if either half of the regression comes back.
+
+describe('worker pool — sandboxed exit codes (SIGCHLD inheritance)', () => {
+  test('sandboxed RPC reports non-zero exit codes verbatim', () => {
+    for (const code of [1, 3, 42, 255]) {
+      const resp = rpcSandboxed({ id: `e${code}`, cmd: `exit ${code}` },
+                                { workers: 1 });
+      assert.equal(resp.exit_code, code,
+        `sandboxed 'exit ${code}' reported exit_code ${resp.exit_code}`);
+    }
+  });
+
+  test('sandboxed RPC reports 0 for successful commands', () => {
+    const resp = rpcSandboxed({ id: 'ok', cmd: 'true' }, { workers: 1 });
+    assert.equal(resp.exit_code, 0);
+    assert.notEqual(resp.isError, true,
+      'successful sandboxed command was marked as an error');
+  });
+
+  test('sandboxed RPC preserves stdout of a failing command', () => {
+    const resp = rpcSandboxed({ id: 'out7', cmd: 'echo before; exit 7' },
+                              { workers: 1 });
+    assert.equal(resp.stdout, 'before\n');
+    assert.equal(resp.exit_code, 7,
+      'stdout survived but the exit code was lost');
+  });
+
+  test('sandboxed RPC reports signal deaths as 128+signo', () => {
+    const term = rpcSandboxed({ id: 'term', cmd: 'kill -TERM $$' },
+                              { workers: 1 });
+    assert.equal(term.exit_code, 128 + 15,
+      `SIGTERM death reported as ${term.exit_code}, expected 143`);
+    const kill9 = rpcSandboxed({ id: 'kill9', cmd: 'kill -9 $$' },
+                               { workers: 1 });
+    assert.equal(kill9.exit_code, 128 + 9,
+      `SIGKILL death reported as ${kill9.exit_code}, expected 137`);
+  });
+
+  test('sandboxed non-zero exit is marked as an error result', () => {
+    // Guards the end-to-end contract: pre-fix, `exit 13` produced
+    // exit_code 0 and no isError flag, i.e. a silent success.
+    const raw = rpcRaw({
+      id: 'rawerr',
+      cmd: 'exit 13',
+    }, { workers: 1, sandbox: true });
+    assert.equal(raw.result?.isError, true,
+      `non-zero sandboxed exit not marked isError: ${JSON.stringify(raw)}`);
+    assert.equal(raw.result?.structuredContent?.exit_code, 13,
+      `expected exit_code 13, got: ${JSON.stringify(raw.result)}`);
+  });
+
+  test('sandboxed batch keeps exit codes independent (1 worker)', () => {
+    const codes = [0, 1, 2, 3, 7, 42];
+    const reqs = codes.map((c, i) => ({ id: `s${i}`, cmd: `exit ${c}` }));
+    // A command that also produces output must not change the outcome.
+    reqs.push({ id: 'slow', cmd: 'sleep 0.1; echo late; exit 5' });
+    const resps = rpcMany(reqs, { workers: 1, sandbox: true, timeout_ms: 20000 });
+    assert.equal(resps.length, reqs.length);
+    const m = byId(resps);
+    codes.forEach((c, i) => {
+      assert.equal(m[`s${i}`].exit_code, c,
+        `request s${i} ('exit ${c}') reported ${m[`s${i}`].exit_code}`);
+    });
+    assert.equal(m['slow'].stdout, 'late\n');
+    assert.equal(m['slow'].exit_code, 5);
+  });
+
+  test('sandboxed batch keeps exit codes independent (4 workers)', () => {
+    // Every worker inherits from the coordinator, so each worker must reset
+    // SIGCHLD itself; use enough requests to hit all four workers.
+    const codes = [3, 0, 9, 1, 7, 0, 255, 2];
+    const reqs = codes.map((c, i) => ({ id: `p${i}`, cmd: `exit ${c}` }));
+    const resps = rpcMany(reqs, { workers: 4, sandbox: true, timeout_ms: 20000 });
+    assert.equal(resps.length, reqs.length);
+    const m = byId(resps);
+    codes.forEach((c, i) => {
+      assert.equal(m[`p${i}`].exit_code, c,
+        `request p${i} ('exit ${c}') reported ${m[`p${i}`].exit_code}`);
+    });
+  });
+
+  test('non-sandboxed exit codes are unaffected (control)', () => {
+    const codes = [0, 1, 42];
+    const resps = rpcMany(codes.map((c, i) => ({ id: `n${i}`, cmd: `exit ${c}` })),
+                          { workers: 1 });
+    const m = byId(resps);
+    codes.forEach((c, i) => assert.equal(m[`n${i}`].exit_code, c));
   });
 });

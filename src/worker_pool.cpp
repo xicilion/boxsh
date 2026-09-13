@@ -246,7 +246,15 @@ static void run_shell_command(const std::string &shell_path,
     close(pfd_err[0]);
 
     int status = 0;
-    waitpid(child, &status, 0);
+    // waitpid() must own this child: if it fails (ECHILD — e.g. another
+    // SIGCHLD reaper got there first) the status is unknown, so report -1
+    // instead of silently claiming success (exit code 0).
+    if (waitpid(child, &status, 0) < 0) {
+        exit_code = -1;
+        stdout_out = std::move(out_buf);
+        stderr_out = std::move(err_buf);
+        return;
+    }
     if (WIFEXITED(status))
         exit_code = WEXITSTATUS(status);
     else if (WIFSIGNALED(status))
@@ -381,6 +389,17 @@ void WorkerPool::spawn_worker(Worker &w) {
 
         // The coordinator has already applied the sandbox before forking, so
         // no sandbox_apply() call is needed here.
+        //
+        // Reset SIGCHLD to the default disposition.  In sandbox mode the
+        // coordinator runs as PID 1 of the new PID namespace and installs a
+        // SIGCHLD handler that reaps every finished child (sandbox.cpp
+        // "As PID 1, we must reap orphaned child processes").  Signal
+        // dispositions are inherited across fork(), so without this reset the
+        // worker's own waitpid() in run_shell_command() would race with that
+        // handler, lose the child status (ECHILD) and report exit code 0 for
+        // every sandboxed command.
+        signal(SIGCHLD, SIG_DFL);
+
         worker_loop(sv[1], cfg_.shell_path);
         _exit(0);
     }
