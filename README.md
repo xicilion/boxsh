@@ -201,7 +201,7 @@ Returns the image as an MCP `image` content block plus `structuredContent` metad
  "params":{"name":"write", "arguments":{"path":"/tmp/hello.txt", "content":"hello\n"}}}
 ```
 
-Creates or overwrites the file. Parent directories are created automatically if needed. The write is in place (timestamps aside, the file's identity, mode bits, hard links and symlinks are preserved) and a failed call leaves nothing behind: directories created for it are removed again, a trailing slash on a path that is not an existing directory is refused up front, and a partially written file is rolled back on a best-effort basis (`detail.restored`). The result reports `created`, `bytes` and the model-facing text `write: PATH (created|overwrote existing, N bytes)`.
+Creates or overwrites the file. Parent directories are created automatically if needed. The write is in place (timestamps aside, the file's identity, mode bits, hard links and symlinks are preserved) and a failed call leaves nothing behind: directories created for it are removed again, a trailing slash on a path that is not an existing directory is refused up front, and a partially written file is rolled back on a best-effort basis (`detail.restored`). The result reports `created`, `bytes` and the model-facing text `write: PATH (created|overwrote existing, N bytes)`. A dangling symlink is followed (POSIX `open(2)` semantics, like `echo x > link`): the write creates the link's target and keeps the link.
 
 #### `edit` — Search-and-replace edit
 
@@ -270,7 +270,16 @@ boxsh distinguishes two kinds of errors per the MCP spec:
 
 Stable tool error codes: `E_INVALID_ARGUMENT`, `E_NOT_FOUND`, `E_NOT_TEXT`, `E_NOT_IMAGE`, `E_UNSUPPORTED_FORMAT`, `E_TOO_LARGE`, `E_TIMEOUT`, `E_SANDBOX`, `E_INTERNAL`. Descriptions and examples are in the per-tool sections above; the contract is enforced by `tests/tool-contract.test.mjs` and `tests/file-tools-robustness.test.mjs`.
 
-Two `detail` fields disambiguate the cases where the code alone is not enough: `detail.sandbox` (with `detail.errno`/`detail.errno_name`) tells a sandbox denial from a file-permission denial on `E_SANDBOX`, and `detail.reason: "decode_failed"` tells a corrupt image from an unsupported format on `E_UNSUPPORTED_FORMAT`. `write`/`edit` report `detail.restored` when a failed write was rolled back, and a symbolic link loop is `E_INVALID_ARGUMENT` (with `detail.errno_name: "ELOOP"`), not a missing file.
+Every tool error sets `isError: true` and carries `structuredContent.{code, message, detail?}`; the readable `content[0].text` always starts with `"<CODE>: "` (e.g. `E_NOT_FOUND: read: ...`), so a client that only forwards text can still detect failures by that prefix. `detail` disambiguates the cases where the code alone is not enough:
+
+| `detail` | Meaning |
+|---|---|
+| `sandbox` + `errno`/`errno_name` | on `E_SANDBOX`: a sandbox denial vs a file-permission denial |
+| `reason: "decode_failed"` | on `E_UNSUPPORTED_FORMAT`: a corrupt file vs a format outside the decode set |
+| `kind: "dangling_symlink"` + `target` | on `E_NOT_FOUND`: a broken symlink (with its target) vs a path that never existed |
+| `kind: "fifo"` / `"socket"` | on `E_INVALID_ARGUMENT`: a blocking target the file tools refuse |
+| `errno_name: "ELOOP"` | on `E_INVALID_ARGUMENT`: a symbolic link loop |
+| `restored` | on `write`/`edit` failures: whether the previous content was restored |
 
 ### Client configuration
 

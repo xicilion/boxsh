@@ -548,6 +548,61 @@ describe('write — semantics', () => {
 });
 
 // ---------------------------------------------------------------------------
+// dangling symlinks: E_NOT_FOUND stays, but the diagnosis is explicit
+// ---------------------------------------------------------------------------
+
+describe('file tools — dangling symlinks', () => {
+  test('a broken symlink carries detail.kind=dangling_symlink and its target', () => {
+    // Without this, a typo, an undeployed file and a broken link were three
+    // identical E_NOT_FOUND answers — and a "create it" retry would follow the
+    // link and produce an unintended file.
+    const link = p('dangle.txt');
+    fs.symlinkSync('missing-target.txt', link);
+    try {
+      for (const [name, args] of [
+        ['read', { path: link }],
+        ['view_image', { path: link }],
+        ['edit', { path: link, edits: [{ oldText: 'a', newText: 'b' }] }],
+      ]) {
+        const resp = call(name, args);
+        assertToolError(resp, 'E_NOT_FOUND', `${name} dangling symlink`);
+        assert.equal(detailOf(resp).kind, 'dangling_symlink', `${name}: detail.kind`);
+        assert.equal(detailOf(resp).target, 'missing-target.txt', `${name}: detail.target`);
+        assert.match(textOf(resp), /broken symbolic link to missing-target\.txt/,
+          `${name}: the message must name the link target`);
+      }
+    } finally {
+      fs.rmSync(link, { force: true });
+    }
+  });
+
+  test('a path that never existed carries no dangling-symlink detail', () => {
+    const resp = call('read', { path: p('never-existed.txt') });
+    assertToolError(resp, 'E_NOT_FOUND', 'missing path');
+    assert.equal(detailOf(resp).kind, undefined,
+      'a plain missing path must not be reported as a broken link');
+    assert.ok(!/broken symbolic link/.test(textOf(resp)));
+  });
+
+  test('writing through a dangling symlink creates the target and keeps the link', () => {
+    // POSIX open(2) semantics (the same as `echo x > link`): the write follows
+    // the link.  Documented in README.md ("write").
+    const link = p('dangle-write.txt');
+    const target = p('dangle-target.txt');
+    fs.symlinkSync(target, link);
+    try {
+      const resp = call('write', { path: link, content: 'x\n' });
+      assert.ok(!isToolError(resp), `unexpected error: ${textOf(resp)}`);
+      assert.equal(fs.lstatSync(link).isSymbolicLink(), true, 'the link must survive');
+      assert.equal(fs.readFileSync(target, 'utf8'), 'x\n');
+    } finally {
+      fs.rmSync(link, { force: true });
+      fs.rmSync(target, { force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // write: a failed call must not leave any side effect (v2 report P0-1)
 // ---------------------------------------------------------------------------
 

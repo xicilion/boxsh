@@ -1339,6 +1339,28 @@ static std::optional<json> errno_detail(int err) {
     return std::nullopt;
 }
 
+// A dangling symbolic link keeps E_NOT_FOUND (its target really is missing, as
+// POSIX tools report it), but the caller must be able to tell it from a typo or
+// an undeployed file — otherwise a retry policy that reads "create it" would
+// follow the link and produce an unintended file.  lstat() + readlink() supply
+// the missing piece (README "Error model").
+static std::optional<ToolResult> broken_symlink_result(const std::string &tool,
+                                                       const std::string &path) {
+    struct stat lst;
+    if (lstat(path.c_str(), &lst) != 0 || !S_ISLNK(lst.st_mode))
+        return std::nullopt;
+
+    char buf[4096];
+    ssize_t n = readlink(path.c_str(), buf, sizeof(buf) - 1);
+    if (n < 0) return std::nullopt;
+    std::string target(buf, static_cast<size_t>(n));
+
+    return tool_error_result(error_code::kNotFound,
+        tool + ": cannot open file: " + path + ": " + errno_message(ENOENT) +
+        " (broken symbolic link to " + target + ")",
+        json{{"kind", "dangling_symlink"}, {"target", target}});
+}
+
 // File types whose open()/read() would block the tool thread forever.  A FIFO
 // with no writer blocks in open(); a unix socket cannot be opened as a file.
 // Both must be rejected before the open (contract §2.5).
@@ -1401,6 +1423,10 @@ static ToolResult tool_read(const RpcRequest &req) {
     std::string resolved_path;
     if (stat_normalized(req.path, &st, resolved_path) != 0) {
         int err = errno;
+        if (err == ENOENT) {
+            if (auto broken = broken_symlink_result("read", req.path))
+                return *broken;
+        }
         return tool_error_result(errno_error_code(err),
             "read: cannot open file: " + req.path + ": " + errno_message(err),
             errno_detail(err));
@@ -1566,6 +1592,10 @@ static ToolResult tool_view_image(const RpcRequest &req) {
     std::string resolved_path;
     if (stat_normalized(req.path, &st, resolved_path) != 0) {
         int err = errno;
+        if (err == ENOENT) {
+            if (auto broken = broken_symlink_result("view_image", req.path))
+                return *broken;
+        }
         return tool_error_result(errno_error_code(err),
             "view_image: cannot open file: " + req.path + ": " + errno_message(err),
             errno_detail(err));
@@ -1818,6 +1848,10 @@ static ToolResult tool_edit(const RpcRequest &req) {
     bool exists = (stat_normalized(req.path, &st, resolved_path) == 0);
     if (!exists) {
         int err = errno;   // ENOENT / ELOOP
+        if (err == ENOENT) {
+            if (auto broken = broken_symlink_result("edit", req.path))
+                return *broken;
+        }
         return tool_error_result(errno_error_code(err),
             "edit: cannot open file: " + req.path + ": " + errno_message(err),
             errno_detail(err));
