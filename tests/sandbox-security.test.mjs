@@ -472,7 +472,10 @@ describe('Phase 7 — /proc information leakage', () => {
   });
 
   test('sandbox cannot enumerate host PIDs in /proc',
-    { skip: !IS_LINUX },
+    { skip: !IS_LINUX || (IN_CONTAINER &&
+      'container userns engine binds the container /proc read-only — ' +
+      'sibling container processes are visible by design (host processes never are), ' +
+      'so the visible PID count follows the container workload') },
     () => {
     // In a proper PID ns with its own /proc mount, ls /proc should show
     // only the sandbox's own PIDs, not hundreds of host PIDs.

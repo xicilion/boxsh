@@ -536,7 +536,7 @@ node --test tests/index.test.mjs
 | `protocol-regression.test.mjs` | Content-Length transport, ID type preservation, initialize handshake, error distinction |
 | `docker.test.mjs` | Container engine contract: engine switch, COW via fuse-overlayfs, sandbox isolation (run by `docker-test.sh`, not in `index.test.mjs`) |
 | `docker-negative.test.mjs` | Negative path: COW without `/dev/fuse` reports actionable error (run by `docker-test.sh`, not in `index.test.mjs`) |
-| `docker-test.sh` | Dev/CI Docker test runner: supports `--vol=bind` (host-mapped) and `--vol=tmpfs` (ephemeral) modes |
+| `docker-test.sh` | Dev/CI Docker test runner: supports `--vol=bind` (host-mapped) and `--vol=tmpfs` (ephemeral) modes. On a macOS host it mounts `build/boxsh-linux` into the container (a Mach-O build cannot run there) and prints the one-line command that produces it when the file is missing |
 
 ---
 

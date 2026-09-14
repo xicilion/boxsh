@@ -769,11 +769,20 @@ static bool bind_mount(const std::string &src, const std::string &dst,
     if (S_ISDIR(st.st_mode)) {
         if (!mkdir_p(dst, 0755, err)) return false;
     } else {
-        // For regular files create an empty file as mount point.
+        // For regular files create an empty file as mount point.  The target
+        // may already exist as a 0444 protection placeholder: opening it for
+        // write then relies on CAP_DAC_OVERRIDE, which does not apply on
+        // filesystems whose permission checks happen outside our user
+        // namespace (FUSE / virtiofs, i.e. bind mounts from a host into a
+        // container).  Anchoring a bind mount only needs the path to exist, so
+        // a failed open on an existing target is not an error.
         int fd = open(dst.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
-        if (fd < 0 && errno != EEXIST) {
-            err = errno_str(("create bind-mount file dst: " + dst).c_str());
-            return false;
+        if (fd < 0) {
+            struct stat dst_st;
+            if (lstat(dst.c_str(), &dst_st) != 0) {
+                err = errno_str(("create bind-mount file dst: " + dst).c_str());
+                return false;
+            }
         }
         if (fd >= 0) close(fd);
     }

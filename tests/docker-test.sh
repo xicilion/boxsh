@@ -39,14 +39,39 @@ esac
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
-BINARY="$PROJECT_ROOT/build/boxsh"
 
-# --- 1. Ensure the host binary exists --------------------------------------
+# --- 1. Ensure a binary the container can execute exists --------------------
+# The container runs Linux, so on a macOS host the native build/boxsh (Mach-O)
+# cannot be used.  build/boxsh-linux is produced by the dockerised Linux build
+# (see .github/workflows/build.sh for the release flavour) and is bind-mounted
+# over /src/build/boxsh inside the container, so every suite keeps using the
+# documented BOXSH=/src/build/boxsh path.
+BIN_MOUNT=""
+if [ "$(uname)" = "Darwin" ]; then
+    BINARY="$PROJECT_ROOT/build/boxsh-linux"
+    if [ ! -x "$BINARY" ] || ! file "$BINARY" | grep -q ELF; then
+        cat >&2 <<'EOF'
+==> build/boxsh-linux is missing (or is not a Linux ELF binary).
 
-if [ ! -x "$BINARY" ]; then
-    echo "==> Building boxsh on the host (build/boxsh not found)"
-    cmake -B "$PROJECT_ROOT/build" -S "$PROJECT_ROOT" -DCMAKE_BUILD_TYPE=Debug
-    cmake --build "$PROJECT_ROOT/build" --parallel "$(nproc)"
+Build it from the project root first:
+
+  docker run --rm -v "$PWD:/src" -w /src node:22-bookworm bash -c '
+    apt-get update -qq && apt-get install -y -qq cmake g++ make &&
+    cmake -B build/linux -S . -DCMAKE_BUILD_TYPE=Release &&
+    cmake --build build/linux --parallel 4 &&
+    cp build/linux/boxsh build/boxsh-linux'
+
+EOF
+        exit 1
+    fi
+    BIN_MOUNT="-v $BINARY:/src/build/boxsh:ro"
+else
+    BINARY="$PROJECT_ROOT/build/boxsh"
+    if [ ! -x "$BINARY" ]; then
+        echo "==> Building boxsh on the host (build/boxsh not found)"
+        cmake -B "$PROJECT_ROOT/build" -S "$PROJECT_ROOT" -DCMAKE_BUILD_TYPE=Debug
+        cmake --build "$PROJECT_ROOT/build" --parallel "$(nproc)"
+    fi
 fi
 echo "==> Using binary: $BINARY"
 
@@ -94,7 +119,9 @@ run_suites() {
       ;;
   esac
 
-  local COMMON="-w /src -e BOXSH=/src/build/boxsh $IMAGE_TAG"
+  # BIN_MOUNT overlays /src/build/boxsh with the Linux binary on macOS hosts
+  # and must come after $VOL_OPTS (which mounts /src).
+  local COMMON="-w /src -e BOXSH=/src/build/boxsh $BIN_MOUNT $IMAGE_TAG"
 
   # In bind mode /src/temp is gitignored (absent in a fresh checkout) and
   # owned by the host user; create it and make it writable for uid 65534
