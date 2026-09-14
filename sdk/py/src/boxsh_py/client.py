@@ -99,7 +99,11 @@ class ReadResult:
 
 @dataclass(frozen=True)
 class ViewImageResult:
-    """Result of the view_image tool (animated sources give their first frame)."""
+    """Result of the view_image tool (animated sources give their first frame).
+
+    Formats outside the model-native set (jpeg/png/gif/webp) are converted to
+    PNG/JPEG before being returned — ``converted`` is True in that case.
+    """
 
     data: str          # base64-encoded image payload
     mime_type: str     # MIME type of the returned image
@@ -111,6 +115,7 @@ class ViewImageResult:
     size: int          # size of the original file in bytes
     animated: bool     # source was animated; only the first frame is returned
     text: str          # model-facing text, e.g. "[Image: image/png, 200x133]"
+    converted: bool = False  # re-encoded (e.g. BMP/TIFF -> PNG/JPEG); see text
 
 
 @dataclass(frozen=True)
@@ -381,8 +386,11 @@ class BoxshClient:
 
         detail="low" returns a 512px preview instead of the default 2000px.
         Animated GIF/APNG/WebP sources are re-encoded to their first frame.
-        Other image formats (avif, heic, jxl, ...) raise
-        BoxshClientError with code E_UNSUPPORTED_FORMAT.
+        Formats outside the model-native set (jpeg/png/gif/webp) are converted
+        to PNG/JPEG (``converted=True``), so the returned payload is always
+        something multimodal models can ingest.  Other image formats
+        (avif, heic, jxl, ...) raise BoxshClientError with code
+        E_UNSUPPORTED_FORMAT.
         """
         arguments: Dict[str, Any] = {"path": _path_str(file_path)}
         if detail is not None:
@@ -402,6 +410,7 @@ class BoxshClient:
             was_resized=bool(structured.get("was_resized", False)),
             size=int(structured.get("size", 0)),
             animated=bool(structured.get("animated", False)),
+            converted=bool(structured.get("converted", False)),
             text=self._text_of(result),
         )
 

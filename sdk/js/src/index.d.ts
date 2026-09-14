@@ -67,6 +67,12 @@ export interface ViewImageResult {
     size: number;
     /** True when the source was animated (only the first frame is returned). */
     animated: boolean;
+    /**
+     * True when the file was re-encoded (e.g. BMP/TIFF → PNG/JPEG) so the
+     * returned format is one multimodal models ingest natively
+     * (jpeg/png/gif/webp pass through unchanged).
+     */
+    converted: boolean;
     /** Model-facing text such as "[Image: image/png, 200x133]". */
     text: string;
 }

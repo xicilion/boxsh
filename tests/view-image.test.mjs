@@ -194,15 +194,38 @@ describe('view_image — positive', () => {
     assert.equal(scOf(resp).was_resized, false, 'dimensions were not changed');
   });
 
-  test('gif, jpeg and bmp are decoded as well', () => {
+  test('jpeg and gif pass through in their native format', () => {
     for (const [name, expectedMime] of [['fixture.gif', 'image/gif'],
-                                       ['fixture.jpg', 'image/jpeg'],
-                                       ['fixture.bmp', 'image/bmp']]) {
+                                       ['fixture.jpg', 'image/jpeg']]) {
       const resp = viewImage({ path: fixture(name) });
       assert.ok(!isError(resp), `${name}: unexpected error: ${textOf(resp)}`);
       assert.equal(scOf(resp).mime_type, expectedMime);
+      assert.equal(scOf(resp).converted, false,
+        `${name}: model-native format must not be re-encoded`);
       assert.ok(imageOf(resp).data.length > 0, `${name}: image data missing`);
     }
+  });
+
+  test('bmp is converted to a model-native format (png/jpeg)', () => {
+    // Multimodal models ingest jpeg/png/gif/webp natively; everything else
+    // (bmp, tiff, …) must be re-encoded so the client model can see it.
+    const resp = viewImage({ path: fixture('fixture.bmp') });
+    assert.ok(!isError(resp), `unexpected error: ${textOf(resp)}`);
+
+    const sc = scOf(resp);
+    assert.equal(sc.converted, true);
+    assert.ok(['image/png', 'image/jpeg'].includes(sc.mime_type),
+      `expected a converted still, got ${sc.mime_type}`);
+    assert.equal(sc.width, 200, 'dimensions must be preserved');
+    assert.equal(sc.height, 133);
+    assert.equal(sc.was_resized, false, 'conversion is not a resize');
+    assert.match(textOf(resp), /converted from image\/bmp/);
+    assert.match(textOf(resp), /^\[Image: (image\/png|image\/jpeg), 200x133, converted from image\/bmp\]$/);
+
+    // The payload must differ from the original BMP bytes (it is re-encoded).
+    assert.ok(!Buffer.from(imageOf(resp).data, 'base64')
+                 .equals(fs.readFileSync(fixture('fixture.bmp'))),
+      'converted output must not be the original BMP bytes');
   });
 
   test('webp is decoded (vendored libwebp decoder)', () => {

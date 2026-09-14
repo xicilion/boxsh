@@ -300,6 +300,15 @@ static bool mime_is_decodable(const std::string &mime) {
     return false;
 }
 
+// Formats multimodal models ingest natively.  view_image may return these
+// as-is (re-encoded only when the source is animated); every other decodable
+// format (bmp, tiff, …) is converted to PNG/JPEG so the client model can
+// actually see the image.
+static bool mime_is_model_native(const std::string &mime) {
+    return mime == "image/jpeg" || mime == "image/png" ||
+           mime == "image/gif"  || mime == "image/webp";
+}
+
 } // namespace
 
 // Convenience constructor for a failed tool result.
@@ -787,10 +796,12 @@ static std::string mcp_tools_list_response(const json &id) {
          std::string("View an image file (") + supported_image_formats() +
          "). Returns the image itself plus its metadata; oversized images are "
          "downscaled to a 2000px longest edge. Use detail=\"low\" for a 512px "
-         "preview. Animated sources return their first frame only. Other image "
-         "formats (avif, heic, jxl, psd, \xe2\x80\xa6) are reported as unsupported. "
-         "The target must be a regular image file; files above 100 MP are "
-         "rejected without being decoded."},
+         "preview. Animated sources return their first frame only. Formats "
+         "outside the model-native set (jpeg/png/gif/webp) are converted to "
+         "PNG/JPEG, so the payload is always something a multimodal model can "
+         "ingest. Other image formats (avif, heic, jxl, psd, \xe2\x80\xa6) are "
+         "reported as unsupported. The target must be a regular image file; "
+         "files above 100 MP are rejected without being decoded."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
@@ -811,7 +822,8 @@ static std::string mcp_tools_list_response(const json &id) {
                 {"original_height", {{"type", "integer"}, {"description", "Height of the file's image before resizing"}}},
                 {"was_resized", {{"type", "boolean"}, {"description", "Whether the image was downscaled"}}},
                 {"size", {{"type", "integer"}, {"description", "Size of the original file in bytes"}}},
-                {"animated", {{"type", "boolean"}, {"description", "Animated source — only the first frame is returned"}}}
+                {"animated", {{"type", "boolean"}, {"description", "Animated source — only the first frame is returned"}}},
+                {"converted", {{"type", "boolean"}, {"description", "Source format was outside the model-native set (jpeg/png/gif/webp) and was re-encoded to PNG/JPEG"}}}
             }},
             {"required", json::array({"encoding", "mime_type", "width", "height",
                                      "original_width", "original_height", "was_resized", "size"})}
@@ -1639,10 +1651,15 @@ static ToolResult tool_view_image(const RpcRequest &req) {
     const int  max_edge   = low_detail ? 512 : 2000;
 
     // Animated sources must return their first frame only: re-encode instead
-    // of handing back the original (possibly animated) file bytes.
+    // of handing back the original (possibly animated) file bytes.  The same
+    // re-encode path is forced for formats outside the model-native set
+    // (jpeg/png/gif/webp) — a small BMP or TIFF would otherwise be passed
+    // through byte-for-byte in a format most multimodal models cannot ingest.
     const bool animated = image_is_animated(raw, ft.mime);
+    const bool convert  = !mime_is_model_native(ft.mime);
     auto img = resize_image(raw, ft.mime, max_edge, max_edge,
-                            kMaxImageBase64Bytes, /*always_reencode=*/animated);
+                            kMaxImageBase64Bytes,
+                            /*always_reencode=*/animated || convert);
 
     if (img.status == ImageResizeStatus::TooManyPixels) {
         // Header-declared dimensions exceeded the pixel budget; nothing was
@@ -1696,6 +1713,7 @@ static ToolResult tool_view_image(const RpcRequest &req) {
                 "x" + std::to_string(img.original_height);
     if (low_detail) text += ", low detail";
     if (animated)   text += ", animated, first frame";
+    if (convert)    text += ", converted from " + ft.mime;
     text += "]";
     tr.text = std::move(text);
 
@@ -1707,7 +1725,8 @@ static ToolResult tool_view_image(const RpcRequest &req) {
                {"original_height", img.original_height},
                {"was_resized", img.was_resized},
                {"size", (uint64_t)raw.size()},
-               {"animated", animated}};
+               {"animated", animated},
+               {"converted", convert}};
     tr.structured = std::move(sc);
     return tr;
 }

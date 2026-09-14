@@ -230,11 +230,13 @@ export class BoxshClient {
     /**
      * View an image file (png, jpeg, gif, bmp, tiff, webp).
      * Other image formats (avif, heic, jxl, …) are rejected with
-     * E_UNSUPPORTED_FORMAT.
+     * E_UNSUPPORTED_FORMAT.  Formats outside the model-native set
+     * (jpeg/png/gif/webp) are converted to PNG/JPEG before being returned
+     * (`converted: true`, e.g. BMP/TIFF → PNG/JPEG).
      *
      * @param {string} filePath          Absolute path to the image
      * @param {'auto'|'low'} [detail]    'low' returns a 512px preview
-     * @returns {Promise<{ data: string, mimeType: string, width: number, height: number, original_width: number, original_height: number, was_resized: boolean, size: number, animated: boolean, text: string }>}
+     * @returns {Promise<{ data: string, mimeType: string, width: number, height: number, original_width: number, original_height: number, was_resized: boolean, size: number, animated: boolean, converted: boolean, text: string }>}
      */
     async viewImage(filePath, detail) {
         const args = { path: filePath };
@@ -257,6 +259,7 @@ export class BoxshClient {
             was_resized:     sc.was_resized ?? false,
             size:            sc.size ?? 0,
             animated:        sc.animated ?? false,
+            converted:       sc.converted ?? false,
             text:            textOf(result),
         };
     }

@@ -51,8 +51,9 @@ struct ResizedImage {
 // raw: raw file bytes (not base64)
 // mime: detected MIME type of the input
 // always_reencode: skip the "return the original bytes" fast path — used for
-//                  animated sources, which must be re-encoded so that only the
-//                  first frame is returned (contract §2.3).
+//                  animated sources (contract §2.3) and for formats outside
+//                  the model-native set (jpeg/png/gif/webp): BMP, TIFF, … are
+//                  converted to PNG/JPEG so multimodal models can ingest them.
 ResizedImage resize_image(const std::string &raw, const std::string &mime,
                           int max_width = 2000, int max_height = 2000,
                           size_t max_bytes = kMaxImageBase64Bytes,

@@ -255,7 +255,7 @@ Binary files are rejected: images with `E_NOT_IMAGE` (use `viewImage`) and other
 
 ### `client.viewImage(path, detail?) → Promise<ViewImageResult>`
 
-View an image (png, jpeg, gif, bmp, tiff, webp). `detail: 'low'` returns a 512px preview instead of the 2000px default. Animated GIF/APNG/WebP sources are re-encoded so only the first frame comes back. Other image formats (avif, heic, jxl, …) are rejected with `E_UNSUPPORTED_FORMAT`. `ViewImageResult` has fields: `data` (base64), `mimeType`, `width`, `height`, `original_width`, `original_height`, `was_resized`, `size`, `animated`, and the model-facing `text`.
+View an image (png, jpeg, gif, bmp, tiff, webp). `detail: 'low'` returns a 512px preview instead of the 2000px default. Animated GIF/APNG/WebP sources are re-encoded so only the first frame comes back. Formats outside the model-native set (jpeg/png/gif/webp) are converted to PNG/JPEG with `converted: true`, so the payload is always something a multimodal model can ingest. Other image formats (avif, heic, jxl, …) are rejected with `E_UNSUPPORTED_FORMAT`. `ViewImageResult` has fields: `data` (base64), `mimeType`, `width`, `height`, `original_width`, `original_height`, `was_resized`, `size`, `animated`, `converted`, and the model-facing `text`.
 
 ### `client.write(path, content) → Promise<void>`
 
