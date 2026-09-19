@@ -12,6 +12,7 @@
 #include <ctime>
 #include <algorithm>
 #include <chrono>
+#include <thread>
 
 #include <unistd.h>
 #include <signal.h>
@@ -78,6 +79,12 @@ static bool read_msg(int fd, std::string &out, int timeout_ms = -1) {
 
 // Capture all output from executing a shell command.
 // Spawns a grandchild, reads stdout+stderr pipes, returns them in 'out'/'err'.
+//
+// 'cancel_fd' is the worker's socket back to the coordinator.  A worker never
+// receives work while a command runs, so anything arriving on that fd (EOF
+// included) means "the coordinator is gone or wants this command to stop".
+// Watching it inside the poll loop is what keeps a killed or disconnected
+// coordinator from leaving the command's process group behind.
 static void run_shell_command(const std::string &shell_path,
                               const std::string &cmd,
                               int timeout_sec,
@@ -86,10 +93,13 @@ static void run_shell_command(const std::string &shell_path,
                               int &exit_code,
                               bool &stdout_truncated,
                               bool &stderr_truncated,
-                              bool &timed_out) {
+                              bool &timed_out,
+                              int cancel_fd = -1,
+                              bool *cancelled_out = nullptr) {
     stdout_truncated = false;
     stderr_truncated = false;
     timed_out = false;
+    if (cancelled_out) *cancelled_out = false;
     int pfd_out[2], pfd_err[2];
     if (pipe(pfd_out) != 0 || pipe(pfd_err) != 0) {
         exit_code = -1;
@@ -202,10 +212,20 @@ static void run_shell_command(const std::string &shell_path,
             poll_ms = (int)std::min<long>(ms, (long)INT_MAX);
         }
 
-        struct pollfd pfds[2];
+        struct pollfd pfds[3];
         int nfds = 0;
-        if (!out_done) { pfds[nfds] = {pfd_out[0], POLLIN, 0}; nfds++; }
-        if (!err_done)  { pfds[nfds] = {pfd_err[0], POLLIN, 0}; nfds++; }
+        int cancel_slot = -1;
+        if (!out_done) { pfds[nfds].fd = pfd_out[0]; pfds[nfds].events = POLLIN;
+                         pfds[nfds].revents = 0; nfds++; }
+        if (!err_done) { pfds[nfds].fd = pfd_err[0]; pfds[nfds].events = POLLIN;
+                         pfds[nfds].revents = 0; nfds++; }
+        if (cancel_fd >= 0) {
+            cancel_slot = nfds;
+            pfds[nfds].fd = cancel_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
 
         int r = poll(pfds, nfds, poll_ms);
         if (r == 0) { handle_timeout(); return; } // deadline reached
@@ -214,7 +234,21 @@ static void run_shell_command(const std::string &shell_path,
             break;
         }
 
+        // Coordinator gone (socket closed, or a cancel arrived): kill the
+        // whole process group so nothing survives the caller.  This must be
+        // checked before draining output so the kill is immediate.
+        if (cancel_slot >= 0 &&
+            (pfds[cancel_slot].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+            if (cancelled_out) *cancelled_out = true;
+            kill(-child, SIGKILL);
+            exit_code = -1;
+            close(pfd_out[0]); close(pfd_err[0]);
+            waitpid(child, nullptr, 0);
+            return;
+        }
+
         for (int i = 0; i < nfds; i++) {
+            if (i == cancel_slot) continue;
             if (!(pfds[i].revents & (POLLIN | POLLHUP))) continue;
             char tmp[4096];
             ssize_t n = read(pfds[i].fd, tmp, sizeof(tmp));
@@ -332,8 +366,17 @@ static void worker_loop(int sock_fd, const std::string &shell_path) {
         std::string out, serr;
         int code = -1;
         bool out_trunc = false, err_trunc = false, timed_out = false;
+        bool cancelled = false;
         run_shell_command(shell_path, req.cmd, req.timeout_sec,
-                          out, serr, code, out_trunc, err_trunc, timed_out);
+                          out, serr, code, out_trunc, err_trunc, timed_out,
+                          sock_fd, &cancelled);
+
+        if (cancelled) {
+            // Nobody is waiting for this response: the coordinator is gone or
+            // dropped the request (JSON-RPC cancellation sends no reply at
+            // all).  Exit so the worker does not linger as an orphan itself.
+            break;
+        }
 
         auto t1 = std::chrono::steady_clock::now();
         uint64_t ms = (uint64_t)std::chrono::duration_cast<
@@ -470,11 +513,24 @@ bool WorkerPool::try_dispatch(const RpcRequest &req) {
     for (auto &w : workers_) {
         if (w.busy) continue;
 
-        std::string payload = serialize_req_payload(req);
+        // Resolve the timeout actually used: a request that carries none
+        // inherits the server default (--command-timeout).  The default is a
+        // fallback, not a ceiling — an explicit value always wins, so a
+        // caller can still ask for a longer-running command.
+        RpcRequest effective = req;
+        bool from_default = false;
+        if (effective.timeout_sec <= 0 && cfg_.default_timeout_sec > 0) {
+            effective.timeout_sec = cfg_.default_timeout_sec;
+            from_default = true;
+        }
+
+        std::string payload = serialize_req_payload(effective);
         if (!write_msg(w.fd, payload)) return false;
 
-        w.busy        = true;
-        w.inflight_id = req.id;
+        w.busy                     = true;
+        w.inflight_id              = req.id;
+        w.inflight_timeout_sec     = effective.timeout_sec;
+        w.inflight_timeout_default = from_default;
         return true;
     }
     return false; // no free worker
@@ -523,25 +579,60 @@ RpcResponse WorkerPool::collect(size_t idx) {
     }
 
     nlohmann::json inflight = w.inflight_id;
+    int  timeout_sec     = w.inflight_timeout_sec;
+    bool timeout_default = w.inflight_timeout_default;
     w.busy        = false;
     w.inflight_id = nullptr;
 
-    return parse_worker_response(payload, inflight);
+    RpcResponse resp = parse_worker_response(payload, inflight);
+    resp.timeout_sec                 = timeout_sec;
+    resp.timeout_from_server_default = timeout_default;
+    return resp;
 }
 
 void WorkerPool::shutdown() {
+    if (workers_.empty()) return;
+
+    // Close our end of every worker socket first.  A worker running a command
+    // polls that socket, so closing it tells the worker "stop": it kills the
+    // command's process group before exiting.  Waiting for the workers to go
+    // away on their own is what makes this a cleanup instead of a leak.
     for (auto &w : workers_) {
-        if (w.pid > 0) {
-            kill(w.pid, SIGTERM);
-            w.pid = -1;
-        }
         if (w.fd >= 0) {
             close(w.fd);
             w.fd = -1;
         }
     }
-    // Reap all.
-    while (waitpid(-1, nullptr, WNOHANG) > 0) {}
+
+    auto wait_pid = [](pid_t pid, int grace_ms) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(grace_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            int status = 0;
+            pid_t r = waitpid(pid, &status, WNOHANG);
+            if (r == pid) return;         // exited and reaped
+            if (r < 0 && errno != EINTR) return; // ECHILD: already reaped
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    };
+
+    // Grace period: long enough for a worker to kill its command and exit.
+    for (auto &w : workers_) {
+        if (w.pid > 0) wait_pid(w.pid, 3000);
+    }
+
+    // Escalate for stragglers (a worker wedged in the kernel keeps its
+    // command's process group alive, so only kill workers that are still here).
+    for (auto &w : workers_) {
+        if (w.pid > 0 && kill(w.pid, 0) == 0) kill(w.pid, SIGTERM);
+    }
+    for (auto &w : workers_) {
+        if (w.pid > 0 && kill(w.pid, 0) == 0) {
+            kill(w.pid, SIGKILL);
+            while (waitpid(w.pid, nullptr, 0) < 0 && errno == EINTR) {}
+        }
+        w.pid = -1;
+    }
     workers_.clear();
 }
 

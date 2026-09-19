@@ -116,7 +116,6 @@ struct RpcRequest {
 struct RpcResponse {
     nlohmann::json id;
     ToolKind tool = ToolKind::None;
-
     // Shell command result (tool == None)
     int exit_code = -1;
     std::string stdout_data;
@@ -125,6 +124,12 @@ struct RpcResponse {
     bool stdout_truncated = false;
     bool stderr_truncated = false;
     bool timed_out = false;
+
+    // Timeout that was in force for this command (0 = none) and whether it
+    // came from the server default (--command-timeout) rather than from the
+    // request.  Lets the result tell a caller "pass timeout to run longer".
+    int  timeout_sec = 0;
+    bool timeout_from_server_default = false;
 
     // Present on any failure (shell crash or tool error)
     int error_code = -32000; // JSON-RPC 2.0 error code
@@ -163,5 +168,10 @@ class WorkerPool;
 
 // Run the concurrent RPC event loop.
 void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool);
+
+// Ask the RPC event loop to shut down cleanly (called from a signal handler,
+// so both functions stay async-signal-safe).
+void rpc_request_shutdown();
+bool rpc_shutdown_requested();
 
 } // namespace boxsh

@@ -41,8 +41,9 @@ const result = await client.exec('ls -la', '/workspace');
 console.log(result.exitCode);  // 0
 console.log(result.stdout);    // file listing
 
-// Set a timeout (seconds) — the worker is killed via SIGALRM when it expires
+// Set a timeout (seconds) — the command's process group is killed when it expires
 const result2 = await client.exec('sleep 100', '/workspace', 5);
+// Omit the timeout and the server's --command-timeout default (60s) applies.
 ```
 
 Multiple `exec` calls can run concurrently. BoxshClient dispatches them across workers and resolves responses in completion order:

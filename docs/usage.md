@@ -850,10 +850,11 @@ but reduced to a single flag.
 RPC mode turns boxsh into an MCP-compatible server. It reads JSON-RPC 2.0 requests from stdin and writes responses to stdout. Any MCP client (VS Code, Claude Desktop, Cursor, etc.) can connect directly.
 
 ```sh
-boxsh --rpc [--workers N] [sandbox flags...]
+boxsh --rpc [--workers N] [--command-timeout N] [sandbox flags...]
 ```
 
 - `--workers N` — number of parallel workers (default: 4)
+- `--command-timeout N` — seconds a command may run when the request carries no positive `timeout` of its own (default: 60; `0` disables the safety net)
 - Responses arrive in **completion order**, not submission order
 
 boxsh supports two transports, auto-detected from the first bytes:
@@ -1033,21 +1034,54 @@ echo '{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"send_to_
 echo '{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"get_terminal_output","arguments":{"id":"<id>"}}}' | boxsh --rpc
 ```
 
-**`kill_terminal`** — Terminate session and free resources.
+**`kill_terminal`** — Terminate session and free resources. SIGHUP is escalated to SIGKILL when the child does not exit.
 
 **`list_terminals`** — List all active sessions.
 
 #### Timeout
 
-Set a per-request timeout via the `timeout` argument. When the timeout fires, the command is killed and the worker is respawned automatically.
+Timeouts come in two layers, because a client that stops waiting for a response
+has no way to tell the server it gave up:
+
+1. **Per-request** — the `timeout` argument kills the command after N seconds.
+2. **Server default** — `--command-timeout N` (default 60s) applies to every
+   request that carries no positive `timeout`, including `timeout: 0`.
 
 ```sh
+# Killed after 2s by the explicit timeout
 echo '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 60","timeout":2}}}' | boxsh --rpc
-# Response after ~2 seconds:
-# {"jsonrpc":"2.0","id":"t","result":{"content":[{"type":"text","text":"timeout"}],"structuredContent":{"exit_code":-1,"stdout":"","stderr":"timeout","duration_ms":2001},"isError":true}}
+# {"jsonrpc":"2.0","id":"t","result":{"content":[{"type":"text","text":"[stderr]\ntimeout\n[timeout]\n[exit code: -1]\n"}],"structuredContent":{"exit_code":-1,"stdout":"","stderr":"timeout","duration_ms":2001,"timed_out":true,"timeout_sec":2,"timeout_source":"request"},"isError":true}}
+
+# No timeout given: the server default (here 2s) applies
+echo '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 60"}}}' | boxsh --rpc --command-timeout 2
+# … structuredContent: {"timed_out":true,"timeout_sec":2,"timeout_source":"server_default"}
 ```
 
-Subsequent requests continue to work normally — the crashed worker is replaced transparently.
+An explicit `timeout` always wins over the default — the default is a fallback,
+not a ceiling, so a long build only needs the caller to say how long it may
+take:
+
+```sh
+printf '%s\n' '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"make -j8","timeout":900}}}' | boxsh --rpc --command-timeout 5
+```
+
+In both cases the command's whole process group is killed and the worker stays
+alive — it accepts the next request immediately, nothing is respawned. The
+result distinguishes the two cases through `timeout_source`
+(`"request"` | `"server_default"`) and the text marker: a bare `[timeout]` for
+a caller-supplied timeout, and
+`[timeout: killed after the server default of 60s — pass \`timeout\` to allow a longer command]`
+when the safety net fired.
+
+#### Shutdown
+
+boxsh takes its work down with it. On `SIGTERM`/`SIGINT`/`SIGHUP` — and also
+when the process is killed outright — every running command (with its process
+group, so pipelines and background jobs go too) and every PTY session is killed
+before boxsh exits. A client that simply closes stdin gets the same treatment:
+boxsh finishes the requests it already accepted (bounded by the command timeout)
+and then cleans up on the way out. Before this, a killed boxsh left its commands
+running as orphans.
 
 #### Client Configuration
 

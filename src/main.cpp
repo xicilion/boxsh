@@ -1,6 +1,7 @@
 #include "rpc.h"
 #include "worker_pool.h"
 #include "sandbox.h"
+#include "terminal.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +44,11 @@ void print_usage(const char *prog) {
         "RPC options:\n"
         "  --workers N    Number of pre-forked worker processes (default: 4).\n"
         "  --shell PATH   Shell binary to use for executing commands (default: /bin/sh).\n"
+        "  --command-timeout N\n"
+        "                 Seconds a command may run before it is killed, applied to\n"
+        "                 requests that do not carry a positive \"timeout\" themselves\n"
+        "                 (default: 60; 0 disables the safety net).  A command whose\n"
+        "                 caller gave up would otherwise run forever.\n"
         "\n"
         "Sandbox options (applied to every worker at fork time):\n"
         "  --sandbox      Enable the sandbox.  Builds an isolated root from a fresh\n"
@@ -71,6 +77,7 @@ struct Cli {
     bool force_interactive = false;
     bool try_mode      = false;  // --try: ephemeral COW shell on CWD
     int  num_workers   = 4;
+    int  command_timeout = 60;   // --command-timeout (0 = commands may run forever)
     std::string shell_path = "/bin/sh";
 
     SandboxConfig sandbox;
@@ -133,6 +140,7 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
         {"rpc",         no_argument,       nullptr, 'R'},
         {"workers",     required_argument, nullptr, 'W'},
         {"shell",       required_argument, nullptr, 'S'},
+        {"command-timeout", required_argument, nullptr, 'T'},
         {"sandbox",     no_argument,       nullptr, 'X'},
         {"new-net-ns",  no_argument,       nullptr, 'N'},
         {"bind",        required_argument, nullptr, 'b'},
@@ -154,6 +162,20 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
         case 'R': cli.rpc_mode = true; break;
         case 'W': cli.num_workers = std::atoi(optarg); break;
         case 'S': cli.shell_path  = optarg; break;
+        case 'T': {
+            char *end = nullptr;
+            long secs = std::strtol(optarg, &end, 10);
+            if (end == optarg || (end && *end != '\0') || secs < 0 ||
+                secs > 30 * 24 * 3600) {
+                std::fprintf(stderr,
+                    "boxsh: invalid --command-timeout argument: %s\n"
+                    "  expected seconds >= 0 (0 = no default timeout)\n",
+                    optarg);
+                std::exit(1);
+            }
+            cli.command_timeout = (int)secs;
+            break;
+        }
         case 'X': cli.sandbox.enabled = true; break;
         case 'N': cli.sandbox.new_net_ns  = true; break;
         case 'b': {
@@ -440,11 +462,24 @@ int main(int argc, char **argv) {
     boxsh::WorkerPoolConfig pool_cfg;
     pool_cfg.num_workers    = (size_t)cli.num_workers;
     pool_cfg.shell_path     = cli.shell_path;
+    pool_cfg.default_timeout_sec = cli.command_timeout;
     pool_cfg.global_sandbox = cli.sandbox;
 
     // Ignore SIGPIPE so writes to a crashed worker's socket return EPIPE
     // instead of killing the coordinator process.
     signal(SIGPIPE, SIG_IGN);
+
+    // A client that goes away stops the server with SIGTERM (or by closing
+    // stdin, which ends the loop by itself).  Turn the termination signals
+    // into a request for an orderly shutdown, so the cleanup at the end of
+    // main() runs and nothing keeps running behind us.
+    struct sigaction shutdown_sa{};
+    shutdown_sa.sa_handler = [](int) { boxsh::rpc_request_shutdown(); };
+    sigemptyset(&shutdown_sa.sa_mask);
+    shutdown_sa.sa_flags = 0;  // no SA_RESTART: poll(2) must return EINTR
+    sigaction(SIGTERM, &shutdown_sa, nullptr);
+    sigaction(SIGINT,  &shutdown_sa, nullptr);
+    sigaction(SIGHUP,  &shutdown_sa, nullptr);
 
     // Apply the sandbox once in the coordinator process.  All subsequently
     // forked workers inherit the restricted namespace, and tool threads share
@@ -478,6 +513,10 @@ int main(int argc, char **argv) {
 
     boxsh::rpc_run_loop(rpc_fd_in, STDOUT_FILENO, pool);
 
+    // Shut down in dependency order: kill everything this process owns, then
+    // take the workers down.  Without this, a command or PTY session outlives
+    // the server that started it.
+    boxsh::terminal_shutdown_all();
     pool.shutdown();
     if (rpc_fd_in >= 0)
         close(rpc_fd_in);

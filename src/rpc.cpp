@@ -18,6 +18,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -114,6 +115,12 @@ static bool is_valid_utf8(const std::string &s) {
 constexpr size_t kTextHeadBytes = 24u * 1024u;
 constexpr size_t kTextTailBytes = 24u * 1024u;
 
+// Set from a signal handler (SIGTERM/SIGINT/SIGHUP) to ask the RPC event loop
+// for an orderly shutdown: stop reading requests, kill everything this
+// process owns, exit.  Read/written across the signal boundary, so it is only
+// ever touched through the two helpers below.
+volatile sig_atomic_t g_shutdown_requested = 0;
+
 // Reduce s to head_bytes + tail_bytes, snapping both cuts to line boundaries
 // and joining the halves with a single marker line.
 static std::string head_tail_reduce(const std::string &s,
@@ -147,7 +154,9 @@ static std::string head_tail_reduce(const std::string &s,
 //   stdout (labelled when stderr follows) / [stderr] section / markers.
 static std::string bash_result_text(int exit_code, const std::string &out,
                                     const std::string &err, bool timed_out,
-                                    bool out_truncated, bool err_truncated) {
+                                    bool out_truncated, bool err_truncated,
+                                    int timeout_sec = 0,
+                                    bool timeout_from_default = false) {
     std::string body;
     if (!out.empty()) {
         if (!err.empty()) body += "[stdout]\n";
@@ -161,7 +170,16 @@ static std::string bash_result_text(int exit_code, const std::string &out,
     }
     if (out_truncated) body += "[stdout truncated at 10 MiB by boxsh]\n";
     if (err_truncated) body += "[stderr truncated at 10 MiB by boxsh]\n";
-    if (timed_out)     body += "[timeout]\n";
+    if (timed_out) {
+        // Distinguish the server's safety-net timeout from a timeout the
+        // caller asked for: only the former is worth retrying with `timeout`.
+        if (timeout_sec > 0 && timeout_from_default)
+            body += "[timeout: killed after the server default of " +
+                    std::to_string(timeout_sec) +
+                    "s \xe2\x80\x94 pass `timeout` to allow a longer command]\n";
+        else
+            body += "[timeout]\n";
+    }
     if (exit_code != 0) body += "[exit code: " + std::to_string(exit_code) + "]\n";
     if (body.empty()) body = "(no output)\n";
     return head_tail_reduce(body, kTextHeadBytes, kTextTailBytes);
@@ -310,6 +328,19 @@ static bool mime_is_model_native(const std::string &mime) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Orderly shutdown
+// ---------------------------------------------------------------------------
+
+// Async-signal-safe: assigns the flag and nothing else.
+void rpc_request_shutdown() {
+    g_shutdown_requested = 1;
+}
+
+bool rpc_shutdown_requested() {
+    return g_shutdown_requested != 0;
+}
 
 // Convenience constructor for a failed tool result.
 ToolResult tool_error_result(const std::string &code,
@@ -572,7 +603,9 @@ ToolResult tool_result_from_bash(const RpcResponse &resp) {
 
     ToolResult tr;
     tr.text = bash_result_text(resp.exit_code, out, err, resp.timed_out,
-                               resp.stdout_truncated, resp.stderr_truncated);
+                               resp.stdout_truncated, resp.stderr_truncated,
+                               resp.timeout_sec,
+                               resp.timeout_from_server_default);
 
     json sc = {
         {"exit_code",   resp.exit_code},
@@ -582,7 +615,14 @@ ToolResult tool_result_from_bash(const RpcResponse &resp) {
     };
     if (resp.stdout_truncated) sc["stdout_truncated"] = true;
     if (resp.stderr_truncated) sc["stderr_truncated"] = true;
-    if (resp.timed_out)        sc["timed_out"] = true;
+    if (resp.timed_out) {
+        sc["timed_out"] = true;
+        if (resp.timeout_sec > 0) {
+            sc["timeout_sec"] = resp.timeout_sec;
+            sc["timeout_source"] = resp.timeout_from_server_default
+                                   ? "server_default" : "request";
+        }
+    }
     tr.structured = std::move(sc);
     return tr;
 }
@@ -690,7 +730,8 @@ static std::string mcp_initialize_response(const json &id,
     return j.dump();
 }
 
-static std::string mcp_tools_list_response(const json &id) {
+static std::string mcp_tools_list_response(const json &id,
+                                           int default_command_timeout) {
     json tools = json::array();
 
     // Shared outputSchema for the three tools that return a screen snapshot
@@ -710,19 +751,31 @@ static std::string mcp_tools_list_response(const json &id) {
     };
 
     // bash tool
+    std::string bash_desc =
+        "Execute a shell command in the sandbox. Returns the exit code plus the "
+        "command's stdout and stderr (each capped at 10 MiB). ";
+    if (default_command_timeout > 0) {
+        bash_desc += "Commands are killed after " +
+                     std::to_string(default_command_timeout) +
+                     " seconds by default (server-side safety net); pass a larger "
+                     "`timeout` for commands that legitimately run longer "
+                     "(builds, test suites, downloads). `timeout: 0` means \"use "
+                     "the server default\". ";
+    } else {
+        bash_desc += "Pass `timeout` to kill the command after N seconds. ";
+    }
+    bash_desc +=
+        "For large output, narrow the command (head/tail/grep/sed) instead of "
+        "relying on truncation.";
     tools.push_back({
         {"name", "bash"},
         {"title", "Bash"},
-        {"description",
-         "Execute a shell command in the sandbox. Returns the exit code plus the "
-         "command's stdout and stderr (each capped at 10 MiB). Pass `timeout` to "
-         "kill the command after N seconds. For large output, narrow the command "
-         "(head/tail/grep/sed) instead of relying on truncation."},
+        {"description", bash_desc},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
                 {"command", {{"type", "string"}, {"description", "Bash command to execute"}}},
-                {"timeout", {{"type", "number"}, {"description", "Timeout in seconds (optional)"}}}
+                {"timeout", {{"type", "number"}, {"description", "Timeout in seconds (optional; overrides the server default, 0 = use the server default)"}}}
             }},
             {"required", json::array({"command"})}
         }},
@@ -735,7 +788,10 @@ static std::string mcp_tools_list_response(const json &id) {
                 {"duration_ms", { {"type", "integer"}, {"description", "Wall-clock execution time in milliseconds"}}},
                 {"stdout_truncated", { {"type", "boolean"}, {"description", "stdout hit the 10 MiB cap"}}},
                 {"stderr_truncated", { {"type", "boolean"}, {"description", "stderr hit the 10 MiB cap"}}},
-                {"timed_out", { {"type", "boolean"}, {"description", "The command was killed after its timeout expired"}}}
+                {"timed_out", { {"type", "boolean"}, {"description", "The command was killed after its timeout expired"}}},
+                {"timeout_sec", { {"type", "integer"}, {"description", "Timeout that was in force when the command was killed (only with timed_out)"}}},
+                {"timeout_source", { {"type", "string"}, {"enum", json::array({"request", "server_default"})},
+                                     {"description", "Whether that timeout came from the request or from the server default (only with timed_out)"}}}
             }},
             {"required", json::array({"exit_code", "stdout", "stderr", "duration_ms"})}
         }},
@@ -2439,6 +2495,11 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
 
     while (true) {
         try {
+        // A signal asked us to stop (client gone, container stopping, Ctrl-C):
+        // leave the loop without waiting for in-flight commands.  Callers rely
+        // on cleanup (kill commands, sessions, workers) running before exit.
+        if (rpc_shutdown_requested()) break;
+
             // Dispatch a previously buffered cmd if a worker is now free.
         if (buffered_cmd.has_value() && pool.idle_count() > 0) {
             pool.try_dispatch(*buffered_cmd);
@@ -2474,7 +2535,8 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
                 if (req.cmd == "initialize")
                     resp_body = mcp_initialize_response(req.id, req.sandbox_json_raw);
                 else if (req.cmd == "tools/list")
-                    resp_body = mcp_tools_list_response(req.id);
+                    resp_body = mcp_tools_list_response(
+                        req.id, pool.default_timeout_sec());
                 write_msg(resp_body);
                 continue;
             }

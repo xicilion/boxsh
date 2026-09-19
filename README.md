@@ -9,7 +9,8 @@ boxsh works as a **command-line shell** and as an **MCP (Model Context Protocol)
 - **AI agent sandbox** — MCP-compatible server that AI clients (VS Code, Claude Desktop, Cursor, etc.) connect to directly. The agent gets `bash`, `read`, `view_image`, `write`, and `edit` tools inside an isolated environment.
 - **Copy-on-write workspace** — overlay any directory as a COW workspace. The agent reads and writes freely; all modifications land in a separate destination directory. The original is never touched.
 - **Interactive sandboxed shell** — `boxsh --try` drops you into a root shell over your current directory with COW. Experiment freely; discard everything on exit.
-- **Parallel isolated workers** — pre-forked worker pool with configurable concurrency. Crash recovery, per-request timeout, out-of-order response streaming.
+- **Parallel isolated workers** — pre-forked worker pool with configurable concurrency. Crash recovery, per-request timeout, a server-side default timeout, out-of-order response streaming.
+- **Leave nothing behind** — when boxsh is stopped (or its client disappears), running commands and PTY sessions are killed together with their process groups instead of lingering as orphans.
 
 For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/usage.md)**.
 
@@ -26,7 +27,9 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 | **JSON-RPC 2.0** | Dual transport: Content-Length framed (LSP-style) or newline-delimited JSON over stdin/stdout |
 | **Pre-forked worker pool** | Configurable number of workers (`--workers N`); each worker is forked once and reused across requests |
 | **Crash recovery** | If a worker is killed (timeout, segfault, OOM), the coordinator detects `POLLHUP`, returns an error response, and immediately respawns a replacement |
-| **Per-request timeout** | `timeout` argument on the `bash` tool; enforced via `alarm(2)` inside the worker |
+| **Per-request timeout** | `timeout` argument on the `bash` tool, enforced by the worker with a monotonic deadline |
+| **Server-side default timeout** | `--command-timeout N` (default 60 s) applies to requests that carry no timeout of their own, so a command whose caller walked away does not run forever; `0` disables it |
+| **Shutdown cleanup** | On SIGTERM/SIGINT/SIGHUP (or a killed coordinator) every running command and PTY session is killed at its process group — no orphans |
 | **Bind mounts** | Selectively expose host paths (read-write or read-only) inside the sandbox |
 | **Drop-in `/bin/sh`** | Shell mode delegates to embedded dash 0.5.12 — any script or flag that works with POSIX sh works here |
 | **Single static binary** | dash, nlohmann/json, and libedit are vendored; no runtime dependencies beyond the OS kernel |
@@ -131,7 +134,7 @@ boxsh --sandbox --new-net-ns -c 'curl example.com'  # network isolated
 boxsh implements [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) over stdio. Any MCP-compatible client can connect to it directly as a sandboxed code execution server.
 
 ```sh
-boxsh --rpc [--workers N] [--shell PATH] [sandbox flags...]
+boxsh --rpc [--workers N] [--shell PATH] [--command-timeout N] [sandbox flags...]
 ```
 
 ### Transport
@@ -171,7 +174,7 @@ Response (MCP `CallToolResult` format):
 ```
 
 - `content` — model-facing text: stdout, a `[stderr]` section when stderr is non-empty, and `[exit code: N]` for non-zero exits. Output past ~50 KiB keeps 24 KiB of head and tail with an explicit omission marker; the untouched streams stay in `structuredContent`.
-- `structuredContent` — typed fields (`exit_code`, `stdout`, `stderr`, `duration_ms`, optional `stdout_truncated`/`stderr_truncated`/`timed_out`)
+- `structuredContent` — typed fields (`exit_code`, `stdout`, `stderr`, `duration_ms`, optional `stdout_truncated`/`stderr_truncated`/`timed_out`, plus `timeout_sec`/`timeout_source` when a timeout fired)
 - `isError: true` — set when `exit_code != 0` or the command fails
 
 #### `read` — Read a text file
@@ -247,7 +250,7 @@ Waits up to 500 ms for new output, then returns the current screen snapshot. Use
  "params":{"name":"kill_terminal", "arguments":{"id":"<session-id>"}}}
 ```
 
-Sends SIGHUP, drains output, and frees resources. Returns the final screen snapshot.
+Sends SIGHUP and escalates to SIGKILL if the child is still alive after a second (a shell that ignores SIGHUP would otherwise keep the session — and the server — waiting), then frees resources and returns the final screen snapshot.
 
 #### `list_terminals` — List active sessions
 
@@ -411,6 +414,9 @@ Modes:
 RPC options:
   --workers N          Number of pre-forked worker processes (default: 4).
   --shell PATH         Shell binary used by workers (default: /bin/sh).
+  --command-timeout N  Seconds a command may run before it is killed, applied to
+                       requests that carry no positive "timeout" themselves
+                       (default: 60; 0 disables the safety net).
 
 Sandbox options (applied in both shell mode and RPC mode):
   --sandbox            Enable the sandbox.
@@ -500,23 +506,40 @@ The coordinator runs a `poll(2)` event loop — it reads requests from stdin and
 
 **Crash recovery:** if a worker crashes (killed by signal or alarm), the coordinator detects `POLLHUP` on the socket, returns an error response for the in-flight request, and respawns a replacement worker.
 
+**Shutdown:** the workers poll their socket to the coordinator while a command runs. When the coordinator closes it — because boxsh got SIGTERM/SIGINT/SIGHUP, or because the process was killed outright — the worker kills the command's whole process group before exiting. boxsh does the same for PTY sessions on the way out, so no command or session is left behind.
+
 ---
 
 ## Timeout
 
+Two layers, because a caller that gives up never says so:
+
 ```sh
-echo '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 60","timeout":5}}}' | boxsh --rpc
+# Explicit: the command is killed after 5s
+printf '%s\n' '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 60","timeout":5}}}' | boxsh --rpc
 ```
 
-When a request includes a `timeout` argument, the worker kills the running command after the specified number of seconds and returns a tool result with `exit_code: -1` and `stderr: "timeout"`. The worker itself remains alive and immediately accepts the next request — no respawn is needed.
+1. **Per-request** — a `timeout` argument kills the command after that many seconds (`exit_code: -1`, `stderr: "timeout"`, `timed_out: true`). The worker itself remains alive and immediately accepts the next request — no respawn is needed.
+2. **Server default** — `--command-timeout N` (default **60 s**) is used for every request that carries no positive `timeout`, including `timeout: 0`. Clients that never pass a timeout would otherwise leave a runaway command behind after they stop waiting for it. `--command-timeout 0` restores unlimited execution.
+
+An explicit `timeout` always wins over the default (it is a fallback, not a ceiling), so long builds and test suites keep working:
+
+```sh
+# default 1s, but this command is allowed 5s
+printf '%s\n' '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"make -j8","timeout":300}}}' | boxsh --rpc --command-timeout 1
+```
+
+When the server default is what fired, the result says so instead of a bare `[timeout]`:
 
 ```json
 {"jsonrpc":"2.0","id":"t","result":{
-  "content":[{"type":"text","text":"timeout"}],
-  "structuredContent":{"exit_code":-1,"stdout":"","stderr":"timeout","duration_ms":5001},
+  "content":[{"type":"text","text":"[stderr]\ntimeout\n[timeout: killed after the server default of 60s \u2014 pass `timeout` to allow a longer command]\n[exit code: -1]\n"}],
+  "structuredContent":{"exit_code":-1,"stdout":"","stderr":"timeout","duration_ms":60001,"timed_out":true,"timeout_sec":60,"timeout_source":"server_default"},
   "isError":true
 }}
 ```
+
+`timeout_source` is `"request"` for a timeout the caller asked for and `"server_default"` for the safety net. Both are present only when `timed_out` is true.
 
 ---
 
@@ -535,6 +558,7 @@ node --test tests/index.test.mjs
 | `rpc-shell-features.test.mjs` | Pipelines, variables, arithmetic, heredocs, sed, grep, awk |
 | `worker-pool.test.mjs` | Pool sizing, crash recovery, sequential and batch dispatch |
 | `timeout.test.mjs` | Timeout triggering, post-timeout worker recovery and reuse |
+| `command-timeout.test.mjs` | Server-side default timeout (`--command-timeout`) precedence and `timeout_source`, shutdown cleanup (SIGTERM/SIGKILL/EOF leave no orphaned commands or PTY sessions) |
 | `concurrent.test.mjs` | Concurrent correctness, out-of-order responses, isolation, stress |
 | `overlay.test.mjs` | COW bind mounts, copy-on-write, delete/whiteout |
 | `tools.test.mjs` | Built-in tools: read (offset/limit), write, edit (uniqueness checks) |

@@ -62,4 +62,12 @@ std::string terminal_kill(const std::string &id);
 // Return metadata for all live and recently-exited sessions.
 std::vector<TerminalInfo> terminal_list();
 
+// Kill every session and free its resources.  Called when the server is
+// shutting down: session children are in their own session/process group, so
+// they outlive boxsh unless they are signalled here.  Each session's process
+// group gets SIGTERM and then SIGKILL, so a shell that ignores SIGTERM (an
+// interactive one does) cannot hold the shutdown up.  Safe to call when no
+// session exists, or twice.
+void terminal_shutdown_all();
+
 } // namespace boxsh

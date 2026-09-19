@@ -172,7 +172,9 @@ export class BoxshClient {
      *
      * @param {string} cmd          Shell command (passed to dash -c)
      * @param {string} [cwd]        Working directory inside the sandbox
-     * @param {number} [timeout]    Timeout in seconds (0 or undefined = none)
+     * @param {number} [timeout]    Timeout in seconds; omitting it (or passing 0)
+     *                              leaves the server default (--command-timeout,
+     *                              60s) in charge
      * @returns {Promise<{ exitCode: number|null, stdout: string, stderr: string }>}
      */
     async exec(cmd, cwd, timeout) {

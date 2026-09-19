@@ -198,6 +198,14 @@ static std::string wait_for_output(std::shared_ptr<TerminalSession> s,
     return screen_snapshot(s->screen, s->rows, s->cols);
 }
 
+// Wait up to `timeout_ms` for the session's process to be reaped.
+static bool wait_for_exit(const std::shared_ptr<TerminalSession> &s,
+                          int timeout_ms) {
+    std::unique_lock<std::mutex> lk(s->mu);
+    return s->cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                          [&]{ return s->exited; });
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -319,32 +327,38 @@ std::string terminal_kill(const std::string &id) {
     auto s = TerminalManager::instance().get(id);
     if (!s) throw std::runtime_error("unknown terminal session: " + id);
 
-    // Signal the child, then close fd_master to force EOF in the reader
-    // thread (guards against the child ignoring SIGHUP).  The reader thread
-    // may have already closed fd_master if the child exited naturally first.
+    // SIGHUP first, then SIGKILL for a child that ignores it (nohup, a shell
+    // with a HUP trap, …).  Escalating matters: the reader thread only stops
+    // when the process holding the PTY slave lets go of it.
     kill(s->child_pid, SIGHUP);
-    {
-        std::lock_guard<std::mutex> lk(s->mu);
-        if (s->fd_master >= 0) {
-            close(s->fd_master);
-            s->fd_master = -1;
-        }
+    if (!wait_for_exit(s, 1000)) {
+        kill(s->child_pid, SIGKILL);
+        wait_for_exit(s, 1000);
     }
 
-    // Wait for reader thread to mark exited.
-    {
-        std::unique_lock<std::mutex> lk(s->mu);
-        s->cv.wait_for(lk, std::chrono::seconds(3),
-                       [&]{ return s->exited; });
-    }
-
+    // Close fd_master to force EOF in a reader that is somehow still running,
+    // but only after the wait above: close(2) on an fd the reader is blocked
+    // in read(2) on does not return until that read does, so an unconditional
+    // close here would hang the whole server for a session that holds on.
+    // Freeing the vterm state is only safe once the reader has stopped writing
+    // into it; a session whose PTY slave is held open by a grandchild the
+    // signal never reached is dropped without its state instead.
     std::string snap;
     {
         std::lock_guard<std::mutex> lk(s->mu);
-        snap = screen_snapshot(s->screen, s->rows, s->cols);
-        vterm_free(s->vt);
-        s->vt     = nullptr;
-        s->screen = nullptr;
+        if (s->screen)
+            snap = screen_snapshot(s->screen, s->rows, s->cols);
+        if (s->exited) {
+            if (s->fd_master >= 0) {
+                close(s->fd_master);
+                s->fd_master = -1;
+            }
+            if (s->vt) {
+                vterm_free(s->vt);
+                s->vt     = nullptr;
+                s->screen = nullptr;
+            }
+        }
     }
 
     TerminalManager::instance().remove(id);
@@ -361,6 +375,44 @@ std::vector<TerminalInfo> terminal_list() {
                           s->exit_code});
     }
     return result;
+}
+
+void terminal_shutdown_all() {
+    auto sessions = TerminalManager::instance().all();
+    for (auto &s : sessions) {
+        const pid_t pid = s->child_pid;
+
+        // terminal_create() calls setsid() in the child, so the child is the
+        // leader of its own process group: signalling -pid reaches every job
+        // the session started, not just the shell itself.  SIGTERM is only a
+        // request — an interactive shell ignores it — so anything still alive
+        // gets SIGKILL, which it cannot ignore.
+        if (pid > 0) kill(-pid, SIGTERM);
+        if (!wait_for_exit(s, 500)) {
+            if (pid > 0) kill(-pid, SIGKILL);
+            wait_for_exit(s, 1000);
+        }
+
+        // Do NOT close the PTY master here.  close(2) on an fd another thread
+        // is blocked in read(2) on does not return until that read does, so
+        // closing while the reader is still draining would turn this cleanup
+        // into a hang.  The reader thread closes the master itself when the
+        // slave goes away (which SIGKILL guarantees).
+        //
+        // The vterm state is freed only once the reader has stopped writing to
+        // it; a session whose PTY is still held open by an escaped grandchild
+        // keeps its state instead — the process is exiting anyway.
+        {
+            std::lock_guard<std::mutex> lk(s->mu);
+            if (s->exited && s->vt) {
+                vterm_free(s->vt);
+                s->vt     = nullptr;
+                s->screen = nullptr;
+            }
+        }
+
+        TerminalManager::instance().remove(s->id);
+    }
 }
 
 } // namespace boxsh

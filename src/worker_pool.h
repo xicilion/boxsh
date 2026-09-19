@@ -13,6 +13,13 @@ namespace boxsh {
 struct WorkerPoolConfig {
     size_t num_workers = 4;       // number of pre-forked worker processes
     std::string shell_path;       // path to the shell binary (e.g. /bin/sh)
+
+    // Timeout applied to a request that carries no positive timeout of its
+    // own (--command-timeout; 0 = commands may run forever).  A client that
+    // abandons a request never tells the server, so without a default a
+    // command outlives the caller indefinitely.
+    int default_timeout_sec = 0;
+
     SandboxConfig global_sandbox; // global sandbox applied at worker fork time
 };
 
@@ -51,12 +58,17 @@ public:
     // and an error response is returned.
     RpcResponse collect(size_t idx);
 
-    // Terminate all workers and reap their PIDs.
+    // Terminate all workers and reap their PIDs.  A command still running in
+    // a worker is killed together with its process group (the worker notices
+    // its socket going away) — no orphan is left behind.  Safe to call twice.
     void shutdown();
 
     // Expose the sandbox configuration, used by the RPC event loop to apply
     // the same sandbox to tool child processes as to exec workers.
     const SandboxConfig &sandbox_cfg() const { return cfg_.global_sandbox; }
+
+    // Timeout applied to requests that carry none (0 = no default).
+    int default_timeout_sec() const { return cfg_.default_timeout_sec; }
 
 private:
     struct Worker {
@@ -64,6 +76,11 @@ private:
         int         fd          = -1;   // coordinator-side socketpair fd
         bool        busy        = false;
         nlohmann::json inflight_id;     // request id in flight (for crash reports)
+
+        // Timeout actually applied to the in-flight request, and whether it
+        // came from the server default rather than the request itself.
+        int  inflight_timeout_sec     = 0;
+        bool inflight_timeout_default = false;
     };
 
     void spawn_worker(Worker &w);
