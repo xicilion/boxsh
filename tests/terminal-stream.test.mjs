@@ -18,8 +18,23 @@ import { BoxshSession } from './helpers.mjs';
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/** Split a raw PTY stream into lines (the tty writes CRLF). */
-const streamLines = (s) => (s ?? '').split('\n').map(l => l.replace(/\r$/, ''));
+/**
+ * Split a raw PTY stream into lines, dropping what the tty adds around the
+ * text: escape sequences (bash on Linux brackets every prompt and output with
+ * `ESC[?2004h/l`) and carriage returns.
+ */
+const streamLines = (s) => (s ?? '')
+  .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')     // OSC
+  .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')             // CSI
+  .split('\n')
+  .map(l => l.replace(/\r/g, ''));
+
+/**
+ * Did the *program* print this line?  Substring checks are unreliable here: the
+ * tty echoes the command line, so `echo START; …; echo AFTER` puts both words in
+ * the stream before either command runs.
+ */
+const hasLine = (s, text) => streamLines(s).includes(text);
 
 /** Assert a raw response is a tool error carrying `code`. */
 function assertToolError(resp, code) {
@@ -124,6 +139,56 @@ describe('terminal — raw output log', () => {
         assert.equal(stream.truncated_before, false);
         assert.equal(stream.total_bytes, stream.next_cursor);
       });
+    } finally {
+      await s.close();
+    }
+  });
+
+  test('the default read carries the new output, not just the screen', async () => {
+    const s = new BoxshSession();
+    try {
+      await withSession(s, { command: 'bash' }, async ({ id }) => {
+        await sleep(300);                    // let bash reach its prompt
+        // No sleep after this call on purpose: "output" waits for the output to
+        // settle, so the result must already hold the command's own output and
+        // not just the tty echo of the command line.
+        const sent = await s.call('send_to_terminal', {
+          id, command: "seq 1 60 | sed 's/^/SEQ-/'; true\n", wait_ms: 900,
+        });
+        const text = (sent.result.content ?? []).map(c => c.text).join('\n');
+        const r = BoxshSession.sc(sent);
+
+        // No cursor was given, yet the text holds every line of the new output:
+        // the screen alone could not (it is a view of the last `rows` lines).
+        assert.ok(text.includes('SEQ-1\n'), 'text must contain the first line of the new output');
+        assert.ok(text.includes('SEQ-60'), 'text must contain the last line');
+        assert.ok(!r.output.includes('SEQ-1\n'), 'the screen view itself stays a view');
+        assert.equal(r.first_cursor + r.stream.length, r.next_cursor);
+        assert.equal(r.truncated_before, false);
+
+        // The delta was consumed: an idle poll is empty and the screen is still there.
+        const idle = BoxshSession.sc(await s.call('get_terminal_output', { id, wait_ms: 200 }));
+        assert.equal(idle.stream, '', 'an idle poll must return no bytes');
+        assert.ok((idle.output ?? '').includes('SEQ-60'), 'the screen is still available');
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  test('a first read reports output that the log could not keep', async () => {
+    const s = new BoxshSession();
+    try {
+      // No cursor at all: the session's read position starts at 0, so a wrapped
+      // log has to admit that the earliest bytes are gone.
+      const r = BoxshSession.sc(await s.call('run_in_terminal', {
+        command: 'seq 1 200000', wait_for: 'exit', wait_ms: 30000,
+      }));
+      assert.ok(r.total_bytes > 1024 * 1024, `expected > 1 MiB, got ${r.total_bytes}`);
+      assert.equal(r.truncated_before, true, 'a wrapped log must be reported on the default read');
+      assert.ok(r.dropped_bytes > 0);
+      assert.ok(r.first_cursor > 0);
+      await s.call('kill_terminal', { id: r.id });
     } finally {
       await s.close();
     }
@@ -338,6 +403,99 @@ describe('terminal — lifecycle', () => {
 });
 
 // ---------------------------------------------------------------------------
+// signals
+// ---------------------------------------------------------------------------
+
+describe('terminal — signal', () => {
+  test('signal:"INT" aborts the running command and the rest of its command line', async () => {
+    const s = new BoxshSession();
+    try {
+      await withSession(s, { command: 'bash' }, async ({ id }) => {
+        await sleep(300);                        // let bash reach its prompt
+        await s.call('send_to_terminal', { id, command: 'echo START; sleep 4; echo AFTER\n', wait_ms: 400 });
+        await sleep(400);                        // bash is inside the sleep now
+        await s.call('send_to_terminal', { id, signal: 'INT', wait_ms: 300 });
+        await sleep(1500);                       // well before the sleep would end
+        const r = BoxshSession.sc(await s.call('get_terminal_output', { id, cursor: 0, wait_ms: 300 }));
+        assert.ok(hasLine(r.stream, 'START'), 'the command did run');
+        assert.ok(!hasLine(r.stream, 'AFTER'), 'the rest of the command line must be abandoned');
+        assert.equal(r.exited, false, 'the session itself survives');
+
+        await sleep(3200);                       // past the sleep: AFTER must not appear later either
+        const later = BoxshSession.sc(await s.call('get_terminal_output', { id, cursor: 0, wait_ms: 300 }));
+        assert.ok(!hasLine(later.stream, 'AFTER'), 'AFTER must never run');
+
+        const alive = BoxshSession.sc(await s.call('send_to_terminal', {
+          id, command: 'echo STILL-ALIVE\n', wait_ms: 600,
+        }));
+        assert.ok(hasLine(alive.stream, 'STILL-ALIVE'), 'the shell must still work');
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  test('a raw ETX byte interrupts the foreground job, like a physical Ctrl-C', async () => {
+    const s = new BoxshSession();
+    try {
+      await withSession(s, { command: 'bash' }, async ({ id }) => {
+        await sleep(300);                        // let bash reach its prompt
+        await s.call('send_to_terminal', { id, command: 'echo START; sleep 5; echo AFTER\n', wait_ms: 400 });
+        await sleep(400);                        // bash is inside the sleep now
+        await s.call('send_to_terminal', { id, command: '\x03', wait_ms: 300 });
+        await sleep(500);
+
+        // The interrupted job frees the shell: a new command runs at once, which
+        // it could not while `sleep 5` still held the foreground.
+        const mark = BoxshSession.sc(await s.call('send_to_terminal', {
+          id, command: 'echo ETX-DONE\n', cursor: 0, wait_ms: 1500,
+        }));
+        assert.ok(hasLine(mark.stream, 'ETX-DONE'),
+          'the shell must be usable right after the interrupt');
+
+        // Whether the rest of the *command line* still runs afterwards is the
+        // shell's own decision - bash 3.2 (macOS) continues it, bash 5.x (Linux)
+        // abandons it - so only the interruption itself is asserted here.
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  test('signal:"KILL" ends the session; an unknown signal is E_INVALID_ARGUMENT', async () => {
+    const s = new BoxshSession();
+    try {
+      const live = BoxshSession.sc(await s.call('run_in_terminal', { command: 'bash' }));
+      assertToolError(await s.call('send_to_terminal', { id: live.id, signal: 'NOPE' }),
+        'E_INVALID_ARGUMENT');
+      await s.call('send_to_terminal', { id: live.id, signal: 'KILL', wait_ms: 600 });
+      let st;
+      for (let i = 0; i < 10; i++) {
+        st = BoxshSession.sc(await s.call('get_terminal_output', { id: live.id, wait_ms: 200 }));
+        if (st.exited) break;
+      }
+      assert.equal(st.exited, true, 'SIGKILL must end the session');
+      assert.equal(st.exit_code, -1, 'a signalled process has no exit code');
+      await s.call('kill_terminal', { id: live.id });
+    } finally {
+      await s.close();
+    }
+  });
+
+  test('signal without a command is accepted (write is optional)', async () => {
+    const s = new BoxshSession();
+    try {
+      await withSession(s, { command: 'sleep 30' }, async ({ id }) => {
+        const r = BoxshSession.sc(await s.call('send_to_terminal', { id, signal: 'TERM', wait_ms: 300 }));
+        assert.equal(typeof r.exited, 'boolean');   // accepted, session unchanged by design
+      });
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // argument validation
 // ---------------------------------------------------------------------------
 
@@ -360,6 +518,8 @@ describe('terminal — argument validation', () => {
         assertToolError(await s.call('send_to_terminal', {
           id: live.id, command: 'x\n', capture_status: 'yes',
         }), 'E_INVALID_ARGUMENT');
+        assertToolError(await s.call('send_to_terminal', { id: live.id }),
+          'E_INVALID_ARGUMENT');
       } finally {
         await s.call('kill_terminal', { id: live.id });
       }

@@ -228,12 +228,15 @@ Each `oldText` must appear exactly once in the original file. Edits must not ove
 
 Starts a PTY session running the given command (`/bin/sh -c`, `/bin/sh` by default on Linux/macOS) at the requested window size — the size is applied to the PTY itself, so `stty size`, `tput`, pagers and full-screen programs see it. Returns `{ id, output, exited, exit_code, total_bytes }`; `id` is used by the other terminal tools. `rows`/`cols` only bound the *screen* snapshot: the raw log keeps the full output regardless.
 
-Optional wait arguments (shared by the read tools):
+Optional arguments (shared by the read tools):
 
 | Argument | Meaning |
 |---|---|
 | `wait_ms` | How long to wait before returning (default 500, up to 600000) |
-| `wait_for` | `"output"` (default), `"exit"` (wait for the process to exit and return the complete raw stream), `"none"` (return at once) |
+| `wait_for` | `"output"` (default: wait for output and for it to settle, so a quick command's result is not just the echo of its own command line), `"exit"` (wait for the process to exit and return the complete raw stream), `"none"` (return at once) |
+| `cursor` | Read from this absolute raw-log position instead of the session's read position |
+
+Every read returns both views: `output` is the rendered screen (the last `rows` lines — what an interactive program is showing) and `stream` is the raw bytes received since the previous read, with `next_cursor` for the position after them. The model-facing text shows whichever is complete, so new output taller than the screen is never mistaken for lost output, and polling is cheap (an idle session returns zero bytes).
 
 With `wait_for:"exit"` a one-shot command behaves like `bash` — one call returns the complete output, the exit code and the duration — while keeping PTY semantics. Prefer `bash` for plain non-interactive commands: it separates stdout/stderr.
 
@@ -249,6 +252,22 @@ Writes text to the session's stdin and returns the updated screen plus the raw b
 
 With `capture_status: true` the text is submitted as a shell command line and boxsh appends a self-erasing status probe, so the result also carries `command_exit_code` — the exit code of *that command* (a persistent shell session can then be driven like a command runner). The probe is input, so use it on shell sessions only, never on a REPL or a pager. Both the probe and its echoed command line are removed from the text and the raw stream that boxsh returns.
 
+With `signal` the session's process group is signalled instead of (or after) the write — no control bytes needed:
+
+```json
+{"jsonrpc":"2.0", "id":"6", "method":"tools/call",
+ "params":{"name":"send_to_terminal", "arguments":{"id":"<session-id>", "signal":"INT"}}}
+```
+
+| Signal | Effect on a shell session |
+|---|---|
+| `INT` | Aborts what the session is running. Delivered to the foreground job *and* to the shell's own process group, so the shell is asked to stop too (which is what makes `a; b; c` abandon `b`/`c` on the shells tested) |
+| `KILL` | Ends the session (the shell cannot ignore it) |
+| `TERM`, `QUIT` | Delivered, but an *interactive* shell ignores both by POSIX — use `kill_terminal` to end one |
+| `HUP`, `USR1`, `USR2`, `STOP`, `CONT` | Passed through to the process group(s) |
+
+A raw ETX byte (`command: "\u0003"`) still works and does what a physical Ctrl-C does: the terminal delivers SIGINT to the *foreground job*, which stops it. What happens to the rest of the command line is then the shell's decision — bash 3.2 (macOS) continues it, bash 5.x (Linux) abandons it — while `signal: "INT"` additionally asks the shell itself. The literal text `\u0003` is just six characters; control characters have to be sent as actual bytes, which is why `signal` exists.
+
 #### `get_terminal_output` — Read output without waiting for a command
 
 ```json
@@ -256,9 +275,9 @@ With `capture_status: true` the text is submitted as a shell command line and bo
  "params":{"name":"get_terminal_output", "arguments":{"id":"<session-id>", "cursor":0}}}
 ```
 
-Without `cursor` this returns the current screen (a view of the last `rows` lines). With `cursor` it returns the raw byte stream instead — only the bytes that arrived after that position, decoded from the lossless log, with `first_cursor`/`next_cursor`/`truncated_before` describing the window. Passing `cursor: 0` reads everything still retained, which is how to collect output that has scrolled off the screen; polling with the returned `next_cursor` returns zero bytes while nothing new arrives. `wait_for:"exit"` waits for the process to finish and returns the whole stream in one call.
+Without `cursor` the read continues where the session's read position points (starting at 0, i.e. everything the log still holds) and advances it, so a poll returns exactly what arrived since the previous one — zero bytes while the session is idle. With `cursor` it reads that absolute position instead, which is how to re-read the whole session (`cursor: 0`) or to follow a position you track yourself.
 
-The raw log keeps 1 MiB per session by default (`--session-log-limit`); when it wraps, the result says so through `truncated_before` and `dropped_bytes` — output is never dropped silently.
+`output` is always the screen, `stream` is always the raw delta; both are in `structuredContent`, with `first_cursor`/`next_cursor`/`truncated_before` describing the window. The raw log keeps 1 MiB per session by default (`--session-log-limit`); when it wraps, the result reports `truncated_before` and `dropped_bytes` — output is never dropped silently.
 
 #### `kill_terminal` — Terminate a PTY session
 
@@ -267,7 +286,7 @@ The raw log keeps 1 MiB per session by default (`--session-log-limit`); when it 
  "params":{"name":"kill_terminal", "arguments":{"id":"<session-id>"}}}
 ```
 
-Signals the session's whole process group with SIGHUP and escalates to SIGKILL if something is still alive after a second (an interactive shell ignores SIGHUP and would otherwise keep the session — and the server — waiting), then frees resources and returns the final screen plus the complete raw output (`{ killed, exit_code, output, stream, next_cursor }`). `killed` is `false` when the process had already exited on its own.
+Signals the session's whole process group with SIGHUP and escalates to SIGKILL if something is still alive after a second (an interactive shell ignores SIGHUP and would otherwise keep the session — and the server — waiting), then frees resources and returns the final screen plus the complete raw output still retained (`{ killed, exit_code, output, stream, next_cursor }`). `killed` is `false` when the process had already exited on its own, and `exit_code` is `-1` when the session died from a signal (the text says so instead of printing a meaningless code).
 
 #### `list_terminals` — List sessions
 

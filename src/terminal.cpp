@@ -135,6 +135,7 @@ struct TerminalSession {
     std::string  command;
     pid_t        child_pid  = -1;
     int          fd_master  = -1;
+    std::string  slave_path;          // ptsname(fd_master), for tcgetpgrp()
     int          cols       = kDefaultCols;
     int          rows       = kDefaultRows;
 
@@ -156,6 +157,11 @@ struct TerminalSession {
     uint64_t    log_base = 0;
     uint64_t    dropped  = 0;
     uint64_t    total_lines = 0;  // newlines seen, for "is the screen partial?"
+
+    // Where the next cursor-less read starts: 0 (everything retained) at first,
+    // advanced to the end of every stream a read returns, so polling a session
+    // costs nothing while it is idle and never repeats what was already read.
+    uint64_t    read_cursor = 0;
 
     // capture_status bookkeeping.
     std::string scan_tail;            // last bytes, so a probe split across
@@ -269,7 +275,7 @@ void log_append(TerminalSession &s, const char *data, size_t n) {
     s.dropped  += drop;
 }
 
-// Bytes in [cursor or the oldest retained byte, end of log).
+// Bytes in [cursor or the session's read cursor, end of log).
 struct LogSlice {
     std::string data;
     uint64_t    begin     = 0;
@@ -280,10 +286,10 @@ struct LogSlice {
 LogSlice log_slice(const TerminalSession &s, const std::optional<uint64_t> &cursor) {
     LogSlice out;
     out.end = s.total_bytes();
-    uint64_t begin = cursor.value_or(s.log_base);
+    uint64_t begin = cursor.value_or(s.read_cursor);
     if (begin < s.log_base) {
-        // The position the caller asked for is gone: say so instead of
-        // silently returning a gap.
+        // The position the caller asked for (or the session's read cursor) is
+        // older than anything kept: say so instead of silently returning a gap.
         out.truncated = true;
         begin = s.log_base;
     }
@@ -293,10 +299,10 @@ LogSlice log_slice(const TerminalSession &s, const std::optional<uint64_t> &curs
     return out;
 }
 
-// A stream is only attached when the caller treats the session as a data
-// channel (explicit cursor, or waiting for the process to exit).
-bool wants_stream(const TerminalReadOptions &opts) {
-    return opts.cursor.has_value() || opts.wait_for == TerminalWait::Exit;
+// A stream is always attached; what the *text* shows is decided in the RPC
+// layer (screen vs delta).  Kept as a helper so the rule stays in one place.
+bool wants_stream(const TerminalReadOptions &) {
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -516,22 +522,36 @@ TerminalOutputResult read_locked(const TerminalSession &s,
         s.total_lines > (uint64_t)std::count(r.output.begin(), r.output.end(), '\n');
 
     if (with_stream) {
-        LogSlice sl   = log_slice(s, opts.cursor);
-        r.stream      = strip_status_noise(sl.data);
+        LogSlice sl    = log_slice(s, opts.cursor);
+        r.stream       = strip_status_noise(sl.data);
         r.first_cursor = sl.begin;
-        r.next_cursor = sl.end;
-        r.truncated   = sl.truncated;
-        r.with_stream = true;
+        r.next_cursor  = sl.end;
+        r.truncated    = sl.truncated;
     }
     return r;
 }
 
+// Consume the returned delta: the next cursor-less read continues from here.
+void advance_read_cursor(TerminalSession &s, const TerminalOutputResult &r) {
+    if (r.next_cursor > s.read_cursor) s.read_cursor = r.next_cursor;
+}
+
 // Wait inside a read.  `gen0` is captured before the wait so that the default
 // ("output") condition means "something arrived since this call started".
+//
+// "output" is also settled: the very first bytes after a write are the tty's
+// echo of the command line, while the command's own output is still in flight.
+// Returning on them hands a caller a result that looks truncated; waiting for a
+// short quiet gap instead makes a quick command complete in one call, at the
+// cost of a few tens of milliseconds.
+constexpr int kOutputSettleMs = 40;
+
 void wait_for_read(std::unique_lock<std::mutex> &lk, TerminalSession &s,
                    const TerminalReadOptions &opts, uint64_t gen0,
                    bool want_status, uint64_t status_seq) {
     if (opts.wait_ms <= 0) return;
+    const auto deadline = Clock::now() + std::chrono::milliseconds(opts.wait_ms);
+
     auto ready = [&]() -> bool {
         if (s.exited) return true;
         if (want_status) return s.status_done_seq >= status_seq;
@@ -542,8 +562,23 @@ void wait_for_read(std::unique_lock<std::mutex> &lk, TerminalSession &s,
             default:                 return s.generation != gen0;
         }
     };
-    if (ready()) return;
-    s.cv.wait_for(lk, std::chrono::milliseconds(opts.wait_ms), ready);
+
+    if (!ready())
+        s.cv.wait_until(lk, deadline, ready);
+
+    if (want_status || opts.wait_for != TerminalWait::Output) return;
+
+    // Settle: keep waiting while output keeps arriving, until it has been quiet
+    // for kOutputSettleMs or the budget is gone.
+    auto quiet_at = Clock::now() + std::chrono::milliseconds(kOutputSettleMs);
+    while (!s.exited) {
+        auto until = std::min(quiet_at, deadline);
+        if (Clock::now() >= until) break;
+        uint64_t gen = s.generation;
+        if (!s.cv.wait_until(lk, until, [&]{ return s.exited || s.generation != gen; }))
+            break;                                    // quiet for the whole gap
+        quiet_at = Clock::now() + std::chrono::milliseconds(kOutputSettleMs);
+    }
 }
 
 std::shared_ptr<TerminalSession> require_session(const std::string &id) {
@@ -585,6 +620,72 @@ void write_all(TerminalSession &s, const std::string &data) {
                                 "terminal session has exited: " + s.id);
         throw TerminalError(error_code::kInternal, "write to PTY failed: " + s.id);
     }
+}
+
+// Signal names accepted by send_to_terminal.  A curated set: the interesting
+// ones for a session are INT (abort what it is running), KILL (make it stop
+// ignoring TERM) and the job-control pair STOP/CONT.  Interactive shells ignore
+// SIGTERM and SIGQUIT by POSIX, so those two are accepted but rarely useful.
+struct SignalName { const char *name; int sig; };
+const SignalName kSignalNames[] = {
+    {"INT", SIGINT}, {"TERM", SIGTERM}, {"KILL", SIGKILL}, {"HUP", SIGHUP},
+    {"QUIT", SIGQUIT}, {"USR1", SIGUSR1}, {"USR2", SIGUSR2},
+    {"STOP", SIGSTOP}, {"CONT", SIGCONT},
+};
+
+int signal_from_name(const std::string &name) {
+    for (const auto &s : kSignalNames)
+        if (name == s.name) return s.sig;
+    return 0;
+}
+
+std::string signal_name_list() {
+    std::string out;
+    for (const auto &s : kSignalNames) {
+        if (!out.empty()) out += ", ";
+        out += s.name;
+    }
+    return out;
+}
+
+// Foreground process group of the session's terminal, or -1 when it cannot be
+// read.  This is the group a physical terminal's Ctrl-C reaches: the job the
+// shell is running, not the shell itself.
+//
+// The master is asked first: TIOCGPGRP works there on macOS *and* Linux (unlike
+// TIOCSWINSZ, which only the slave accepts).  Opening the slave as a fallback
+// mimics what a terminal emulator does — briefly, with O_NOCTTY so it does not
+// become *our* controlling terminal, and closed right away so that EOF
+// detection (which is what marks a session exited) stays intact.
+int foreground_pgrp(const TerminalSession &s) {
+    errno = 0;
+    pid_t fg = s.fd_master >= 0 ? tcgetpgrp(s.fd_master) : -1;
+    if (fg > 0) return (int)fg;
+
+    if (s.slave_path.empty()) return -1;
+    int fds = open(s.slave_path.c_str(), O_RDWR | O_NOCTTY);
+    if (fds < 0) return -1;
+    fg = tcgetpgrp(fds);
+    close(fds);
+    return fg > 0 ? (int)fg : -1;
+}
+
+// Deliver a signal the way "stop what you are doing" is meant to work.
+//
+// Two targets, because they do different jobs:
+//   * the *foreground* process group is what a physical Ctrl-C hits - the
+//     command that is running, which is what actually stops it;
+//   * the shell's own process group is what makes the shell abandon the rest of
+//     its command line.  Interactive shells decide this themselves and the
+//     rules differ between versions (bash 3.2 abandons on its own SIGINT, bash
+//     5.x only when the foreground job died from one), so both are signalled.
+// Returns false when neither group could be reached (everything already gone).
+bool deliver_signal(const TerminalSession &s, int sig) {
+    bool delivered = false;
+    int fg = foreground_pgrp(s);
+    if (fg > 0 && kill(-fg, sig) == 0) delivered = true;
+    if (kill(-s.child_pid, sig) == 0) delivered = true;
+    return delivered;
 }
 
 // Free a session's resources and drop it from the table.  Only valid once the
@@ -745,6 +846,7 @@ TerminalCreateResult terminal_create(const std::string &command,
     s->command   = command;
     s->child_pid = pid;
     s->fd_master = fdm;
+    if (const char *slave = ptsname(fdm)) s->slave_path = slave;
     s->cols      = cols;
     s->rows      = rows;
 
@@ -772,6 +874,7 @@ TerminalCreateResult terminal_create(const std::string &command,
         uint64_t gen0 = s->generation;
         wait_for_read(lk, *s, opts, gen0, false, 0);
         res.out = read_locked(*s, opts, wants_stream(opts));
+        advance_read_cursor(*s, res.out);
     }
     return res;
 }
@@ -781,9 +884,17 @@ TerminalCreateResult terminal_create(const std::string &command,
 // ---------------------------------------------------------------------------
 
 TerminalSendResult terminal_send(const std::string &id, const std::string &text,
-                                 const TerminalReadOptions &opts,
-                                 bool capture_status) {
+                                 const TerminalSendOptions &opts) {
     auto s = require_session(id);
+
+    int sig = 0;
+    if (!opts.signal.empty()) {
+        sig = signal_from_name(opts.signal);
+        if (sig == 0)
+            throw TerminalError(error_code::kInvalidArgument,
+                "send_to_terminal: unknown signal \"" + opts.signal +
+                "\"; expected one of " + signal_name_list());
+    }
 
     // Write and read are one operation: the lock is held across both so a
     // concurrent read cannot observe the write without its result.
@@ -793,7 +904,7 @@ TerminalSendResult terminal_send(const std::string &id, const std::string &text,
 
     std::string payload = text;
     uint64_t status_seq = 0;
-    if (capture_status) {
+    if (opts.capture_status) {
         if (payload.empty() || payload.back() != '\n') payload += '\n';
         payload += kStatusLine;
         // Arm the probe *before* writing: the shell may already execute the
@@ -805,14 +916,23 @@ TerminalSendResult terminal_send(const std::string &id, const std::string &text,
         s->probe_used         = true;
     }
 
-    write_all(*s, payload);
+    if (!payload.empty())
+        write_all(*s, payload);
+
+    if (sig != 0) {
+        // ESRCH just means everything already exited: not an error.
+        if (!deliver_signal(*s, sig) && errno != ESRCH)
+            throw TerminalError(error_code::kInternal,
+                "failed to send SIG" + opts.signal + " to terminal session " + id);
+    }
 
     uint64_t gen0 = s->generation;
-    wait_for_read(lk, *s, opts, gen0, capture_status, status_seq);
+    wait_for_read(lk, *s, opts.read, gen0, opts.capture_status, status_seq);
 
     TerminalSendResult r;
-    r.out = read_locked(*s, opts, capture_status || wants_stream(opts));
-    if (capture_status && s->status_done_seq >= status_seq) {
+    r.out = read_locked(*s, opts.read, wants_stream(opts.read));
+    advance_read_cursor(*s, r.out);
+    if (opts.capture_status && s->status_done_seq >= status_seq) {
         r.has_command_exit_code = true;
         r.command_exit_code     = s->status_code;
     }
@@ -825,7 +945,9 @@ TerminalOutputResult terminal_read(const std::string &id,
     std::unique_lock<std::mutex> lk(s->mu);
     uint64_t gen0 = s->generation;
     wait_for_read(lk, *s, opts, gen0, false, 0);
-    return read_locked(*s, opts, wants_stream(opts));
+    TerminalOutputResult r = read_locked(*s, opts, wants_stream(opts));
+    advance_read_cursor(*s, r);
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -861,7 +983,9 @@ TerminalKillResult terminal_kill(const std::string &id,
         std::lock_guard<std::mutex> lk(s->mu);
         r.output        = screen_snapshot(s->screen, s->rows, s->cols);
         if (s->probe_used) r.output = strip_probe_echo_lines(r.output);
-        slice           = log_slice(*s, cursor);
+        // A kill is the last chance to read the session, so it returns
+        // everything still retained unless the caller pinned a cursor.
+        slice           = log_slice(*s, cursor.value_or(0));
         r.exit_code     = s->exited ? s->exit_code : -1;
         r.stream        = strip_status_noise(slice.data);
         r.first_cursor  = slice.begin;

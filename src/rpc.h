@@ -99,6 +99,7 @@ struct RpcRequest {
     std::optional<uint64_t> terminal_cursor;          // raw-log cursor
     bool                   terminal_capture_status = false;
     bool                   terminal_include_exited = false;
+    std::string            terminal_signal;           // send_to_terminal: INT/TERM/…
 
     // Set when the tool arguments themselves are wrong.  The parser accepts the
     // request (so the tool kind is known) and the dispatcher turns this into a

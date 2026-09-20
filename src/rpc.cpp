@@ -609,11 +609,23 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
                 return true;
             }
             req.session_id = args["id"].get<std::string>();
-            if (!args.contains("command") || !args["command"].is_string()) {
-                req.arg_error = "send_to_terminal: missing string field: command";
+            if (args.contains("signal")) {
+                if (!args["signal"].is_string()) {
+                    req.arg_error = "send_to_terminal: signal must be a string";
+                    return true;
+                }
+                req.terminal_signal = args["signal"].get<std::string>();
+            }
+            if (args.contains("command")) {
+                if (!args["command"].is_string()) {
+                    req.arg_error = "send_to_terminal: command must be a string";
+                    return true;
+                }
+                req.terminal_command = args["command"].get<std::string>();
+            } else if (req.terminal_signal.empty()) {
+                req.arg_error = "send_to_terminal: needs a `command` to write or a `signal` to send";
                 return true;
             }
-            req.terminal_command = args["command"].get<std::string>();
             if (args.contains("capture_status")) {
                 if (!args["capture_status"].is_boolean()) {
                     req.arg_error = "send_to_terminal: capture_status must be a boolean";
@@ -852,10 +864,10 @@ static std::string mcp_tools_list_response(const json &id,
                                {"description", "Exit code when exited, null while it is still running"}}},
                 {"total_bytes", {{"type", "integer"}, {"description", "Raw bytes received from the PTY since the session started"}}},
                 {"screen_partial", {{"type", "boolean"}, {"description", "The session produced more lines than the screen shows, so `output` is a partial view — read the stream for everything"}}},
-                {"stream",    {{"type", "string"},  {"description", "Raw output bytes (escape sequences included) in [first_cursor, next_cursor)"}}},
+                {"stream",    {{"type", "string"},  {"description", "Raw output bytes (escape sequences included) received since the previous read or the given cursor"}}},
                 {"first_cursor", {{"type", "integer"}, {"description", "Cursor the returned stream starts at"}}},
                 {"next_cursor",  {{"type", "integer"}, {"description", "Pass as `cursor` to read only what comes after this result"}}},
-                {"truncated_before", {{"type", "boolean"}, {"description", "The requested cursor had already scrolled out of the raw log; the stream starts at first_cursor instead"}}},
+                {"truncated_before", {{"type", "boolean"}, {"description", "Bytes before first_cursor were dropped from the log and cannot be recovered"}}},
                 {"dropped_bytes", {{"type", "integer"}, {"description", "Bytes dropped from the front of the raw log so far"}}},
                 {"command_exit_code", {{"type", "integer"}, {"description", "Exit code of the command just submitted (capture_status only)"}}}
             }},
@@ -868,7 +880,7 @@ static std::string mcp_tools_list_response(const json &id,
         props["wait_ms"]  = {{"type", "number"},
             {"description", "How long to wait before returning, in ms (default 500; up to 600000). With wait_for=\"exit\" or capture_status the default is 60000."}};
         props["wait_for"] = {{"type", "string"}, {"enum", json::array({"output", "exit", "none"})},
-            {"description", "What to wait for: \"output\" (default; new output or exit), \"exit\" (the process exits; also returns the complete raw stream), \"none\" (return immediately)."}};
+            {"description", "What to wait for: \"output\" (default; new output, then until it settles), \"exit\" (the process exits; also returns the complete raw stream), \"none\" (return immediately)."}};
         return props;
     };
 
@@ -1102,10 +1114,10 @@ static std::string mcp_tools_list_response(const json &id,
          "Start a persistent PTY session running the given command (e.g. \"bash\"). "
          "The command runs on a real terminal: it can be interactive (prompts, REPLs, "
          "pagers) and keeps state (cwd, environment) across calls. "
-         "Returns the session id, the rendered screen, the exit status and the number of "
-         "bytes received. The screen is a view of the last `rows` lines, so for a command "
-         "whose output must be complete pass wait_for:\"exit\" (and a `wait_ms` budget), or "
-         "read the raw byte stream with get_terminal_output using the `cursor` it returns. "
+         "Returns the session id, the rendered screen, the raw output received so far "
+         "(with `next_cursor` for the position after it) and the amount of bytes received. "
+         "For a command whose output must be complete pass wait_for:\"exit\" (with a "
+         "`wait_ms` budget): one call then returns everything plus the exit code. "
          "Use send_to_terminal to type into the session and kill_terminal to end it. "
          "For a plain non-interactive command prefer the bash tool: it returns separate "
          "stdout/stderr and no terminal rendering."},
@@ -1133,22 +1145,31 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "send_to_terminal"},
         {"title", "Send to Terminal"},
         {"description",
-         "Write text to a session's PTY stdin. Append \\n to run it as a shell command line "
-         "(text without a trailing newline only reaches the program as keystrokes). "
-         "Then waits for output and returns the screen plus the raw byte delta. "
+         "Write text to a session's PTY stdin and return what came back. Append \\n to "
+         "run it as a shell command line (text without a trailing newline only reaches the "
+         "program as keystrokes). The result holds the output produced since the previous "
+         "read, so nothing repeats and nothing is lost. "
          "With capture_status:true the text is submitted as a shell command line and the "
          "result carries command_exit_code, so a persistent shell session can be driven "
          "like a command runner (shell sessions only — the probe line is input, so do not "
-         "use it on a REPL or a pager)."},
+         "use it on a REPL or a pager). "
+         "With signal the session's process group is signalled instead of (or after) the "
+         "write: it goes to the foreground job *and* to the shell itself, which is how you "
+         "ask a session to stop what it is doing (a raw ETX byte, 0x03, only reaches the "
+         "foreground job). \"KILL\" ends the session; interactive shells ignore "
+         "SIGTERM/SIGQUIT by POSIX, so use kill_terminal to end one of those."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", terminal_read_args(json{
                 {"id",      {{"type", "string"}, {"description", "Terminal session id"}}},
-                {"command", {{"type", "string"}, {"description", "Text to write to the PTY stdin"}}},
+                {"command", {{"type", "string"}, {"description", "Text to write to the PTY stdin (optional when signal is given)"}}},
+                {"signal",  {{"type", "string"},
+                             {"enum", json::array({"INT", "TERM", "KILL", "HUP", "QUIT", "USR1", "USR2", "STOP", "CONT"})},
+                             {"description", "Signal to deliver to the session's process group"}}},
                 {"capture_status", {{"type", "boolean"},
                     {"description", "Submit `command` as a shell command line and report its exit code (default false)"}}}
             })},
-            {"required", json::array({"id", "command"})}
+            {"required", json::array({"id"})}
         }},
         {"outputSchema", terminal_output_schema()},
         {"annotations", {
@@ -1163,17 +1184,20 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "get_terminal_output"},
         {"title", "Get Terminal Output"},
         {"description",
-         "Wait for output from a session and return the current screen together with the "
-         "exit status. Pass `cursor` (from a previous result's next_cursor, or 0 for "
-         "everything still retained) to read the raw byte stream from that position "
-         "instead: the result then holds only the new bytes, so polling costs nothing while "
-         "the screen is idle and no output is ever lost. wait_for:\"exit\" waits for the "
-         "process to finish and returns the complete raw stream in one call."},
+         "Wait for output from a session and return it. The result always carries both "
+         "views: `output` is the rendered screen (the last `rows` lines — what an "
+         "interactive program is showing) and `stream` is the raw bytes received since "
+         "the previous read, the position after which is `next_cursor`; the text shows "
+         "whichever is complete, so nothing repeats and nothing is lost. "
+         "Pass `cursor` to read from an explicit position instead (0 = everything still "
+         "retained) and wait_for:\"exit\" to wait for the process to finish and collect "
+         "the complete output in one call. When the log wrapped, truncated_before and "
+         "dropped_bytes say which bytes are gone."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", terminal_read_args(json{
                 {"id",     {{"type", "string"}, {"description", "Terminal session id"}}},
-                {"cursor", {{"type", "number"}, {"description", "Absolute byte cursor: return the raw stream from here (0 = oldest retained byte)"}}}
+                {"cursor", {{"type", "number"}, {"description", "Absolute byte cursor: read from here instead of the session's read position (0 = oldest retained byte)"}}}
             })},
             {"required", json::array({"id"})}
         }},
@@ -1192,8 +1216,8 @@ static std::string mcp_tools_list_response(const json &id,
         {"description",
          "Kill a terminal session and free its resources. Signals the session's whole "
          "process group (SIGHUP, escalating to SIGKILL) and returns the final screen plus "
-         "the complete raw output (from `cursor` when given), so nothing printed before the "
-         "kill is lost."},
+         "the complete raw output still retained (from `cursor` when given), so nothing "
+         "printed before the kill is lost."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
@@ -1302,9 +1326,14 @@ static std::string terminal_state_line(const std::string &id,
                                        bool exited, int exit_code) {
     std::string line = "terminal " + id;
     if (!command.empty()) line += " (" + command + ")";
-    line += exited ? (", exited, code " + std::to_string(exit_code))
-                   : ", running";
+    if (!exited)                    line += ", running";
+    else if (exit_code < 0)         line += ", exited (killed by a signal)";
+    else                            line += ", exited, code " + std::to_string(exit_code);
     return line;
+}
+
+static size_t count_lines(const std::string &s) {
+    return (size_t)std::count(s.begin(), s.end(), '\n');
 }
 
 // Map a terminal_* failure to its stable error code.  TerminalError carries the
@@ -1409,13 +1438,11 @@ static json terminal_structured(const std::string &id,
         {"exited",    r.exited},
         {"exit_code", r.exited ? json(r.exit_code) : json(nullptr)},
         {"total_bytes", r.total_bytes},
+        {"stream",           ensure_valid_utf8(r.stream)},
+        {"first_cursor",     r.first_cursor},
+        {"next_cursor",      r.next_cursor},
+        {"truncated_before", r.truncated},
     };
-    if (r.with_stream) {
-        sc["stream"]           = ensure_valid_utf8(r.stream);
-        sc["first_cursor"]     = r.first_cursor;
-        sc["next_cursor"]      = r.next_cursor;
-        sc["truncated_before"] = r.truncated;
-    }
     if (r.dropped_bytes > 0) sc["dropped_bytes"] = r.dropped_bytes;
     if (r.screen_partial) sc["screen_partial"] = true;
     return sc;
@@ -1423,29 +1450,29 @@ static json terminal_structured(const std::string &id,
 
 // Body of a terminal result.
 //
-//   stream mode (explicit cursor, wait_for:"exit", capture_status) — the caller
-//   is using the session as a data channel, so the body is the raw delta with
-//   escape sequences stripped and CR rewrites applied.
-//
-//   screen mode (default) — the caller is driving an interactive program, so
-//   the body is the rendered screen (unchanged behaviour).
-static std::string terminal_body(const TerminalOutputResult &r, bool stream_mode) {
-    std::string body;
-    if (stream_mode) {
-        body = clean_stream(r.stream);
+//   delta mode  — the caller asked for the stream (explicit cursor) or the new
+//                 output is taller than the screen, so it would be shown as a
+//                 lossy view: the cleaned raw delta is the body.
+//   screen mode — the screen contains everything new (small deltas), so it is
+//                 both readable and complete; no duplicated text.
+static std::string terminal_body(const TerminalOutputResult &r, bool use_delta,
+                                 const std::string &cleaned_delta) {
+    if (use_delta) {
+        std::string body = cleaned_delta;
         if (r.truncated)
             body = "[earlier output was dropped: " + std::to_string(r.dropped_bytes) +
                    " bytes no longer retained]\n" + body;
         if (body.empty()) body = "(no new output)\n";
         return head_tail_reduce(body, kTextHeadBytes, kTextTailBytes);
     }
-    body = r.output;
+    std::string body = r.output;
     if (body.empty()) body = "(no new output)\n";
     return body;
 }
 
-// Screen-mode trailer: without it a caller reads a partial view and never
-// learns that the raw log holds more (the screen keeps at most `rows` lines).
+// Screen-mode trailer: the screen holds the last `rows` lines only, and with
+// several readers of one session the earlier bytes may not have been read by
+// this caller at all.
 static std::string terminal_stream_hint(const TerminalOutputResult &r) {
     if (!r.screen_partial) return std::string();
     return "[screen shows the last lines only \xe2\x80\x94 the complete output is "
@@ -1453,22 +1480,31 @@ static std::string terminal_stream_hint(const TerminalOutputResult &r) {
            ", or run with wait_for:\"exit\"]\n";
 }
 
-// Full text for the run/send/output results: state line, body, hint.
+// Full text for a read result: state line, body, hint.
 static std::string terminal_result_text(const std::string &id,
                                         const std::string &command,
                                         const TerminalOutputResult &r,
-                                        bool stream_mode,
+                                        bool use_delta,
+                                        const std::string &cleaned_delta,
                                         bool has_status, int status,
                                         const std::string &suffix_state) {
     std::string line = terminal_state_line(id, command, r.exited, r.exit_code);
     if (has_status) line += ", command exit code " + std::to_string(status);
     if (!suffix_state.empty()) line += suffix_state;
-    if (stream_mode)
-        line += ", " + std::to_string(r.total_bytes) + " bytes, cursor \xe2\x86\x92 " +
-                std::to_string(r.next_cursor);
-    std::string text = line + "\n\n" + terminal_body(r, stream_mode);
-    if (!stream_mode) text += terminal_stream_hint(r);
+    line += ", " + std::to_string(r.stream.size()) + " bytes, cursor \xe2\x86\x92 " +
+            std::to_string(r.next_cursor);
+    std::string text = line + "\n\n" + terminal_body(r, use_delta, cleaned_delta);
+    if (!use_delta) text += terminal_stream_hint(r);
     return text;
+}
+
+// Does this read want the raw delta as its text?  YES when the caller pinned a
+// cursor; otherwise when the new output is taller than the screen (the screen
+// would silently drop its head - the exact failure the stream exists to fix).
+static bool terminal_use_delta(const RpcRequest &req, const TerminalOutputResult &r,
+                               const std::string &cleaned_delta) {
+    if (req.terminal_cursor.has_value()) return true;
+    return count_lines(cleaned_delta) > count_lines(r.output);
 }
 
 static ToolResult tool_terminal_run(const RpcRequest &req) {
@@ -1477,10 +1513,11 @@ static ToolResult tool_terminal_run(const RpcRequest &req) {
         auto result = terminal_create(req.terminal_command,
                                       req.terminal_cols, req.terminal_rows,
                                       terminal_read_options(req, run_to_completion));
+        const std::string cleaned = clean_stream(result.out.stream);
         ToolResult tr;
         tr.text = terminal_result_text(result.id, req.terminal_command, result.out,
-                                       result.out.with_stream, false, 0,
-                                       std::string());
+                                       terminal_use_delta(req, result.out, cleaned),
+                                       cleaned, false, 0, std::string());
         tr.structured = terminal_structured(result.id, result.out);
         return tr;
     } catch (const std::exception &e) {
@@ -1490,14 +1527,18 @@ static ToolResult tool_terminal_run(const RpcRequest &req) {
 
 static ToolResult tool_terminal_send(const RpcRequest &req) {
     try {
-        const bool run_to_completion = req.terminal_capture_status ||
-                                       req.terminal_wait_for == "exit";
-        auto r = terminal_send(req.session_id, req.terminal_command,
-                               terminal_read_options(req, run_to_completion),
-                               req.terminal_capture_status);
+        TerminalSendOptions opts;
+        opts.read           = terminal_read_options(
+            req, req.terminal_capture_status || req.terminal_wait_for == "exit");
+        opts.capture_status = req.terminal_capture_status;
+        opts.signal         = req.terminal_signal;
+
+        auto r = terminal_send(req.session_id, req.terminal_command, opts);
+        const std::string cleaned = clean_stream(r.out.stream);
         ToolResult tr;
         tr.text = terminal_result_text(req.session_id, std::string(), r.out,
-                                       r.out.with_stream,
+                                       terminal_use_delta(req, r.out, cleaned),
+                                       cleaned,
                                        r.has_command_exit_code, r.command_exit_code,
                                        std::string());
         tr.structured = terminal_structured(req.session_id, r.out);
@@ -1514,9 +1555,11 @@ static ToolResult tool_terminal_output(const RpcRequest &req) {
         const bool run_to_completion = req.terminal_wait_for == "exit";
         auto r = terminal_read(req.session_id,
                                terminal_read_options(req, run_to_completion));
+        const std::string cleaned = clean_stream(r.stream);
         ToolResult tr;
         tr.text = terminal_result_text(req.session_id, std::string(), r,
-                                       r.with_stream, false, 0, std::string());
+                                       terminal_use_delta(req, r, cleaned),
+                                       cleaned, false, 0, std::string());
         tr.structured = terminal_structured(req.session_id, r);
         return tr;
     } catch (const std::exception &e) {
@@ -1531,7 +1574,6 @@ static TerminalOutputResult terminal_out_from_kill(const TerminalKillResult &k) 
     r.output        = k.output;
     r.exited        = true;
     r.exit_code     = k.exit_code;
-    r.with_stream   = true;
     r.stream        = k.stream;
     r.first_cursor  = k.first_cursor;
     r.next_cursor   = k.next_cursor;
@@ -1550,11 +1592,12 @@ static ToolResult tool_terminal_kill(const RpcRequest &req) {
         // with the exit status added after it.
         std::string line = "terminal " + req.session_id + " killed";
         if (!r.killed) line += " (already exited)";
-        line += ", exit code " + std::to_string(r.exit_code) +
-                ", cursor \xe2\x86\x92 " + std::to_string(r.next_cursor);
+        if (r.exit_code < 0) line += ", killed by a signal";
+        else                 line += ", exit code " + std::to_string(r.exit_code);
+        line += ", cursor \xe2\x86\x92 " + std::to_string(r.next_cursor);
 
         ToolResult tr;
-        tr.text = line + "\n\n" + terminal_body(out, true);
+        tr.text = line + "\n\n" + terminal_body(out, true, clean_stream(out.stream));
         tr.structured = terminal_structured(req.session_id, out);
         tr.structured.value()["killed"] = r.killed;
         return tr;

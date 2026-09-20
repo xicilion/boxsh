@@ -58,8 +58,11 @@ struct TerminalReadOptions {
     int          wait_ms  = 500;             // 0 = return at once
     TerminalWait wait_for = TerminalWait::Output;
     // Absolute cursor into the raw log, taken from a previous result's
-    // `next_cursor`.  Absent = start at the oldest retained byte, i.e. "give me
-    // everything you still have".
+    // `next_cursor`.  Absent = continue where the session's read cursor points:
+    // it starts at 0 (everything the log still holds) and is advanced by every
+    // read, so a poll returns what arrived since the previous one.  Passing an
+    // explicit cursor reads that position and leaves the session's cursor alone
+    // beyond moving it forward to the end of what was returned.
     std::optional<uint64_t> cursor;
 };
 
@@ -67,21 +70,19 @@ struct TerminalReadOptions {
 // Public API
 // ---------------------------------------------------------------------------
 
-// Result of a read.  `output` is the rendered screen; the raw-log fields are
-// filled in when the caller asked for the stream channel.
+// Result of a read.  `output` is the rendered screen; `stream` is the raw-log
+// delta the read consumed (always present - see the cursor rules below).
 struct TerminalOutputResult {
     std::string output;    // rendered screen snapshot
     bool        exited;    // the session's process has exited
     int         exit_code; // valid when exited (-1 for a signal)
 
-    // Raw-log channel: `stream` holds the bytes in
-    // [requested cursor (or oldest retained byte), next_cursor).
-    bool        with_stream  = false; // false: the stream was not requested
+    // Raw-log channel: `stream` holds the bytes in [first_cursor, next_cursor).
     std::string stream;
-    uint64_t    first_cursor = 0;     // oldest cursor still retained
+    uint64_t    first_cursor = 0;     // where the returned stream starts
     uint64_t    next_cursor  = 0;     // pass as `cursor` to continue reading
     uint64_t    total_bytes  = 0;     // bytes received since session start
-    bool        truncated    = false; // the requested cursor was already dropped
+    bool        truncated    = false; // bytes before first_cursor were dropped
     uint64_t    dropped_bytes = 0;    // bytes dropped from the log since start
     // True when the session produced more lines than the rendered screen can
     // show: `output` is a partial view and only the stream has everything.
@@ -108,23 +109,34 @@ struct TerminalSendResult {
     int  command_exit_code     = 0;
 };
 
-// Write `text` to a session's PTY stdin, then read the result.
-//
-// `capture_status` submits the text as a shell command line and appends a
-// self-erasing status probe, so the command's exit code comes back in
-// TerminalSendResult::command_exit_code.  Shell sessions only: the probe is
-// input, so an interactive program (a REPL, a pager) would just see garbage.
-// Throws TerminalError if id is unknown or the session has exited.
-TerminalSendResult terminal_send(const std::string &id, const std::string &text,
-                                 const TerminalReadOptions &opts = {},
-                                 bool capture_status = false);
+// Options for terminal_send().
+struct TerminalSendOptions {
+    TerminalReadOptions read;
+    // Submit the text as a shell command line and append a self-erasing status
+    // probe, reporting the command's exit code (shell sessions only).
+    bool        capture_status = false;
+    // Deliver a signal to the session's process group instead of (or after)
+    // writing text: "INT", "TERM", "KILL", "HUP", "QUIT", "USR1", "USR2",
+    // "STOP", "CONT".  Empty = no signal.  An unknown name is E_INVALID_ARGUMENT.
+    std::string signal;
+};
 
-// Read a session without writing to it.
+// Write `text` to a session's PTY stdin (empty text = signal only), then read
+// the result according to opts.read.
 //
-// The raw-log channel is included when the caller treats the session as a data
-// channel — i.e. when `opts.cursor` is set or `opts.wait_for` is Exit — and
-// stays out of a plain screen poll, so a polling loop can never pull the whole
-// log by accident.  Throws TerminalError if id is unknown.
+// A signal is delivered to the whole process group the session leads, which is
+// what makes "INT" abort the current command *and* the rest of its command
+// line, unlike a raw ETX byte (interrupts the foreground job only, exactly like
+// pressing Ctrl-C on a physical terminal).
+// Throws TerminalError if id is unknown, the session has exited or the signal
+// name is not one of the listed ones.
+TerminalSendResult terminal_send(const std::string &id, const std::string &text,
+                                 const TerminalSendOptions &opts = {});
+
+// Read a session without writing to it.  The raw-log delta in [first_cursor,
+// next_cursor) is always attached; `wait_for:"exit"` waits for the process to
+// finish so one call returns the complete output.  Throws TerminalError if id
+// is unknown.
 TerminalOutputResult terminal_read(const std::string &id,
                                    const TerminalReadOptions &opts = {});
 
