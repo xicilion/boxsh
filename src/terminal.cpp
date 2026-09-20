@@ -1025,6 +1025,19 @@ TerminalKillResult terminal_kill(const std::string &id,
 // List
 // ---------------------------------------------------------------------------
 
+void terminal_interrupt(const std::string &id) {
+    auto s = TerminalManager::instance().get(id);
+    if (!s) return;
+    std::lock_guard<std::mutex> lk(s->mu);
+    if (s->exited) return;
+    // Both targets, exactly like `signal: "INT"`: the foreground job stops what
+    // is running, and the shell abandons the rest of that command line - a
+    // cancelled call asked for the command, so leaving `cmd1; cmd2` to continue
+    // would be the wrong kind of silence.  The shell itself survives, and with it
+    // the session and its state.
+    deliver_signal(*s, SIGINT);
+}
+
 std::vector<TerminalInfo> terminal_list() {
     terminal_sweep();
     auto sessions = TerminalManager::instance().all();

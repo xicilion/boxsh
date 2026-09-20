@@ -398,11 +398,21 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
         return true;
     }
 
-    // MCP notifications: no response needed.
-    if (method == "notifications/initialized") {
-        req.cmd = method;
+    // MCP notifications: no response needed, and per the spec a notification
+    // never gets one - answering is what used to make clients log schema errors
+    // ({"id":null} is neither a request id nor valid for a response).
+    if (method.rfind("notifications/", 0) == 0) {
+        req.cmd  = method;
         req.tool = ToolKind::None;
         req.timeout_sec = -2;    // flag for notifications
+        if (method == "notifications/cancelled") {
+            // The client gave up on a request (SDK: request timeout).  Acting on
+            // it is what stops the command instead of letting it run until the
+            // server-side default timeout.
+            if (params.contains("requestId"))
+                req.cancel_id   = params["requestId"];
+            req.timeout_sec = -3; // flag for cancellation
+        }
         return true;
     }
 
@@ -710,7 +720,302 @@ json safe_id_value(const json &id) {
     return safe_id;
 }
 
+// ---------------------------------------------------------------------------
+// Result budget
+//
+// A client's stdio read buffer is a hard wall: the official MCP SDK keeps 10 MiB
+// (STDIO_DEFAULT_MAX_BUFFER_SIZE) and, on overflow, clears the buffer *and*
+// closes the transport - every later request then fails with "Not connected".
+// So the guarantee has to be about the JSON that actually goes out, not about
+// the raw output behind it: JSON escaping turns a NUL byte into "\u0000" (six
+// bytes) and doubles quotes and backslashes, so 2 MB of binary output becomes a
+// 12 MB message while 8 MB of plain text stays under 10 MB.
+//
+// escaped_len() mirrors nlohmann's compact dump() (ensure_ascii == false)
+// exactly, which is what lets a payload be sized without serializing it:
+//   \b \t \n \f \r \" \\ -> 2 bytes each;  other C0 controls -> \u00xx (6)
+//   everything else (0x7F, valid UTF-8) -> copied verbatim
+// tests/result-budget.test.mjs checks the outcome (fits the budget, both ends
+// intact) against payloads built to hit every one of those cases.
+// ---------------------------------------------------------------------------
+
+size_t escaped_len(const char *data, size_t n) {
+    size_t len = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = static_cast<unsigned char>(data[i]);
+        switch (c) {
+            case 0x08: case 0x09: case 0x0A: case 0x0C: case 0x0D:
+            case 0x22: case 0x5C:
+                len += 2;
+                break;
+            default:
+                len += (c <= 0x1F) ? 6 : 1;
+                break;
+        }
+    }
+    return len;
+}
+
+size_t escaped_len(const std::string &s) { return escaped_len(s.data(), s.size()); }
+
+// How many raw bytes fit in `budget` encoded bytes, walking from `from` in
+// `dir` (+1 forwards, -1 backwards) and never crossing `limit`.  Backwards walks
+// step over whole UTF-8 sequences so a multi-byte character is never split in
+// half (every byte of one is copied verbatim, so escaping a sequence is just its
+// length).
+size_t fit_raw_bytes(const std::string &raw, size_t from, int dir, size_t budget,
+                     size_t limit) {
+    size_t used = 0, pos = from;
+    while (true) {
+        if (dir > 0) {
+            if (pos >= limit) break;
+            size_t add = escaped_len(raw.data() + pos, 1);
+            if (used + add > budget) break;
+            used += add;
+            pos++;
+        } else {
+            if (pos <= limit) break;
+            size_t p = pos - 1;
+            while (p > limit && (static_cast<unsigned char>(raw[p]) & 0xC0) == 0x80) p--;
+            size_t add = escaped_len(raw.data() + p, pos - p);
+            if (used + add > budget) break;
+            used += add;
+            pos = p;
+        }
+    }
+    return dir > 0 ? pos - from : from - pos;
+}
+
+// Cut `raw` down to `budget` *encoded* bytes, keeping both ends: what the
+// command printed first and what it printed last (where the error usually is).
+struct TrimmedValue {
+    std::string data;
+    size_t      dropped_raw_bytes = 0;
+    bool        trimmed           = false;
+};
+
+TrimmedValue trim_to_encoded_budget(const std::string &raw, size_t budget) {
+    TrimmedValue out;
+    if (budget == 0 || escaped_len(raw) <= budget) {
+        out.data = raw;
+        return out;
+    }
+    out.trimmed = true;
+
+    size_t head_len = fit_raw_bytes(raw, 0, +1, budget / 2, raw.size());
+    size_t tail_len = fit_raw_bytes(raw, raw.size(), -1, budget - budget / 2,
+                                    head_len);
+
+    // Text: snap both cuts to line boundaries (inward only, so the budget still
+    // holds) - half a line at either end reads like corruption.
+    auto looks_like_text = [&]() {
+        size_t probe = std::min<size_t>(raw.size(), 4096), printable = 0;
+        for (size_t i = 0; i < probe; ++i) {
+            unsigned char c = static_cast<unsigned char>(raw[i]);
+            if (c == '\n' || c == '\t' || (c >= 0x20 && c != 0x7F)) printable++;
+        }
+        return probe > 0 && printable * 10 >= probe * 9;
+    };
+    if (looks_like_text()) {
+        const size_t window = 512;
+        for (size_t back = head_len; back > 0 && head_len - back < window; back--) {
+            if (raw[back - 1] == '\n') { head_len = back; break; }
+        }
+        size_t tail_start = raw.size() - tail_len;
+        const size_t limit = head_len > 0 ? head_len : 0;
+        size_t fwd = tail_start, stop = std::min(raw.size(), tail_start + window);
+        while (fwd < stop) {
+            if (raw[fwd] == '\n' && fwd + 1 > limit) { tail_start = fwd + 1; break; }
+            fwd++;
+        }
+        tail_len = raw.size() - tail_start;
+        if (head_len + tail_len > raw.size()) {
+            head_len = raw.size();
+            tail_len = 0;
+        }
+    }
+
+    const size_t head_end   = head_len;
+    const size_t tail_start = raw.size() - tail_len;
+    out.dropped_raw_bytes   = raw.size() - head_len - tail_len;
+    out.data = raw.substr(0, head_end) +
+               "\n\xe2\x80\xa6 [truncated: " + std::to_string(out.dropped_raw_bytes) +
+               " of " + std::to_string(raw.size()) +
+               " bytes omitted to fit the result budget] \xe2\x80\xa6\n" +
+               (tail_len ? raw.substr(tail_start) : std::string());
+    return out;
+}
+
+size_t g_result_budget = 8u * 1024u * 1024u; // --max-result-bytes (0 = unlimited)
+
+// Percentage of the budget kept free so the bookkeeping around the payloads
+// (content blocks, isError, an id, transport framing) cannot push the message
+// over the edge, and so a client that buffers one more chunk still fits.
+constexpr size_t kResultBudgetSlack = 32u * 1024u;
+
+// Enforce the result budget on an already-built message.
+//
+// Candidates are cut in a defined order and never silently: the model-facing
+// text first (a model can live with a shorter preview), then the payload fields
+// the tool declared trimmable (bash stdout/stderr, terminal stream).  Small
+// ones are kept whole - a 300 KiB text is not worth cutting to make room for a
+// 12 MB payload - and the big ones share what is left in proportion to their
+// size.  Fields are never *corrupted*: a value either fits or is cut with a
+// marker.  Images are not trimmed (half an image is worthless), so a result that
+// cannot carry one is reported as a tool failure instead.
+void enforce_result_budget(json &j, const std::vector<std::string> &fields,
+                           const std::vector<ImagePart> &images) {
+    const size_t budget = g_result_budget;
+    if (budget == 0) return;
+    if (!j.contains("result") || !j["result"].is_object()) return;
+    json &result = j["result"];
+
+    std::string *text = nullptr;
+    if (result.contains("content") && result["content"].is_array() &&
+        !result["content"].empty() && result["content"][0].is_object() &&
+        result["content"][0].contains("text") && result["content"][0]["text"].is_string()) {
+        text = &result["content"][0]["text"].get_ref<std::string &>();
+    }
+    json *sc = (result.contains("structuredContent") &&
+                result["structuredContent"].is_object())
+                   ? &result["structuredContent"] : nullptr;
+
+    struct Candidate {
+        std::string  name;   // "" for the text block
+        std::string *value;
+        bool         small = false;
+    };
+    std::vector<Candidate> cands;
+    if (text) cands.push_back({"", text, false});
+    for (const auto &f : fields) {
+        if (sc && sc->contains(f) && (*sc)[f].is_string())
+            cands.push_back({f, &(*sc)[f].get_ref<std::string &>(), false});
+    }
+    if (cands.empty()) return;
+
+    // Size the message without serializing it: an empty string costs 2 bytes,
+    // and every candidate contributes its exact escaped length.
+    json probe = j;
+    {
+        json &pr = probe["result"];
+        if (text) pr["content"][0]["text"] = "";
+        for (const auto &c : cands) {
+            if (!c.name.empty()) pr["structuredContent"][c.name] = "";
+        }
+    }
+    const size_t base = probe.dump().size();
+    size_t payload_esc = 0;
+    for (const auto &c : cands) payload_esc += escaped_len(*c.value);
+    const size_t total = base + payload_esc - 2 * cands.size();
+    if (total <= budget) return;                  // fits: nothing to do
+
+    if (base >= budget) {
+        // Even the empty envelope does not fit (a tiny budget, a huge id).
+        // Say so instead of sending something that would break the client.
+        json minimal;
+        minimal["jsonrpc"] = "2.0";
+        minimal["id"]      = j.value("id", json(nullptr));
+        minimal["result"]  = json::object();
+        minimal["result"]["content"] = json::array();
+        minimal["result"]["content"].push_back({{"type", "text"},
+            {"text", std::string(error_code::kTooLarge) +
+                     ": result exceeds the " + std::to_string(budget) +
+                     "-byte result budget before any payload was added "
+                     "(raise --max-result-bytes)"}});
+        minimal["result"]["structuredContent"] = {
+            {"code", error_code::kTooLarge},
+            {"message", "result envelope exceeds the " + std::to_string(budget) +
+                        "-byte result budget"}};
+        minimal["result"]["isError"] = true;
+        j = std::move(minimal);
+        return;
+    }
+
+    // Slack so the bookkeeping around the payloads (content blocks, isError, an
+    // id, transport framing) cannot push the message over the edge, and so a
+    // client that buffers one more chunk still fits.  Scaled for small budgets,
+    // where a fixed 32 KiB would waste half of it.
+    const size_t slack     = std::min(kResultBudgetSlack, budget / 8);
+    const size_t available = budget - base > slack ? budget - base - slack
+                                                   : budget - base;
+
+    // The model-facing text comes first: a legacy client that only forwards
+    // content[0].text must still see a usable preview, so it keeps a quarter of
+    // the budget before the payloads compete for the rest.
+    size_t text_keep = 0;
+    if (text) {
+        const size_t e = escaped_len(*text);
+        text_keep = std::min(e, available / 4);
+    }
+
+    // Payloads: the small ones are kept whole (cutting a 2 KB stderr to make
+    // room for a 12 MB stdout would be silly), the big ones share what is left
+    // in proportion to their size.
+    const size_t rest       = available - text_keep;
+    const size_t small_limit = rest / 8;
+    size_t kept = text_keep, big_total = 0;
+    for (auto &c : cands) {
+        if (c.name.empty()) continue;            // text, counted above
+        const size_t e = escaped_len(*c.value);
+        c.small = e <= small_limit;
+        if (c.small) kept += e;
+        else         big_total += e;
+    }
+    if (kept > available) {                      // everything small, still too much
+        for (auto &c : cands) c.small = false;
+        kept = text_keep;
+        big_total = 0;
+        for (const auto &c : cands)
+            if (!c.name.empty()) big_total += escaped_len(*c.value);
+    }
+    const size_t pool = available > kept ? available - kept : 0;
+
+    size_t dropped_total = 0;
+    bool   any = false;
+    for (auto &c : cands) {
+        const size_t e = escaped_len(*c.value);
+        const size_t share = c.name.empty()
+                                 ? text_keep
+                                 : (c.small ? e
+                                            : (big_total ? (size_t)((double)pool *
+                                                               ((double)e / (double)big_total))
+                                                         : 0));
+        TrimmedValue t = trim_to_encoded_budget(*c.value, share);
+        if (!t.trimmed) continue;
+        any = true;
+        dropped_total += t.dropped_raw_bytes;
+        *c.value = t.data;
+        if (c.name.empty()) continue;               // text is self-describing
+        if (sc) {
+            (*sc)[c.name + "_truncated"]       = true;
+            (*sc)[c.name + "_dropped_bytes"]   = t.dropped_raw_bytes;
+        }
+    }
+    if (!any) return;
+
+    if (sc) {
+        (*sc)["result_truncated"]     = true;
+        (*sc)["result_dropped_bytes"] = dropped_total;
+        (*sc)["result_budget_bytes"]  = budget;
+    }
+    if (text) {
+        *text += "[result truncated: " + std::to_string(dropped_total) +
+                 " bytes dropped to fit the " + std::to_string(budget) +
+                 "-byte result budget (--max-result-bytes)]\n";
+    }
+
+    if (j.dump().size() > budget) {
+        // Should not happen (slack + proportional shares), but never emit a
+        // message that could take the client's transport down with it.
+        for (auto &c : cands)
+            if (!c.name.empty()) *c.value = "";
+    }
+}
+
 } // namespace
+
+void rpc_set_result_budget(size_t encoded_bytes) { g_result_budget = encoded_bytes; }
+size_t rpc_result_budget() { return g_result_budget; }
 
 // Build the unified result for a shell command (bash tool).
 ToolResult tool_result_from_bash(const RpcResponse &resp) {
@@ -722,6 +1027,7 @@ ToolResult tool_result_from_bash(const RpcResponse &resp) {
                                resp.stdout_truncated, resp.stderr_truncated,
                                resp.timeout_sec,
                                resp.timeout_from_server_default);
+    tr.trimmable_fields = {"stdout", "stderr"};
 
     json sc = {
         {"exit_code",   resp.exit_code},
@@ -777,6 +1083,7 @@ std::string rpc_serialize_tool_result(const json &id, const ToolResult &tr,
     }
 
     j["result"] = std::move(result);
+    enforce_result_budget(j, tr.trimmable_fields, tr.images);
     return j.dump();
 }
 
@@ -869,6 +1176,9 @@ static std::string mcp_tools_list_response(const json &id,
                 {"next_cursor",  {{"type", "integer"}, {"description", "Pass as `cursor` to read only what comes after this result"}}},
                 {"truncated_before", {{"type", "boolean"}, {"description", "Bytes before first_cursor were dropped from the log and cannot be recovered"}}},
                 {"dropped_bytes", {{"type", "integer"}, {"description", "Bytes dropped from the front of the raw log so far"}}},
+                {"result_truncated", {{"type", "boolean"}, {"description", "The payload was cut to fit the result budget (--max-result-bytes)"}}},
+                {"result_dropped_bytes", {{"type", "integer"}, {"description", "Raw bytes dropped to fit the result budget"}}},
+                {"result_budget_bytes", {{"type", "integer"}, {"description", "Budget that was in force when the payload was cut"}}},
                 {"command_exit_code", {{"type", "integer"}, {"description", "Exit code of the command just submitted (capture_status only)"}}}
             }},
             {"required", json::array({"id", "output", "exited", "exit_code"})}
@@ -922,6 +1232,11 @@ static std::string mcp_tools_list_response(const json &id,
                 {"duration_ms", { {"type", "integer"}, {"description", "Wall-clock execution time in milliseconds"}}},
                 {"stdout_truncated", { {"type", "boolean"}, {"description", "stdout hit the 10 MiB cap"}}},
                 {"stderr_truncated", { {"type", "boolean"}, {"description", "stderr hit the 10 MiB cap"}}},
+                {"stdout_dropped_bytes", { {"type", "integer"}, {"description", "Raw stdout bytes dropped to fit the result budget"}}},
+                {"stderr_dropped_bytes", { {"type", "integer"}, {"description", "Raw stderr bytes dropped to fit the result budget"}}},
+                {"result_truncated", { {"type", "boolean"}, {"description", "The result was cut to fit the result budget (--max-result-bytes)"}}},
+                {"result_dropped_bytes", { {"type", "integer"}, {"description", "Raw bytes dropped to fit the result budget"}}},
+                {"result_budget_bytes", { {"type", "integer"}, {"description", "Budget that was in force when the result was cut"}}},
                 {"timed_out", { {"type", "boolean"}, {"description", "The command was killed after its timeout expired"}}},
                 {"timeout_sec", { {"type", "integer"}, {"description", "Timeout that was in force when the command was killed (only with timed_out)"}}},
                 {"timeout_source", { {"type", "string"}, {"enum", json::array({"request", "server_default"})},
@@ -1519,6 +1834,7 @@ static ToolResult tool_terminal_run(const RpcRequest &req) {
                                        terminal_use_delta(req, result.out, cleaned),
                                        cleaned, false, 0, std::string());
         tr.structured = terminal_structured(result.id, result.out);
+        tr.trimmable_fields = {"stream"};
         return tr;
     } catch (const std::exception &e) {
         return terminal_exception_result(e);
@@ -1542,6 +1858,7 @@ static ToolResult tool_terminal_send(const RpcRequest &req) {
                                        r.has_command_exit_code, r.command_exit_code,
                                        std::string());
         tr.structured = terminal_structured(req.session_id, r.out);
+        tr.trimmable_fields = {"stream"};
         if (r.has_command_exit_code)
             tr.structured.value()["command_exit_code"] = r.command_exit_code;
         return tr;
@@ -1561,6 +1878,7 @@ static ToolResult tool_terminal_output(const RpcRequest &req) {
                                        terminal_use_delta(req, r, cleaned),
                                        cleaned, false, 0, std::string());
         tr.structured = terminal_structured(req.session_id, r);
+        tr.trimmable_fields = {"stream"};
         return tr;
     } catch (const std::exception &e) {
         return terminal_exception_result(e);
@@ -1600,6 +1918,7 @@ static ToolResult tool_terminal_kill(const RpcRequest &req) {
         tr.text = line + "\n\n" + terminal_body(out, true, clean_stream(out.stream));
         tr.structured = terminal_structured(req.session_id, out);
         tr.structured.value()["killed"] = r.killed;
+        tr.trimmable_fields = {"stream"};
         return tr;
     } catch (const std::exception &e) {
         return terminal_exception_result(e);
@@ -2830,8 +3149,14 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
     // Each in-flight tool request gets its own socketpair.  A detached thread
     // runs the handler inside the coordinator's sandbox namespace and writes a
     // 4-byte LE length + serialized response; the event loop polls the read end
-    // alongside worker sockets.
-    struct ToolEntry { int fd; };
+    // alongside worker sockets.  The id and the request are kept so a client
+    // cancellation can be matched to it.
+    struct ToolEntry {
+        int          fd;
+        nlohmann::json id;
+        RpcRequest   req;
+        bool         cancelled = false;   // client gave up: drop the response
+    };
     std::vector<ToolEntry> pending_tools;
 
     // A cmd request that arrived when all workers were busy.  We hold exactly
@@ -2880,8 +3205,35 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
             close(write_fd);
         }).detach();
 
-        pending_tools.push_back({sv[0]});
+        pending_tools.push_back({sv[0], req.id, req, false});
         in_flight++;
+    };
+
+    // The client gave up on a request (notifications/cancelled; the official
+    // SDK sends it when a tool call times out).  MCP gives a cancelled request
+    // no reply at all, so the response is dropped - and whatever the request
+    // was running is stopped, which is what keeps a runaway command from
+    // outliving its caller (the server-side default timeout is only a net for
+    // clients that die without saying anything).
+    auto cancel_in_flight = [&](const nlohmann::json &id) {
+        if (buffered_cmd.has_value() && buffered_cmd->id == id) {
+            buffered_cmd.reset();          // not dispatched yet: forget it
+            return;
+        }
+        if (pool.cancel(id))               // running in a worker: kill its group
+            return;
+        for (auto &t : pending_tools) {    // running on a tool thread
+            if (t.id != id) continue;
+            t.cancelled = true;
+            // A tool thread cannot be interrupted, but a request that submitted
+            // a command line to a terminal session can still stop it: the caller
+            // who asked for that command is gone.  The session itself stays.
+            const bool submitted_command =
+                t.req.tool == ToolKind::TerminalRun ||
+                (t.req.tool == ToolKind::TerminalSend && t.req.terminal_capture_status);
+            if (submitted_command)
+                terminal_interrupt(t.req.session_id);
+        }
     };
 
     while (true) {
@@ -2919,6 +3271,13 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
 
             // MCP notifications: no response.
             if (req.timeout_sec == -2) continue;
+
+            // MCP cancellation: the client no longer waits for this request, so
+            // stop its work and drop its response.
+            if (req.timeout_sec == -3) {
+                cancel_in_flight(req.cancel_id);
+                continue;
+            }
 
             // MCP protocol methods: respond synchronously.
             if (req.timeout_sec == -1) {
@@ -2992,7 +3351,7 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
         for (size_t i = 0; i < busy.size(); i++) {
             if (pfds[pfd_off + i].revents & (POLLIN | POLLHUP | POLLERR)) {
                 RpcResponse resp = pool.collect(busy[i].idx);
-                write_resp(resp);
+                if (!resp.suppressed) write_resp(resp);
                 in_flight--;
             }
         }
@@ -3008,7 +3367,7 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
             if (read_all(tfd, &len, sizeof(len)) &&
                 len > 0 && len <= kMaxTransportMessageBytes) {
                 std::string payload(len, '\0');
-                if (read_all(tfd, &payload[0], len)) {
+                if (read_all(tfd, &payload[0], len) && !pending_tools[i].cancelled) {
                     // payload includes trailing '\n' from the serializer;
                     // strip it so write_msg can apply the correct framing.
                     std::string body = payload;

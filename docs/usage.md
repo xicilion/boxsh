@@ -875,7 +875,7 @@ but reduced to a single flag.
 RPC mode turns boxsh into an MCP-compatible server. It reads JSON-RPC 2.0 requests from stdin and writes responses to stdout. Any MCP client (VS Code, Claude Desktop, Cursor, etc.) can connect directly.
 
 ```sh
-boxsh --rpc [--workers N] [--command-timeout N] [--session-log-limit N] [--max-sessions N] [--session-ttl N] [sandbox flags...]
+boxsh --rpc [--workers N] [--command-timeout N] [--session-log-limit N] [--max-sessions N] [--session-ttl N] [--max-result-bytes N] [sandbox flags...]
 ```
 
 - `--workers N` — number of parallel workers (default: 4)
@@ -883,6 +883,7 @@ boxsh --rpc [--workers N] [--command-timeout N] [--session-log-limit N] [--max-s
 - `--session-log-limit N` — raw output bytes kept per terminal session (default: 1048576); when the ring wraps, results report `truncated_before` / `dropped_bytes`
 - `--max-sessions N` — maximum live terminal sessions (default: 32); one more fails with `E_TOO_MANY_SESSIONS`
 - `--session-ttl N` — seconds an exited session stays addressable before being reaped (default: 600; `0` keeps them)
+- `--max-result-bytes N` — budget for one serialized tool result, in **encoded** bytes (default: 8388608; `0` disables it). Clients keep a fixed stdio read buffer — the official MCP SDK uses 10 MiB and closes the transport when it overflows, after which every request fails with `Not connected` — so an oversized payload is cut head + tail to fit instead of being sent
 - Responses arrive in **completion order**, not submission order
 
 boxsh supports two transports, auto-detected from the first bytes:
@@ -898,6 +899,8 @@ boxsh supports two transports, auto-detected from the first bytes:
 |---|---|
 | `initialize` | Returns server capabilities and protocol version (`2025-06-18`; known older revisions are echoed back) |
 | `notifications/initialized` | Acknowledged silently (no response) |
+| `notifications/cancelled` | Stops the request it names and sends no reply — see [Cancellation](#cancellation) |
+| other `notifications/*` | Ignored silently: a notification never gets a response |
 | `tools/list` | Returns all ten tools with `inputSchema`, `outputSchema` and `annotations` |
 | `tools/call` | Dispatches to a named tool: `bash`, `read`, `view_image`, `write`, `edit`, `run_in_terminal`, `send_to_terminal`, `get_terminal_output`, `kill_terminal`, `list_terminals` |
 
@@ -1140,6 +1143,33 @@ take:
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"make -j8","timeout":900}}}' | boxsh --rpc --command-timeout 5
 ```
+
+#### Cancellation
+
+`--command-timeout` is a net for callers that vanish without saying anything. A
+caller that *says* it gave up is served much better by `notifications/cancelled`
+— exactly what the official MCP SDK sends when a tool call times out
+(`{requestId, reason}`):
+
+```sh
+# 1. ask for a long command, then give up on it: a cancelled request gets no reply
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 300","timeout":0}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"Request timed out"}}' \
+| boxsh --rpc --command-timeout 0
+```
+
+What boxsh does with it:
+
+| The cancelled request was … | Effect |
+|---|---|
+| a `bash` command still waiting to be dispatched | dropped, never runs |
+| a `bash` command already running in a worker | its **whole process group is killed** immediately; the worker is replaced |
+| a terminal call that submitted a command line (`capture_status`, or a `run_in_terminal` waiter) | `SIGINT` to the session: the command line is abandoned, the **session and its state survive** |
+| anything else (a file tool, a plain read) | the response is dropped when it arrives |
+
+Notifications are never answered — not `notifications/cancelled`, not any other,
+known or unknown. Answering them is what used to make clients log schema errors
+(`{"id":null}` is not a valid response id) while the command kept running.
 
 In both cases the command's whole process group is killed and the worker stays
 alive — it accepts the next request immediately, nothing is respawned. The

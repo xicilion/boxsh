@@ -50,6 +50,13 @@ struct ToolResult {
     std::optional<nlohmann::json> structured; // MUST match the tool's outputSchema
     std::vector<ImagePart>        images;     // non-empty => text MUST be set
     std::optional<ToolError>      error;      // tool failure (isError:true)
+
+    // Keys inside `structured` whose string values may be cut when the encoded
+    // result would exceed the result budget (bash: stdout/stderr, terminal:
+    // stream).  Everything else is never touched: an image or a metadata field
+    // is either delivered as is or reported as a failure (see rpc.cpp
+    // "result budget").
+    std::vector<std::string> trimmable_fields;
 };
 
 // Convenience constructors.
@@ -106,6 +113,11 @@ struct RpcRequest {
     // tool error — E_INVALID_ARGUMENT — rather than a protocol error, which is
     // what the tool result contract asks for.
     std::string arg_error;
+
+    // Set for notifications/cancelled: the id of the request the client gave up
+    // on (string or number).  Requests are never answered as notifications, but
+    // this one has to be acted upon.
+    nlohmann::json cancel_id;
 };
 
 // ---------------------------------------------------------------------------
@@ -142,6 +154,11 @@ struct RpcResponse {
     // When false and error is set, it is a tool execution error and should be
     // serialized as MCP CallToolResult with isError=true.
     bool is_protocol_error = false;
+
+    // True when the client cancelled this request while it was running: MCP
+    // gives a cancelled request no reply at all, so the event loop drops this
+    // response instead of writing it.
+    bool suppressed = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -160,6 +177,14 @@ std::string rpc_serialize_tool_result(const nlohmann::json &id,
 // Build the unified result for a shell command (bash tool) response.
 ToolResult tool_result_from_bash(const RpcResponse &resp);
 
+// Budget for one serialized tool result, in *encoded* bytes (0 = no limit).
+// Exceeding a client's stdio read buffer is fatal for the whole session - the
+// official SDK drops its buffer and closes the transport - so this is enforced
+// on the JSON that actually goes out (see rpc.cpp).  Set once at startup from
+// --max-result-bytes.
+void rpc_set_result_budget(size_t encoded_bytes);
+size_t rpc_result_budget();
+
 // Parse one JSON line into an RpcRequest.
 // Returns false and sets parse_error on failure.
 bool rpc_parse_request(const std::string &line, RpcRequest &req,
@@ -167,7 +192,6 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
 
 // Forward declaration — avoids circular include with worker_pool.h.
 class WorkerPool;
-
 // Run the concurrent RPC event loop.
 void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool);
 

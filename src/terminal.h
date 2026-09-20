@@ -156,7 +156,14 @@ struct TerminalKillResult {
 TerminalKillResult terminal_kill(const std::string &id,
                                  const std::optional<uint64_t> &cursor = {});
 
-// Return metadata for every live session plus exited sessions that have not
+// Interrupt what a session is running: SIGINT to its foreground process group
+// (the job a physical Ctrl-C would reach).  The session itself, its shell and
+// its state survive - this is what a cancelled `run_in_terminal`/`capture_status`
+// call does with the command its caller no longer waits for.  Unknown or already
+// exited sessions are ignored (no-op), so a cancellation can never fail.
+void terminal_interrupt(const std::string &id);
+
+// Metadata for every live session plus exited sessions that have not
 // been reaped yet (see TerminalConfig::ttl_sec).
 std::vector<TerminalInfo> terminal_list();
 

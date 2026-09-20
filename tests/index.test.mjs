@@ -12,6 +12,8 @@ import './tools.test.mjs';
 import './file-tools-robustness.test.mjs';
 import './view-image.test.mjs';
 import './tool-contract.test.mjs';
+import './result-budget.test.mjs';
+import './cancel.test.mjs';
 import './mcp.test.mjs';
 import './protocol-regression.test.mjs';
 import './sandbox-escape.test.mjs';

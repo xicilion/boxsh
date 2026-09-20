@@ -28,7 +28,8 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 | **Pre-forked worker pool** | Configurable number of workers (`--workers N`); each worker is forked once and reused across requests |
 | **Crash recovery** | If a worker is killed (timeout, segfault, OOM), the coordinator detects `POLLHUP`, returns an error response, and immediately respawns a replacement |
 | **Per-request timeout** | `timeout` argument on the `bash` tool, enforced by the worker with a monotonic deadline |
-| **Server-side default timeout** | `--command-timeout N` (default 60 s) applies to requests that carry no timeout of their own, so a command whose caller walked away does not run forever; `0` disables it |
+| **Server-side default timeout** | `--command-timeout N` (default 60 s) applies to requests that carry no timeout of their own, so a command whose caller walked away does not run forever; `0` disables it. A client that *says* it gave up (`notifications/cancelled`) stops its command immediately |
+| **Result budget** | One serialized tool result may not exceed `--max-result-bytes` (default 8 MiB) *encoded* bytes, so no output shape can overflow a client's stdio read buffer (the official SDK keeps 10 MiB and closes the transport on overflow) |
 | **Stateful PTY sessions** | Five terminal tools over real PTY sessions: interactive programs, persistent cwd/env, and an addressable raw output log (cursor-based, no loss above the visible screen). Bounded by `--max-sessions` (32), `--session-log-limit` (1 MiB) and `--session-ttl` (600 s) |
 | **Shutdown cleanup** | On SIGTERM/SIGINT/SIGHUP (or a killed coordinator) every running command and PTY session is killed at its process group — no orphans |
 | **Bind mounts** | Selectively expose host paths (read-write or read-only) inside the sandbox |
@@ -137,7 +138,7 @@ boxsh implements [MCP (Model Context Protocol)](https://modelcontextprotocol.io/
 ```sh
 boxsh --rpc [--workers N] [--shell PATH] [--command-timeout N] \
            [--session-log-limit BYTES] [--max-sessions N] [--session-ttl SECONDS] \
-           [sandbox flags...]
+           [--max-result-bytes BYTES] [sandbox flags...]
 ```
 
 ### Transport
@@ -179,6 +180,27 @@ Response (MCP `CallToolResult` format):
 - `content` — model-facing text: stdout, a `[stderr]` section when stderr is non-empty, and `[exit code: N]` for non-zero exits. Output past ~50 KiB keeps 24 KiB of head and tail with an explicit omission marker; the untouched streams stay in `structuredContent`.
 - `structuredContent` — typed fields (`exit_code`, `stdout`, `stderr`, `duration_ms`, optional `stdout_truncated`/`stderr_truncated`/`timed_out`, plus `timeout_sec`/`timeout_source` when a timeout fired)
 - `isError: true` — set when `exit_code != 0` or the command fails
+
+#### Result budget
+
+An MCP client's stdio read buffer is a hard wall: the official SDK keeps **10 MiB** (`STDIO_DEFAULT_MAX_BUFFER_SIZE`) and on overflow it clears the buffer *and* closes the transport — every later request then fails with `Not connected`. boxsh therefore bounds what it sends by the **encoded size of one result message**, not by the raw output: JSON escaping turns a NUL byte into `\u0000` (six bytes) and doubles quotes and backslashes, so 2 MB of binary output is a 12 MB message while 8 MB of plain text is only 8 MB.
+
+`--max-result-bytes N` (default `8388608`, `0` disables it) sets that budget. Oversized payloads are cut head + tail (`… [truncated: N of M bytes omitted to fit the result budget] …`) and the result says so:
+
+| Field | Meaning |
+|---|---|
+| `result_truncated` | The result was cut to fit the budget |
+| `result_dropped_bytes` | Raw bytes dropped in total |
+| `result_budget_bytes` | The budget that was in force |
+| `stdout_truncated` / `stdout_dropped_bytes`, `stderr_*`, `stream_*` | Which payload lost bytes, and how many |
+
+Small payloads (a stderr line, a short preview) are kept whole; the model-facing text always keeps a quarter of the budget so a client that only forwards `content[0].text` still sees something usable. Images are never trimmed — a half image is worthless — so `view_image` fails with `E_TOO_LARGE` rather than delivering one when the budget cannot hold it.
+
+The per-stream 10 MiB cap in the worker stays, as a memory guard: it is what keeps a `yes` loop from filling the box. Workers also bound their reply to the wire limit, so a binary-heavy output cannot be mistaken for a worker crash.
+
+#### Cancellation
+
+The official SDK sends `notifications/cancelled {requestId, reason}` when a tool call times out. boxsh acts on it: the cancelled request gets **no reply at all** (per MCP), a running `bash` command's whole process group is killed (faster and more precise than waiting for `--command-timeout`), and a terminal call that submitted a command line (`capture_status`, or a `run_in_terminal` waiter) gets `SIGINT` — the command line is abandoned while the session and its state survive. Notifications are never answered, including ones boxsh does not know.
 
 #### `read` — Read a text file
 
@@ -461,6 +483,12 @@ RPC options:
                        Starting one more fails with E_TOO_MANY_SESSIONS.
   --session-ttl N      Seconds an exited terminal session stays addressable
                        before its resources are reaped (default: 600; 0 keeps them).
+  --max-result-bytes N
+                       Budget for one serialized tool result, in encoded bytes
+                       (default: 8388608; 0 disables it).  Clients keep a fixed
+                       stdio read buffer (the official SDK: 10 MiB) and close the
+                       transport when it overflows, so oversized payloads are
+                       cut head + tail to fit instead of being sent.
 
 Sandbox options (applied in both shell mode and RPC mode):
   --sandbox            Enable the sandbox.
@@ -604,6 +632,8 @@ node --test tests/index.test.mjs
 | `timeout.test.mjs` | Timeout triggering, post-timeout worker recovery and reuse |
 | `command-timeout.test.mjs` | Server-side default timeout (`--command-timeout`) precedence and `timeout_source`, shutdown cleanup (SIGTERM/SIGKILL/EOF leave no orphaned commands or PTY sessions) |
 | `terminal-stream.test.mjs` | Terminal session output model: raw log + cursors (no loss above the viewport), `wait_for`/`wait_ms`, `capture_status` exit codes, PTY window size, session reaping and `E_TOO_MANY_SESSIONS` |
+| `result-budget.test.mjs` | Encoded-size result budget: binary/text payloads cut to fit `--max-result-bytes`, head+tail kept, markers and flags, image that cannot fit reported as `E_TOO_LARGE` |
+| `cancel.test.mjs` | `notifications/cancelled` stops a running command and sends no reply, terminal commands are interrupted without killing the session, notifications are never answered |
 | `concurrent.test.mjs` | Concurrent correctness, out-of-order responses, isolation, stress |
 | `overlay.test.mjs` | COW bind mounts, copy-on-write, delete/whiteout |
 | `tools.test.mjs` | Built-in tools: read (offset/limit), write, edit (uniqueness checks) |

@@ -67,6 +67,13 @@ public:
     // the same sandbox to tool child processes as to exec workers.
     const SandboxConfig &sandbox_cfg() const { return cfg_.global_sandbox; }
 
+    // Cancel an in-flight request (notifications/cancelled).  The worker that
+    // runs it is told to stop; it kills the command's process group and exits
+    // without replying, and the coordinator's existing crash path respawns it.
+    // The response that would normally be produced for `id` is suppressed.
+    // Returns true when the id matched something in flight.
+    bool cancel(const nlohmann::json &id);
+
     // Timeout applied to requests that carry none (0 = no default).
     int default_timeout_sec() const { return cfg_.default_timeout_sec; }
 
@@ -76,6 +83,7 @@ private:
         int         fd          = -1;   // coordinator-side socketpair fd
         bool        busy        = false;
         nlohmann::json inflight_id;     // request id in flight (for crash reports)
+        bool        inflight_cancelled = false; // client gave up on it
 
         // Timeout actually applied to the in-flight request, and whether it
         // came from the server default rather than the request itself.

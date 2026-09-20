@@ -32,6 +32,22 @@ namespace {
 
 constexpr uint32_t kMaxWireMessageBytes = 64u * 1024u * 1024u;
 
+// Marker the coordinator writes to a busy worker's socket to cancel its
+// request.  A busy worker treats *any* activity there as "stop" (that is also
+// how a disappearing coordinator is noticed), so it never parses this; an idle
+// worker can still receive one when the command finished just before the cancel
+// arrived, and skips it by exact value.
+constexpr const char *kCancelPayload = "{\"method\":\"cancel\"}";
+
+// A worker's own result budget exists only to keep its reply readable: the
+// coordinator refuses a wire message above kMaxWireMessageBytes and would
+// report that as "worker crash, respawned", losing the command's output.  Raw
+// streams (2 x 10 MiB) can escape to six times their size, so without this a
+// binary-heavy output could break the channel.  The *client* budget
+// (--max-result-bytes) is applied by the coordinator, which is the only place
+// that knows what is being written to the client.
+constexpr size_t kWorkerWireBudget = 48u * 1024u * 1024u;
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -343,6 +359,12 @@ static void worker_loop(int sock_fd, const std::string &shell_path) {
         std::string payload;
         if (!read_msg(sock_fd, payload)) break; // coordinator closed
 
+        // A cancel marker can land here when the previous command finished right
+        // before the client's cancellation arrived: it is not a request, and the
+        // coordinator is not waiting for an answer, so it must not be parsed (or
+        // answered) as one.
+        if (payload == kCancelPayload) continue;
+
         // Minimal parse: extract id, cmd, timeout from the simple JSON above.
         // Re-use rpc_parse_request.
         RpcRequest req;
@@ -442,6 +464,11 @@ void WorkerPool::spawn_worker(Worker &w) {
         // handler, lose the child status (ECHILD) and report exit code 0 for
         // every sandboxed command.
         signal(SIGCHLD, SIG_DFL);
+
+        // The client-facing result budget is not this process's business: a
+        // worker only has to keep its wire message readable (see
+        // kWorkerWireBudget).
+        rpc_set_result_budget(kWorkerWireBudget);
 
         worker_loop(sv[1], cfg_.shell_path);
         _exit(0);
@@ -552,12 +579,27 @@ std::vector<WorkerPool::BusyEntry> WorkerPool::busy_entries() const {
     return out;
 }
 
+bool WorkerPool::cancel(const nlohmann::json &id) {
+    for (auto &w : workers_) {
+        if (!w.busy || w.inflight_id != id) continue;
+        w.inflight_cancelled = true;
+        // The worker kills the command's whole process group and exits without
+        // replying (see run_shell_command's cancel_fd handling); the reply that
+        // never comes is the crash path below, which respawns the worker.
+        write_msg(w.fd, kCancelPayload);
+        return true;
+    }
+    return false;
+}
+
 RpcResponse WorkerPool::collect(size_t idx) {
     Worker &w = workers_[idx];
+    const bool was_cancelled = w.inflight_cancelled;
 
     std::string payload;
     if (!read_msg(w.fd, payload)) {
-        // Worker crashed: respawn and return an error.
+        // Worker crashed - or stopped because the request was cancelled, which
+        // its machinery does by exiting after killing the command's group.
         nlohmann::json inflight = w.inflight_id;
         close(w.fd);
         if (w.pid > 0) {
@@ -573,8 +615,9 @@ RpcResponse WorkerPool::collect(size_t idx) {
         spawn_worker(w);
 
         RpcResponse resp;
-        resp.id    = inflight;
-        resp.error = "worker crash, respawned";
+        resp.id        = inflight;
+        resp.error     = "worker crash, respawned";
+        resp.suppressed = was_cancelled;   // nobody is waiting for this one
         return resp;
     }
 
@@ -583,10 +626,12 @@ RpcResponse WorkerPool::collect(size_t idx) {
     bool timeout_default = w.inflight_timeout_default;
     w.busy        = false;
     w.inflight_id = nullptr;
+    w.inflight_cancelled = false;
 
     RpcResponse resp = parse_worker_response(payload, inflight);
     resp.timeout_sec                 = timeout_sec;
     resp.timeout_from_server_default = timeout_default;
+    resp.suppressed                  = was_cancelled;
     return resp;
 }
 

@@ -59,6 +59,12 @@ void print_usage(const char *prog) {
         "  --session-ttl N\n"
         "                 Seconds an exited terminal session stays addressable before\n"
         "                 its resources are reaped (default: 600; 0 keeps them).\n"
+        "  --max-result-bytes N\n"
+        "                 Budget for one serialized tool result, in *encoded* bytes\n"
+        "                 (default: 8388608; 0 disables it).  MCP clients keep a\n"
+        "                 fixed stdio read buffer - the official SDK uses 10 MiB and\n"
+        "                 closes the transport when it overflows - so oversized output\n"
+        "                 is truncated (head + tail) to fit instead of being sent.\n"
         "\n"
         "Sandbox options (applied to every worker at fork time):\n"
         "  --sandbox      Enable the sandbox.  Builds an isolated root from a fresh\n"
@@ -94,6 +100,9 @@ struct Cli {
     long long session_log_limit = 1024LL * 1024LL;
     int       max_sessions      = 32;
     int       session_ttl       = 600;
+
+    // Encoded size budget for one tool result (--max-result-bytes).
+    long long max_result_bytes  = 8LL * 1024LL * 1024LL;
 
     SandboxConfig sandbox;
 };
@@ -159,6 +168,7 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
         {"session-log-limit", required_argument, nullptr, 'L'},
         {"max-sessions",   required_argument, nullptr, 'M'},
         {"session-ttl",    required_argument, nullptr, 'e'},
+        {"max-result-bytes", required_argument, nullptr, 'B'},
         {"sandbox",     no_argument,       nullptr, 'X'},
         {"new-net-ns",  no_argument,       nullptr, 'N'},
         {"bind",        required_argument, nullptr, 'b'},
@@ -233,6 +243,20 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
                 std::exit(1);
             }
             cli.session_ttl = (int)secs;
+            break;
+        }
+        case 'B': {
+            char *end = nullptr;
+            long long bytes = std::strtoll(optarg, &end, 10);
+            if (end == optarg || (end && *end != '\0') || bytes < 0 ||
+                bytes > 512LL * 1024LL * 1024LL) {
+                std::fprintf(stderr,
+                    "boxsh: invalid --max-result-bytes argument: %s\n"
+                    "  expected bytes between 0 (no limit) and 536870912\n",
+                    optarg);
+                std::exit(1);
+            }
+            cli.max_result_bytes = bytes;
             break;
         }
         case 'X': cli.sandbox.enabled = true; break;
@@ -575,6 +599,7 @@ int main(int argc, char **argv) {
     term_cfg.max_sessions    = cli.max_sessions;
     term_cfg.ttl_sec         = cli.session_ttl;
     boxsh::terminal_set_config(term_cfg);
+    boxsh::rpc_set_result_budget((size_t)cli.max_result_bytes);
 
     boxsh::rpc_run_loop(rpc_fd_in, STDOUT_FILENO, pool);
 
