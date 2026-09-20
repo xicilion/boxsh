@@ -412,8 +412,8 @@ export function byId(resps) {
  *   await s.close();
  */
 export class BoxshSession {
-  constructor({ workers = 2 } = {}) {
-    this._proc = spawn(BOXSH, ['--rpc', '--workers', String(workers)]);
+  constructor({ workers = 2, args = [] } = {}) {
+    this._proc = spawn(BOXSH, ['--rpc', '--workers', String(workers), ...args]);
     this._pending = new Map();   // id → { resolve, reject }
     this._nextId  = 1;
     this._closed  = false;

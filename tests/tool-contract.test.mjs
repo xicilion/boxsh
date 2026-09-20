@@ -35,6 +35,7 @@ const TOOL_NAMES = [
 const ERROR_CODES = [
   'E_INVALID_ARGUMENT', 'E_NOT_FOUND', 'E_NOT_TEXT', 'E_NOT_IMAGE',
   'E_UNSUPPORTED_FORMAT', 'E_TOO_LARGE', 'E_TIMEOUT', 'E_SANDBOX', 'E_INTERNAL',
+  'E_TOO_MANY_SESSIONS',
 ];
 
 // ---------------------------------------------------------------------------

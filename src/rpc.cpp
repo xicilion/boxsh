@@ -521,53 +521,157 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
             return true;
         }
         // Terminal tools
+        //
+        // Shared optional arguments (all of them also accepted by
+        // send_to_terminal / get_terminal_output):
+        //   wait_ms N      how long to wait before returning (default 500)
+        //   wait_for S     "output" (default) | "exit" | "none"
+        auto parse_terminal_read_opts = [&](std::string &what) -> bool {
+            if (args.contains("wait_ms")) {
+                if (!args["wait_ms"].is_number_integer() && !args["wait_ms"].is_number_unsigned()) {
+                    what = "wait_ms must be an integer";
+                    return false;
+                }
+                long long v = args["wait_ms"].get<long long>();
+                if (v < 0 || v > 600000) {
+                    what = "wait_ms must be between 0 and 600000";
+                    return false;
+                }
+                req.terminal_wait_ms = (int)v;
+            }
+            if (args.contains("wait_for")) {
+                if (!args["wait_for"].is_string()) {
+                    what = "wait_for must be a string";
+                    return false;
+                }
+                std::string w = args["wait_for"].get<std::string>();
+                if (w != "output" && w != "exit" && w != "none") {
+                    what = "wait_for must be \"output\", \"exit\" or \"none\"";
+                    return false;
+                }
+                req.terminal_wait_for = w;
+            }
+            if (args.contains("cursor")) {
+                if (!args["cursor"].is_number_unsigned() && !args["cursor"].is_number_integer()) {
+                    what = "cursor must be a non-negative integer";
+                    return false;
+                }
+                long long v = args["cursor"].get<long long>();
+                if (v < 0) {
+                    what = "cursor must be a non-negative integer";
+                    return false;
+                }
+                req.terminal_cursor = (uint64_t)v;
+            }
+            return true;
+        };
+
         if (tool_name == "run_in_terminal") {
             req.tool = ToolKind::TerminalRun;
             if (!args.contains("command") || !args["command"].is_string()) {
-                parse_error = "run_in_terminal missing string field: command";
-                return false;
+                req.arg_error = "run_in_terminal: missing string field: command";
+                return true;
             }
             req.terminal_command = args["command"].get<std::string>();
-            if (args.contains("cols") && args["cols"].is_number())
+            if (args.contains("cols")) {
+                if (!args["cols"].is_number()) {
+                    req.arg_error = "run_in_terminal: cols must be a number";
+                    return true;
+                }
                 req.terminal_cols = args["cols"].get<int>();
-            if (args.contains("rows") && args["rows"].is_number())
+                if (req.terminal_cols < 20 || req.terminal_cols > 1000) {
+                    req.arg_error = "run_in_terminal: cols must be between 20 and 1000";
+                    return true;
+                }
+            }
+            if (args.contains("rows")) {
+                if (!args["rows"].is_number()) {
+                    req.arg_error = "run_in_terminal: rows must be a number";
+                    return true;
+                }
                 req.terminal_rows = args["rows"].get<int>();
+                if (req.terminal_rows < 1 || req.terminal_rows > 1000) {
+                    req.arg_error = "run_in_terminal: rows must be between 1 and 1000";
+                    return true;
+                }
+            }
+            std::string what;
+            if (!parse_terminal_read_opts(what)) {
+                req.arg_error = "run_in_terminal: " + what;
+                return true;
+            }
             return true;
         }
         if (tool_name == "send_to_terminal") {
             req.tool = ToolKind::TerminalSend;
             if (!args.contains("id") || !args["id"].is_string()) {
-                parse_error = "send_to_terminal missing string field: id";
-                return false;
+                req.arg_error = "send_to_terminal: missing string field: id";
+                return true;
             }
             req.session_id = args["id"].get<std::string>();
             if (!args.contains("command") || !args["command"].is_string()) {
-                parse_error = "send_to_terminal missing string field: command";
-                return false;
+                req.arg_error = "send_to_terminal: missing string field: command";
+                return true;
             }
             req.terminal_command = args["command"].get<std::string>();
+            if (args.contains("capture_status")) {
+                if (!args["capture_status"].is_boolean()) {
+                    req.arg_error = "send_to_terminal: capture_status must be a boolean";
+                    return true;
+                }
+                req.terminal_capture_status = args["capture_status"].get<bool>();
+            }
+            std::string what;
+            if (!parse_terminal_read_opts(what)) {
+                req.arg_error = "send_to_terminal: " + what;
+                return true;
+            }
             return true;
         }
         if (tool_name == "get_terminal_output") {
             req.tool = ToolKind::TerminalOutput;
             if (!args.contains("id") || !args["id"].is_string()) {
-                parse_error = "get_terminal_output missing string field: id";
-                return false;
+                req.arg_error = "get_terminal_output: missing string field: id";
+                return true;
             }
             req.session_id = args["id"].get<std::string>();
+            std::string what;
+            if (!parse_terminal_read_opts(what)) {
+                req.arg_error = "get_terminal_output: " + what;
+                return true;
+            }
             return true;
         }
         if (tool_name == "kill_terminal") {
             req.tool = ToolKind::TerminalKill;
             if (!args.contains("id") || !args["id"].is_string()) {
-                parse_error = "kill_terminal missing string field: id";
-                return false;
+                req.arg_error = "kill_terminal: missing string field: id";
+                return true;
             }
             req.session_id = args["id"].get<std::string>();
+            if (args.contains("cursor")) {
+                if (!args["cursor"].is_number_unsigned() && !args["cursor"].is_number_integer()) {
+                    req.arg_error = "kill_terminal: cursor must be a non-negative integer";
+                    return true;
+                }
+                long long v = args["cursor"].get<long long>();
+                if (v < 0) {
+                    req.arg_error = "kill_terminal: cursor must be a non-negative integer";
+                    return true;
+                }
+                req.terminal_cursor = (uint64_t)v;
+            }
             return true;
         }
         if (tool_name == "list_terminals") {
             req.tool = ToolKind::TerminalList;
+            if (args.contains("include_exited")) {
+                if (!args["include_exited"].is_boolean()) {
+                    req.arg_error = "list_terminals: include_exited must be a boolean";
+                    return true;
+                }
+                req.terminal_include_exited = args["include_exited"].get<bool>();
+            }
             return true;
         }
 
@@ -734,20 +838,38 @@ static std::string mcp_tools_list_response(const json &id,
                                            int default_command_timeout) {
     json tools = json::array();
 
-    // Shared outputSchema for the three tools that return a screen snapshot
-    // plus the session's live/exited state.
+    // Shared outputSchema for the terminal tools: the rendered screen plus the
+    // session's live/exited state, and — when the caller reads the raw-log
+    // channel (cursor / wait_for:"exit" / capture_status) — the byte delta.
     auto terminal_output_schema = []() {
         return json{
             {"type", "object"},
             {"properties", {
                 {"id",        {{"type", "string"},  {"description", "Terminal session id"}}},
-                {"output",    {{"type", "string"},  {"description", "Current terminal screen snapshot"}}},
+                {"output",    {{"type", "string"},  {"description", "Rendered screen snapshot (a view of the last `rows` lines)"}}},
                 {"exited",    {{"type", "boolean"}, {"description", "Whether the process has exited"}}},
                 {"exit_code", {{"type", json::array({"integer", "null"})},
-                               {"description", "Exit code when exited, null while it is still running"}}}
+                               {"description", "Exit code when exited, null while it is still running"}}},
+                {"total_bytes", {{"type", "integer"}, {"description", "Raw bytes received from the PTY since the session started"}}},
+                {"screen_partial", {{"type", "boolean"}, {"description", "The session produced more lines than the screen shows, so `output` is a partial view — read the stream for everything"}}},
+                {"stream",    {{"type", "string"},  {"description", "Raw output bytes (escape sequences included) in [first_cursor, next_cursor)"}}},
+                {"first_cursor", {{"type", "integer"}, {"description", "Cursor the returned stream starts at"}}},
+                {"next_cursor",  {{"type", "integer"}, {"description", "Pass as `cursor` to read only what comes after this result"}}},
+                {"truncated_before", {{"type", "boolean"}, {"description", "The requested cursor had already scrolled out of the raw log; the stream starts at first_cursor instead"}}},
+                {"dropped_bytes", {{"type", "integer"}, {"description", "Bytes dropped from the front of the raw log so far"}}},
+                {"command_exit_code", {{"type", "integer"}, {"description", "Exit code of the command just submitted (capture_status only)"}}}
             }},
             {"required", json::array({"id", "output", "exited", "exit_code"})}
         };
+    };
+
+    // Options every terminal read accepts.
+    auto terminal_read_args = [](json props) {
+        props["wait_ms"]  = {{"type", "number"},
+            {"description", "How long to wait before returning, in ms (default 500; up to 600000). With wait_for=\"exit\" or capture_status the default is 60000."}};
+        props["wait_for"] = {{"type", "string"}, {"enum", json::array({"output", "exit", "none"})},
+            {"description", "What to wait for: \"output\" (default; new output or exit), \"exit\" (the process exits; also returns the complete raw stream), \"none\" (return immediately)."}};
+        return props;
     };
 
     // bash tool
@@ -978,18 +1100,24 @@ static std::string mcp_tools_list_response(const json &id,
         {"title", "Run in Terminal"},
         {"description",
          "Start a persistent PTY session running the given command (e.g. \"bash\"). "
-         "Returns a session id, initial screen output, exit status, and exit code. "
-         "Use get_terminal_output to poll for further output, "
-         "send_to_terminal to write to stdin, kill_terminal to terminate and free resources."},
+         "The command runs on a real terminal: it can be interactive (prompts, REPLs, "
+         "pagers) and keeps state (cwd, environment) across calls. "
+         "Returns the session id, the rendered screen, the exit status and the number of "
+         "bytes received. The screen is a view of the last `rows` lines, so for a command "
+         "whose output must be complete pass wait_for:\"exit\" (and a `wait_ms` budget), or "
+         "read the raw byte stream with get_terminal_output using the `cursor` it returns. "
+         "Use send_to_terminal to type into the session and kill_terminal to end it. "
+         "For a plain non-interactive command prefer the bash tool: it returns separate "
+         "stdout/stderr and no terminal rendering."},
         {"inputSchema", {
             {"type", "object"},
-            {"properties", {
+            {"properties", terminal_read_args(json{
                 {"command",     {{"type", "string"}, {"description", "Command to run in the PTY (e.g. bash)"}}},
                 {"explanation", {{"type", "string"}, {"description", "Why this terminal is needed"}}},
                 {"goal",        {{"type", "string"}, {"description", "What you intend to accomplish"}}},
-                {"cols",        {{"type", "number"}, {"description", "Terminal columns (default 220)"}}},
-                {"rows",        {{"type", "number"}, {"description", "Terminal rows (default 50)"}}}
-            }},
+                {"cols",        {{"type", "number"}, {"description", "Terminal columns, 20-1000 (default 220). Set on the PTY itself, so programs see the real size."}}},
+                {"rows",        {{"type", "number"}, {"description", "Terminal rows, 1-1000 (default 50). Only the screen snapshot is this tall; the raw log is not limited by it."}}}
+            })},
             {"required", json::array({"command"})}
         }},
         {"outputSchema", terminal_output_schema()},
@@ -1005,15 +1133,21 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "send_to_terminal"},
         {"title", "Send to Terminal"},
         {"description",
-         "Send text to an existing terminal session's PTY stdin, then wait up to 500ms "
-         "for new output. Returns the updated screen snapshot, exit status, and exit code. "
-         "Append \\n to execute as a shell command."},
+         "Write text to a session's PTY stdin. Append \\n to run it as a shell command line "
+         "(text without a trailing newline only reaches the program as keystrokes). "
+         "Then waits for output and returns the screen plus the raw byte delta. "
+         "With capture_status:true the text is submitted as a shell command line and the "
+         "result carries command_exit_code, so a persistent shell session can be driven "
+         "like a command runner (shell sessions only — the probe line is input, so do not "
+         "use it on a REPL or a pager)."},
         {"inputSchema", {
             {"type", "object"},
-            {"properties", {
+            {"properties", terminal_read_args(json{
                 {"id",      {{"type", "string"}, {"description", "Terminal session id"}}},
-                {"command", {{"type", "string"}, {"description", "Text to write to the PTY stdin"}}}
-            }},
+                {"command", {{"type", "string"}, {"description", "Text to write to the PTY stdin"}}},
+                {"capture_status", {{"type", "boolean"},
+                    {"description", "Submit `command` as a shell command line and report its exit code (default false)"}}}
+            })},
             {"required", json::array({"id", "command"})}
         }},
         {"outputSchema", terminal_output_schema()},
@@ -1029,14 +1163,18 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "get_terminal_output"},
         {"title", "Get Terminal Output"},
         {"description",
-         "Wait up to 500ms for new output from a terminal session, then return the current "
-         "screen snapshot together with exit status and exit code. "
-         "Use this to poll long-running commands until exited is true."},
+         "Wait for output from a session and return the current screen together with the "
+         "exit status. Pass `cursor` (from a previous result's next_cursor, or 0 for "
+         "everything still retained) to read the raw byte stream from that position "
+         "instead: the result then holds only the new bytes, so polling costs nothing while "
+         "the screen is idle and no output is ever lost. wait_for:\"exit\" waits for the "
+         "process to finish and returns the complete raw stream in one call."},
         {"inputSchema", {
             {"type", "object"},
-            {"properties", {
-                {"id", {{"type", "string"}, {"description", "Terminal session id"}}}
-            }},
+            {"properties", terminal_read_args(json{
+                {"id",     {{"type", "string"}, {"description", "Terminal session id"}}},
+                {"cursor", {{"type", "number"}, {"description", "Absolute byte cursor: return the raw stream from here (0 = oldest retained byte)"}}}
+            })},
             {"required", json::array({"id"})}
         }},
         {"outputSchema", terminal_output_schema()},
@@ -1052,22 +1190,34 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "kill_terminal"},
         {"title", "Kill Terminal"},
         {"description",
-         "Kill a terminal session and free its resources. Returns the final screen snapshot."},
+         "Kill a terminal session and free its resources. Signals the session's whole "
+         "process group (SIGHUP, escalating to SIGKILL) and returns the final screen plus "
+         "the complete raw output (from `cursor` when given), so nothing printed before the "
+         "kill is lost."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"id", {{"type", "string"}, {"description", "Terminal session id"}}}
+                {"id",     {{"type", "string"}, {"description", "Terminal session id"}}},
+                {"cursor", {{"type", "number"}, {"description", "Absolute byte cursor: return the raw stream from here (0 = oldest retained byte)"}}}
             }},
             {"required", json::array({"id"})}
         }},
         {"outputSchema", {
             {"type", "object"},
             {"properties", {
-                {"id",     {{"type", "string"},  {"description", "Terminal session id"}}},
-                {"killed", {{"type", "boolean"}, {"description", "True when the session was killed"}}},
-                {"output", {{"type", "string"},  {"description", "Final screen snapshot"}}}
+                {"id",       {{"type", "string"},  {"description", "Terminal session id"}}},
+                {"killed",   {{"type", "boolean"}, {"description", "True when the session was still running and had to be signalled (false when it had already exited)"}}},
+                {"exit_code", {{"type", json::array({"integer", "null"})},
+                               {"description", "Exit code of the session's process (-1 when it was signalled)"}}},
+                {"output",   {{"type", "string"},  {"description", "Final screen snapshot"}}},
+                {"stream",   {{"type", "string"},  {"description", "Raw output bytes in [first_cursor, next_cursor)"}}},
+                {"first_cursor", {{"type", "integer"}}},
+                {"next_cursor",  {{"type", "integer"}}},
+                {"total_bytes",  {{"type", "integer"}}},
+                {"truncated_before", {{"type", "boolean"}}},
+                {"dropped_bytes",    {{"type", "integer"}}}
             }},
-            {"required", json::array({"id", "killed", "output"})}
+            {"required", json::array({"id", "killed", "output", "exit_code"})}
         }},
         {"annotations", {
             {"title", "Kill Terminal"},
@@ -1080,10 +1230,16 @@ static std::string mcp_tools_list_response(const json &id,
     tools.push_back({
         {"name", "list_terminals"},
         {"title", "List Terminals"},
-        {"description", "List all active terminal sessions."},
+        {"description",
+         "List the terminal sessions this server owns. Exited sessions are hidden by "
+         "default (they stay addressable until they are reaped); pass include_exited:true "
+         "to see them too, and kill_terminal to release one."},
         {"inputSchema", {
             {"type", "object"},
-            {"properties", json::object()},
+            {"properties", {
+                {"include_exited", {{"type", "boolean"},
+                    {"description", "Also list sessions whose process has exited (default false)"}}}
+            }},
             {"required", json::array()}
         }},
         {"outputSchema", {
@@ -1100,7 +1256,12 @@ static std::string mcp_tools_list_response(const json &id,
                             {"exited",  {{"type", "boolean"}, {"description", "Whether the process has exited"}}},
                             {"exit_code", {{"type", json::array({"integer", "null"})}}},
                             {"cols",    {{"type", "integer"}}},
-                            {"rows",    {{"type", "integer"}}}
+                            {"rows",    {{"type", "integer"}}},
+                            {"total_bytes", {{"type", "integer"}, {"description", "Raw bytes received so far"}}},
+                            {"retained_bytes", {{"type", "integer"}, {"description", "Bytes still readable from the raw log"}}},
+                            {"truncated", {{"type", "boolean"}, {"description", "Some output was dropped from the raw log"}}},
+                            {"age_ms",  {{"type", "integer"}, {"description", "Age of the session in milliseconds"}}},
+                            {"idle_ms", {{"type", "integer"}, {"description", "Time since the last output (or the exit)"}}}
                         }},
                         {"required", json::array({"id", "command", "alive", "exited", "exit_code"})}
                     }}
@@ -1134,7 +1295,8 @@ static std::string mcp_tools_list_response(const json &id,
 // place (rpc_serialize_tool_result).
 // ---------------------------------------------------------------------------
 
-// One-line state header for terminal results.
+// One-line state header for terminal results.  The tool-contract test pins the
+// "terminal <id> (<command>)" prefix, so extra state goes after it.
 static std::string terminal_state_line(const std::string &id,
                                        const std::string &command,
                                        bool exited, int exit_code) {
@@ -1145,104 +1307,285 @@ static std::string terminal_state_line(const std::string &id,
     return line;
 }
 
-// Map a terminal_* exception message to a stable error code.
-static ToolResult terminal_exception_result(const std::string &what) {
-    if (what.rfind("unknown terminal session", 0) == 0 ||
+// Map a terminal_* failure to its stable error code.  TerminalError carries the
+// code; anything else is an internal error.
+static ToolResult terminal_exception_result(const std::exception &e) {
+    if (const auto *te = dynamic_cast<const TerminalError *>(&e))
+        return tool_error_result(te->code(), e.what());
+    if (const std::string what = e.what();
+        what.rfind("unknown terminal session", 0) == 0 ||
         what.rfind("terminal session has exited", 0) == 0)
         return tool_error_result(error_code::kNotFound, what);
-    return tool_error_result(error_code::kInternal, what);
+    return tool_error_result(error_code::kInternal, e.what());
+}
+
+// Best-effort plain-text view of a raw PTY stream: escape sequences are
+// dropped and the CR / backspace edits that line-oriented output relies on
+// (progress bars, spinners) are applied.  Cursor-addressed (full-screen) output
+// still needs the rendered screen — this is only a readable approximation of a
+// byte stream, which is exactly what a command runner wants.
+static std::string clean_stream(const std::string &raw) {
+    std::string out;
+    std::string line;
+    size_t i = 0;
+    const size_t n = raw.size();
+
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(raw[i]);
+
+        if (c == 0x1b) {                       // ESC
+            size_t j = i + 1;
+            if (j < n && raw[j] == '[') {      // CSI … final byte
+                j++;
+                while (j < n && static_cast<unsigned char>(raw[j]) < 0x40) j++;
+                if (j < n) j++;
+                i = j;
+                continue;
+            }
+            if (j < n && raw[j] == ']') {      // OSC … BEL | ST
+                j++;
+                bool closed = false;
+                while (j < n) {
+                    if (static_cast<unsigned char>(raw[j]) == 0x07) { j++; closed = true; break; }
+                    if (static_cast<unsigned char>(raw[j]) == 0x1b && j + 1 < n && raw[j+1] == '\\') {
+                        j += 2; closed = true; break;
+                    }
+                    j++;
+                }
+                (void)closed;
+                i = j;
+                continue;
+            }
+            i = (j < n) ? j + 1 : n;           // ESC + one char
+            continue;
+        }
+
+        if (c == '\n') { out += line; out += '\n'; line.clear(); i++; continue; }
+        if (c == '\r') {
+            if (i + 1 < n && raw[i+1] == '\n') {   // CRLF is a line ending
+                out += line; out += '\n'; line.clear(); i += 2; continue;
+            }
+            line.clear();                          // bare CR rewrites the line
+            i++;
+            continue;
+        }
+        if (c == '\b') { if (!line.empty()) line.pop_back(); i++; continue; }
+        if (c == '\t' || c >= 0x20) { line += static_cast<char>(c); i++; continue; }
+        i++;                                       // other control bytes
+    }
+    out += line;                                   // trailing partial line
+    return out;
+}
+
+// Read options shared by every terminal tool.  `run_to_completion` marks the
+// two forms whose whole point is "run this and give me the result"
+// (wait_for:"exit" and capture_status): they wait much longer by default.
+static int terminal_wait_ms_for(const RpcRequest &req, bool run_to_completion) {
+    if (req.terminal_wait_ms >= 0) return req.terminal_wait_ms;
+    return run_to_completion ? 60000 : 500;
+}
+
+static TerminalWait terminal_wait_kind(const RpcRequest &req) {
+    if (req.terminal_wait_for == "exit") return TerminalWait::Exit;
+    if (req.terminal_wait_for == "none") return TerminalWait::None;
+    return TerminalWait::Output;
+}
+
+static TerminalReadOptions terminal_read_options(const RpcRequest &req,
+                                                 bool run_to_completion) {
+    TerminalReadOptions opts;
+    opts.wait_ms  = terminal_wait_ms_for(req, run_to_completion);
+    opts.wait_for = terminal_wait_kind(req);
+    opts.cursor   = req.terminal_cursor;
+    return opts;
+}
+
+// Structured payload shared by every terminal read result.
+static json terminal_structured(const std::string &id,
+                                const TerminalOutputResult &r) {
+    json sc = {
+        {"id",        id},
+        {"output",    ensure_valid_utf8(r.output)},
+        {"exited",    r.exited},
+        {"exit_code", r.exited ? json(r.exit_code) : json(nullptr)},
+        {"total_bytes", r.total_bytes},
+    };
+    if (r.with_stream) {
+        sc["stream"]           = ensure_valid_utf8(r.stream);
+        sc["first_cursor"]     = r.first_cursor;
+        sc["next_cursor"]      = r.next_cursor;
+        sc["truncated_before"] = r.truncated;
+    }
+    if (r.dropped_bytes > 0) sc["dropped_bytes"] = r.dropped_bytes;
+    if (r.screen_partial) sc["screen_partial"] = true;
+    return sc;
+}
+
+// Body of a terminal result.
+//
+//   stream mode (explicit cursor, wait_for:"exit", capture_status) — the caller
+//   is using the session as a data channel, so the body is the raw delta with
+//   escape sequences stripped and CR rewrites applied.
+//
+//   screen mode (default) — the caller is driving an interactive program, so
+//   the body is the rendered screen (unchanged behaviour).
+static std::string terminal_body(const TerminalOutputResult &r, bool stream_mode) {
+    std::string body;
+    if (stream_mode) {
+        body = clean_stream(r.stream);
+        if (r.truncated)
+            body = "[earlier output was dropped: " + std::to_string(r.dropped_bytes) +
+                   " bytes no longer retained]\n" + body;
+        if (body.empty()) body = "(no new output)\n";
+        return head_tail_reduce(body, kTextHeadBytes, kTextTailBytes);
+    }
+    body = r.output;
+    if (body.empty()) body = "(no new output)\n";
+    return body;
+}
+
+// Screen-mode trailer: without it a caller reads a partial view and never
+// learns that the raw log holds more (the screen keeps at most `rows` lines).
+static std::string terminal_stream_hint(const TerminalOutputResult &r) {
+    if (!r.screen_partial) return std::string();
+    return "[screen shows the last lines only \xe2\x80\x94 the complete output is "
+           "in the stream: pass cursor:" + std::to_string(r.first_cursor) +
+           ", or run with wait_for:\"exit\"]\n";
+}
+
+// Full text for the run/send/output results: state line, body, hint.
+static std::string terminal_result_text(const std::string &id,
+                                        const std::string &command,
+                                        const TerminalOutputResult &r,
+                                        bool stream_mode,
+                                        bool has_status, int status,
+                                        const std::string &suffix_state) {
+    std::string line = terminal_state_line(id, command, r.exited, r.exit_code);
+    if (has_status) line += ", command exit code " + std::to_string(status);
+    if (!suffix_state.empty()) line += suffix_state;
+    if (stream_mode)
+        line += ", " + std::to_string(r.total_bytes) + " bytes, cursor \xe2\x86\x92 " +
+                std::to_string(r.next_cursor);
+    std::string text = line + "\n\n" + terminal_body(r, stream_mode);
+    if (!stream_mode) text += terminal_stream_hint(r);
+    return text;
 }
 
 static ToolResult tool_terminal_run(const RpcRequest &req) {
     try {
+        const bool run_to_completion = req.terminal_wait_for == "exit";
         auto result = terminal_create(req.terminal_command,
-                                      req.terminal_cols, req.terminal_rows);
+                                      req.terminal_cols, req.terminal_rows,
+                                      terminal_read_options(req, run_to_completion));
         ToolResult tr;
-        std::string out = ensure_valid_utf8(result.output);
-        tr.text = terminal_state_line(result.id, req.terminal_command,
-                                      result.exited, result.exit_code) +
-                  "\n\n" + out;
-        tr.structured = json{
-            {"id",        result.id},
-            {"output",    out},
-            {"exited",    result.exited},
-            {"exit_code", result.exited ? json(result.exit_code) : json(nullptr)},
-        };
+        tr.text = terminal_result_text(result.id, req.terminal_command, result.out,
+                                       result.out.with_stream, false, 0,
+                                       std::string());
+        tr.structured = terminal_structured(result.id, result.out);
         return tr;
     } catch (const std::exception &e) {
-        return terminal_exception_result(e.what());
+        return terminal_exception_result(e);
     }
 }
 
 static ToolResult tool_terminal_send(const RpcRequest &req) {
     try {
-        terminal_send(req.session_id, req.terminal_command);
-        auto out = terminal_output(req.session_id);
+        const bool run_to_completion = req.terminal_capture_status ||
+                                       req.terminal_wait_for == "exit";
+        auto r = terminal_send(req.session_id, req.terminal_command,
+                               terminal_read_options(req, run_to_completion),
+                               req.terminal_capture_status);
         ToolResult tr;
-        std::string text = ensure_valid_utf8(out.output);
-        tr.text = text.empty() ? "(no new output)\n" : text;
-        tr.structured = json{
-            {"id",        req.session_id},
-            {"output",    text},
-            {"exited",    out.exited},
-            {"exit_code", out.exited ? json(out.exit_code) : json(nullptr)},
-        };
+        tr.text = terminal_result_text(req.session_id, std::string(), r.out,
+                                       r.out.with_stream,
+                                       r.has_command_exit_code, r.command_exit_code,
+                                       std::string());
+        tr.structured = terminal_structured(req.session_id, r.out);
+        if (r.has_command_exit_code)
+            tr.structured.value()["command_exit_code"] = r.command_exit_code;
         return tr;
     } catch (const std::exception &e) {
-        return terminal_exception_result(e.what());
+        return terminal_exception_result(e);
     }
 }
 
 static ToolResult tool_terminal_output(const RpcRequest &req) {
     try {
-        auto out = terminal_output(req.session_id);
+        const bool run_to_completion = req.terminal_wait_for == "exit";
+        auto r = terminal_read(req.session_id,
+                               terminal_read_options(req, run_to_completion));
         ToolResult tr;
-        std::string text = ensure_valid_utf8(out.output);
-        tr.text = text.empty() ? "(no new output)\n" : text;
-        tr.structured = json{
-            {"id",        req.session_id},
-            {"output",    text},
-            {"exited",    out.exited},
-            {"exit_code", out.exited ? json(out.exit_code) : json(nullptr)},
-        };
+        tr.text = terminal_result_text(req.session_id, std::string(), r,
+                                       r.with_stream, false, 0, std::string());
+        tr.structured = terminal_structured(req.session_id, r);
         return tr;
     } catch (const std::exception &e) {
-        return terminal_exception_result(e.what());
+        return terminal_exception_result(e);
     }
+}
+
+// Adapt a kill result to the shared renderer.  A kill always reads the stream:
+// the point of the call is the final output, not the last screen.
+static TerminalOutputResult terminal_out_from_kill(const TerminalKillResult &k) {
+    TerminalOutputResult r;
+    r.output        = k.output;
+    r.exited        = true;
+    r.exit_code     = k.exit_code;
+    r.with_stream   = true;
+    r.stream        = k.stream;
+    r.first_cursor  = k.first_cursor;
+    r.next_cursor   = k.next_cursor;
+    r.total_bytes   = k.next_cursor;
+    r.truncated     = k.truncated;
+    r.dropped_bytes = k.dropped_bytes;
+    return r;
 }
 
 static ToolResult tool_terminal_kill(const RpcRequest &req) {
     try {
-        std::string snap = ensure_valid_utf8(terminal_kill(req.session_id));
+        auto r   = terminal_kill(req.session_id, req.terminal_cursor);
+        auto out = terminal_out_from_kill(r);
+
+        // The kill text keeps its historical shape ("terminal <id> killed"),
+        // with the exit status added after it.
+        std::string line = "terminal " + req.session_id + " killed";
+        if (!r.killed) line += " (already exited)";
+        line += ", exit code " + std::to_string(r.exit_code) +
+                ", cursor \xe2\x86\x92 " + std::to_string(r.next_cursor);
+
         ToolResult tr;
-        tr.text = "terminal " + req.session_id + " killed\n\n" + snap;
-        tr.structured = json{
-            {"id",     req.session_id},
-            {"killed", true},
-            {"output", snap},
-        };
+        tr.text = line + "\n\n" + terminal_body(out, true);
+        tr.structured = terminal_structured(req.session_id, out);
+        tr.structured.value()["killed"] = r.killed;
         return tr;
     } catch (const std::exception &e) {
-        return terminal_exception_result(e.what());
+        return terminal_exception_result(e);
     }
 }
 
-static ToolResult tool_terminal_list(const RpcRequest &) {
+static ToolResult tool_terminal_list(const RpcRequest &req) {
     auto sessions = terminal_list();
     json arr = json::array();
     std::string text;
     for (auto &s : sessions) {
+        // Exited sessions stay addressable until they are reaped, but they are
+        // not what "list my terminals" means, so they are opt-in.
+        if (!s.alive && !req.terminal_include_exited) continue;
         std::string id      = ensure_valid_utf8(s.id);
         std::string command = ensure_valid_utf8(s.command);
-        // terminal_list() reports sessions that are alive or already exited.
-        bool exited = !s.alive;
         arr.push_back({
             {"id", id}, {"command", command}, {"alive", s.alive},
-            {"exited", exited},
-            {"exit_code", exited ? json(s.exit_code) : json(nullptr)},
-            {"cols", s.cols}, {"rows", s.rows}
+            {"exited", !s.alive},
+            {"exit_code", s.alive ? json(nullptr) : json(s.exit_code)},
+            {"cols", s.cols}, {"rows", s.rows},
+            {"total_bytes", s.total_bytes},
+            {"retained_bytes", s.retained_bytes},
+            {"truncated", s.truncated},
+            {"age_ms", s.age_ms},
+            {"idle_ms", s.idle_ms},
         });
-        text += id + "  " + (s.alive ? "running" : "exited") + "  " + command + "\n";
+        text += id + "  " + (s.alive ? "running" : "exited") + "  " + command +
+                "  (" + std::to_string(s.total_bytes) + " bytes)\n";
     }
     if (text.empty()) text = "(no terminal sessions)\n";
 
@@ -2217,6 +2560,11 @@ static ToolResult tool_edit(const RpcRequest &req) {
 // result-serialization path.
 static std::string run_builtin_tool(const RpcRequest &req) {
     ToolResult tr;
+    if (!req.arg_error.empty()) {
+        // Bad tool arguments are a tool error, not a protocol error.
+        tr = tool_error_result(error_code::kInvalidArgument, req.arg_error);
+        return rpc_serialize_tool_result(req.id, tr, true);
+    }
     switch (req.tool) {
         case ToolKind::Read:           tr = tool_read(req);            break;
         case ToolKind::ViewImage:      tr = tool_view_image(req);      break;

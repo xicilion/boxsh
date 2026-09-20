@@ -713,6 +713,26 @@ boxsh --sandbox --bind cow:"$project:$dst" -c '
 '
 ```
 
+**Same thing over RPC.** The terminal tools exist for exactly this, and a session can now do both halves of the job: run a command line *and* collect its result without losing a byte.
+
+```sh
+# One-shot command in a session: complete output + exit code in one call
+run_in_terminal {command: "npm test", wait_for: "exit", wait_ms: 300000}
+
+# Interactive prompt or REPL — same session, screen semantics
+run_in_terminal {command: "bash"}          → screen, prompts, vim/less/top all work
+send_to_terminal {id, command: "npm init\n"}
+send_to_terminal {id, command: "y\n"}
+
+# Command runner inside a *persistent* shell (cwd/env kept), with exit codes
+send_to_terminal {id, command: "make -j8\n", capture_status: true, wait_ms: 300000}
+                                                     → command_exit_code: 0
+
+# Never lose output that scrolled off the screen
+send_to_terminal {id, command: "npm test\n"}
+get_terminal_output {id, cursor: 0}         → the whole raw stream, byte for byte
+```
+
 **What the agent gets:**
 
 - A real POSIX shell with full syntax: pipes, redirections, variables, functions, subshells
@@ -728,8 +748,8 @@ boxsh --sandbox --bind cow:"$project:$dst" -c '
 | Protocol | stdin/stdout text stream | JSON-RPC 2.0 (MCP-compatible) |
 | Concurrency | Sequential (one command at a time) | Parallel (multi-worker) |
 | Output format | Raw text (agent must parse) | Structured JSON (`content` + `structuredContent`) |
-| Interactive programs | Yes (with PTY) | No |
-| Shell state | Persists (cd, export, aliases) | Isolated per command |
+| Interactive programs | Yes (with PTY) | Yes — the terminal tools own real PTY sessions |
+| Shell state | Persists (cd, export, aliases) | Persists per session (run_in_terminal / send_to_terminal) |
 | Built-in file tools | No | read / write / edit |
 | Best for | Interactive sessions, stateful workflows | Programmatic automation, parallel execution |
 
@@ -850,11 +870,14 @@ but reduced to a single flag.
 RPC mode turns boxsh into an MCP-compatible server. It reads JSON-RPC 2.0 requests from stdin and writes responses to stdout. Any MCP client (VS Code, Claude Desktop, Cursor, etc.) can connect directly.
 
 ```sh
-boxsh --rpc [--workers N] [--command-timeout N] [sandbox flags...]
+boxsh --rpc [--workers N] [--command-timeout N] [--session-log-limit N] [--max-sessions N] [--session-ttl N] [sandbox flags...]
 ```
 
 - `--workers N` — number of parallel workers (default: 4)
 - `--command-timeout N` — seconds a command may run when the request carries no positive `timeout` of its own (default: 60; `0` disables the safety net)
+- `--session-log-limit N` — raw output bytes kept per terminal session (default: 1048576); when the ring wraps, results report `truncated_before` / `dropped_bytes`
+- `--max-sessions N` — maximum live terminal sessions (default: 32); one more fails with `E_TOO_MANY_SESSIONS`
+- `--session-ttl N` — seconds an exited session stays addressable before being reaped (default: 600; `0` keeps them)
 - Responses arrive in **completion order**, not submission order
 
 boxsh supports two transports, auto-detected from the first bytes:
@@ -1015,28 +1038,59 @@ Tool requests and shell commands can be interleaved — tools do not occupy a wo
 
 Five terminal tools manage persistent PTY sessions. They run on background threads and do not occupy a worker slot.
 
-**`run_in_terminal`** — Start a PTY session.
+A session has two output channels, and picking the right one is the whole trick:
+
+| Channel | What it is | Good for |
+|---|---|---|
+| **screen** (`output`) | libvterm's rendering of the last `rows` lines, escape sequences applied | driving interactive programs — prompts, REPLs, `vim`, `less`, `top` |
+| **raw log** (`stream` + cursors) | every byte the PTY produced, kept in a bounded ring and addressed by an absolute byte cursor | collecting a command's output — nothing is lost when it scrolls off, and an unchanged session returns zero bytes |
+
+A read uses the stream when you ask for it: pass `cursor` (from a previous result's `next_cursor`, or `0` for everything still retained), `wait_for:"exit"`, or `capture_status:true`. Without one of those you get the screen, plus a one-line hint when the raw log holds more than the screen can show.
+
+**`run_in_terminal`** — Start a PTY session. `rows`/`cols` are applied to the PTY (so `stty size` and pagers see the real size), and only bound the *screen* view.
 
 ```sh
 echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"run_in_terminal","arguments":{"command":"bash"}}}' | boxsh --rpc
-# → structuredContent: { id: "<session-id>", output: "...", exited: false, exit_code: null }
+# → structuredContent: { id: "<session-id>", output: "...", exited: false, exit_code: null, total_bytes: 120 }
+
+# One-shot command with the complete output and its exit code, in a single call:
+echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"run_in_terminal","arguments":{"command":"seq 1 100 | sed s/^/N-/","wait_for":"exit","wait_ms":20000}}}' | boxsh --rpc
+# → structuredContent: { exited: true, exit_code: 0, stream: "N-1\r\nN-2\r\n…N-100\r\n", next_cursor: 810, truncated_before: false }
 ```
 
-**`send_to_terminal`** — Write to stdin and get updated screen output.
+**`send_to_terminal`** — Write to stdin and read back. A trailing `\n` is what turns text into a command line; `wait_ms` controls how long to wait (default 500 ms).
 
 ```sh
 echo '{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"send_to_terminal","arguments":{"id":"<id>","command":"ls -la\n"}}}' | boxsh --rpc
 ```
 
-**`get_terminal_output`** — Poll for new output (up to 500 ms).
+With `capture_status: true` the text is submitted as a shell command line and boxsh appends a self-erasing status probe, so the result carries `command_exit_code` — the exit code of that command, in a *persistent* shell session:
 
 ```sh
-echo '{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"get_terminal_output","arguments":{"id":"<id>"}}}' | boxsh --rpc
+echo '{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"send_to_terminal","arguments":{"id":"<id>","command":"make -j8\n","capture_status":true,"wait_ms":300000}}}' | boxsh --rpc
+# → structuredContent: { command_exit_code: 0, exited: false, stream: "…" }
 ```
 
-**`kill_terminal`** — Terminate session and free resources. SIGHUP is escalated to SIGKILL when the child does not exit.
+Shell sessions only (the probe is input — a REPL or pager would just see it as keystrokes); boxsh removes the probe and its echoed command line from both the text and the raw stream it returns.
 
-**`list_terminals`** — List all active sessions.
+**`get_terminal_output`** — Read without writing. Without `cursor` it returns the current screen; with `cursor` it returns the raw delta.
+
+```sh
+# Screen view (default)
+echo '{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"get_terminal_output","arguments":{"id":"<id>"}}}' | boxsh --rpc
+
+# Everything the session has printed (lossless), then only what is new
+echo '{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"get_terminal_output","arguments":{"id":"<id>","cursor":0}}}' | boxsh --rpc
+# → structuredContent: { stream: "…4871 bytes…", first_cursor: 0, next_cursor: 4871, truncated_before: false }
+echo '{"jsonrpc":"2.0","id":"4","method":"tools/call","params":{"name":"get_terminal_output","arguments":{"id":"<id>","cursor":4871,"wait_ms":1000}}}' | boxsh --rpc
+# → structuredContent: { stream: "", next_cursor: 4871 }   (idle → 0 bytes)
+```
+
+The log keeps 1 MiB per session (`--session-log-limit`). When it wraps, the result reports `truncated_before: true`, `first_cursor` (the oldest byte still kept) and `dropped_bytes` — output is never dropped silently.
+
+**`kill_terminal`** — Terminate the session's whole process group (SIGHUP, escalating to SIGKILL when a shell ignores it), then free its resources. Returns `{ killed, exit_code, output, stream }` — including the output produced before the kill, so nothing printed at the end is lost.
+
+**`list_terminals`** — List sessions: `{ id, command, alive, cols, rows, total_bytes, age_ms, idle_ms }`. Exited sessions stay addressable but are hidden unless `include_exited: true`; they are reaped after `--session-ttl` (default 600 s), and at most `--max-sessions` live sessions may exist (one more → `E_TOO_MANY_SESSIONS`).
 
 #### Timeout
 
@@ -1321,11 +1375,11 @@ await client.close();
 | `viewImage(path, detail?)` | `ViewImageResult` | View an image (base64 + metadata) |
 | `write(path, content)` | `void` | Create or overwrite a file |
 | `edit(path, edits)` | `void` | Search-and-replace edit |
-| `runInTerminal(cmd, opts?)` | `{ id, output, exited, exitCode }` | Start a PTY session |
-| `sendToTerminal(id, cmd)` | `{ output, exited, exitCode }` | Send to PTY and get screen |
-| `getTerminalOutput(id)` | `{ output, exited, exitCode }` | Poll PTY output |
+| `runInTerminal(cmd, opts?)` | `{ id, output, exited, exitCode, … }` | Start a PTY session (`waitFor:"exit"` = run to completion, complete output) |
+| `sendToTerminal(id, cmd, opts?)` | `{ output, exited, exitCode, … }` | Send to PTY; `captureStatus:true` adds `commandExitCode` |
+| `getTerminalOutput(id, opts?)` | `{ output, exited, exitCode, … }` | Read PTY output; with `cursor` returns the raw delta (lossless) |
 | `killTerminal(id)` | `string` | Kill session, return final screen |
-| `listTerminals()` | `TerminalSession[]` | List active sessions |
+| `listTerminals(opts?)` | `TerminalSession[]` | List sessions (`includeExited:true` for exited ones) |
 | `close()` | `void` | Graceful shutdown |
 | `terminate()` | `void` | Kill immediately |
 

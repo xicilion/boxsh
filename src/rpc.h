@@ -5,6 +5,7 @@
 #include <vector>
 #include <optional>
 
+#include "error_codes.h"
 #include "../third_party/nlohmann/json.hpp"
 
 namespace boxsh {
@@ -24,21 +25,9 @@ struct EditOp {
 // ---------------------------------------------------------------------------
 // Tool result contract — documented in README.md ("Error model") and enforced
 // by tests/tool-contract.test.mjs + tests/file-tools-robustness.test.mjs.
-// ---------------------------------------------------------------------------
-
-// Error codes are stable — do not add new ones without updating the contract
-// document first.
-namespace error_code {
-inline constexpr const char *kInvalidArgument   = "E_INVALID_ARGUMENT";
-inline constexpr const char *kNotFound          = "E_NOT_FOUND";
-inline constexpr const char *kNotText           = "E_NOT_TEXT";
-inline constexpr const char *kNotImage          = "E_NOT_IMAGE";
-inline constexpr const char *kUnsupportedFormat = "E_UNSUPPORTED_FORMAT";
-inline constexpr const char *kTooLarge          = "E_TOO_LARGE";
-inline constexpr const char *kTimeout           = "E_TIMEOUT";
-inline constexpr const char *kSandbox           = "E_SANDBOX";
-inline constexpr const char *kInternal          = "E_INTERNAL";
-} // namespace error_code
+//
+// Stable error codes live in src/error_codes.h — do not add new ones without
+// updating the contract document first.
 
 // Tool-level failure.  Serialized as isError:true with
 // structuredContent = {code, message, detail?}.
@@ -104,6 +93,18 @@ struct RpcRequest {
     std::string terminal_command;
     int         terminal_cols = 220;
     int         terminal_rows = 50;
+    // Shared terminal read options (see src/terminal.h).
+    int                    terminal_wait_ms  = -1;   // -1 = not given
+    std::string            terminal_wait_for;         // "" | output | exit | none
+    std::optional<uint64_t> terminal_cursor;          // raw-log cursor
+    bool                   terminal_capture_status = false;
+    bool                   terminal_include_exited = false;
+
+    // Set when the tool arguments themselves are wrong.  The parser accepts the
+    // request (so the tool kind is known) and the dispatcher turns this into a
+    // tool error — E_INVALID_ARGUMENT — rather than a protocol error, which is
+    // what the tool result contract asks for.
+    std::string arg_error;
 };
 
 // ---------------------------------------------------------------------------

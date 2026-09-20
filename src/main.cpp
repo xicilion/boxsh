@@ -49,6 +49,16 @@ void print_usage(const char *prog) {
         "                 requests that do not carry a positive \"timeout\" themselves\n"
         "                 (default: 60; 0 disables the safety net).  A command whose\n"
         "                 caller gave up would otherwise run forever.\n"
+        "  --session-log-limit N\n"
+        "                 Raw output bytes retained per terminal session (default:\n"
+        "                 1048576).  Older bytes are dropped from the front, and the\n"
+        "                 result says so (truncated_before / dropped_bytes).\n"
+        "  --max-sessions N\n"
+        "                 Maximum number of live terminal sessions (default: 32).\n"
+        "                 Starting one more fails with E_TOO_MANY_SESSIONS.\n"
+        "  --session-ttl N\n"
+        "                 Seconds an exited terminal session stays addressable before\n"
+        "                 its resources are reaped (default: 600; 0 keeps them).\n"
         "\n"
         "Sandbox options (applied to every worker at fork time):\n"
         "  --sandbox      Enable the sandbox.  Builds an isolated root from a fresh\n"
@@ -79,6 +89,11 @@ struct Cli {
     int  num_workers   = 4;
     int  command_timeout = 60;   // --command-timeout (0 = commands may run forever)
     std::string shell_path = "/bin/sh";
+
+    // Terminal session limits (--session-log-limit / --max-sessions / --session-ttl).
+    long long session_log_limit = 1024LL * 1024LL;
+    int       max_sessions      = 32;
+    int       session_ttl       = 600;
 
     SandboxConfig sandbox;
 };
@@ -141,6 +156,9 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
         {"workers",     required_argument, nullptr, 'W'},
         {"shell",       required_argument, nullptr, 'S'},
         {"command-timeout", required_argument, nullptr, 'T'},
+        {"session-log-limit", required_argument, nullptr, 'L'},
+        {"max-sessions",   required_argument, nullptr, 'M'},
+        {"session-ttl",    required_argument, nullptr, 'e'},
         {"sandbox",     no_argument,       nullptr, 'X'},
         {"new-net-ns",  no_argument,       nullptr, 'N'},
         {"bind",        required_argument, nullptr, 'b'},
@@ -174,6 +192,47 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
                 std::exit(1);
             }
             cli.command_timeout = (int)secs;
+            break;
+        }
+        case 'L': {
+            char *end = nullptr;
+            long long bytes = std::strtoll(optarg, &end, 10);
+            if (end == optarg || (end && *end != '\0') || bytes < 4096 ||
+                bytes > 1024LL * 1024LL * 1024LL) {
+                std::fprintf(stderr,
+                    "boxsh: invalid --session-log-limit argument: %s\n"
+                    "  expected bytes between 4096 and 1073741824\n",
+                    optarg);
+                std::exit(1);
+            }
+            cli.session_log_limit = bytes;
+            break;
+        }
+        case 'M': {
+            char *end = nullptr;
+            long secs = std::strtol(optarg, &end, 10);
+            if (end == optarg || (end && *end != '\0') || secs < 0 || secs > 100000) {
+                std::fprintf(stderr,
+                    "boxsh: invalid --max-sessions argument: %s\n"
+                    "  expected a session count >= 0 (0 = unlimited)\n",
+                    optarg);
+                std::exit(1);
+            }
+            cli.max_sessions = (int)secs;
+            break;
+        }
+        case 'e': {
+            char *end = nullptr;
+            long secs = std::strtol(optarg, &end, 10);
+            if (end == optarg || (end && *end != '\0') || secs < 0 ||
+                secs > 30 * 24 * 3600) {
+                std::fprintf(stderr,
+                    "boxsh: invalid --session-ttl argument: %s\n"
+                    "  expected seconds >= 0 (0 = keep exited sessions)\n",
+                    optarg);
+                std::exit(1);
+            }
+            cli.session_ttl = (int)secs;
             break;
         }
         case 'X': cli.sandbox.enabled = true; break;
@@ -510,6 +569,12 @@ int main(int argc, char **argv) {
                      err.c_str());
         return 1;
     }
+
+    boxsh::TerminalConfig term_cfg;
+    term_cfg.log_limit_bytes = (size_t)cli.session_log_limit;
+    term_cfg.max_sessions    = cli.max_sessions;
+    term_cfg.ttl_sec         = cli.session_ttl;
+    boxsh::terminal_set_config(term_cfg);
 
     boxsh::rpc_run_loop(rpc_fd_in, STDOUT_FILENO, pool);
 

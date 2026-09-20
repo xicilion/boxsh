@@ -29,6 +29,7 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 | **Crash recovery** | If a worker is killed (timeout, segfault, OOM), the coordinator detects `POLLHUP`, returns an error response, and immediately respawns a replacement |
 | **Per-request timeout** | `timeout` argument on the `bash` tool, enforced by the worker with a monotonic deadline |
 | **Server-side default timeout** | `--command-timeout N` (default 60 s) applies to requests that carry no timeout of their own, so a command whose caller walked away does not run forever; `0` disables it |
+| **Stateful PTY sessions** | Five terminal tools over real PTY sessions: interactive programs, persistent cwd/env, and an addressable raw output log (cursor-based, no loss above the visible screen). Bounded by `--max-sessions` (32), `--session-log-limit` (1 MiB) and `--session-ttl` (600 s) |
 | **Shutdown cleanup** | On SIGTERM/SIGINT/SIGHUP (or a killed coordinator) every running command and PTY session is killed at its process group — no orphans |
 | **Bind mounts** | Selectively expose host paths (read-write or read-only) inside the sandbox |
 | **Drop-in `/bin/sh`** | Shell mode delegates to embedded dash 0.5.12 — any script or flag that works with POSIX sh works here |
@@ -134,7 +135,9 @@ boxsh --sandbox --new-net-ns -c 'curl example.com'  # network isolated
 boxsh implements [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) over stdio. Any MCP-compatible client can connect to it directly as a sandboxed code execution server.
 
 ```sh
-boxsh --rpc [--workers N] [--shell PATH] [--command-timeout N] [sandbox flags...]
+boxsh --rpc [--workers N] [--shell PATH] [--command-timeout N] \
+           [--session-log-limit BYTES] [--max-sessions N] [--session-ttl SECONDS] \
+           [sandbox flags...]
 ```
 
 ### Transport
@@ -220,28 +223,42 @@ Each `oldText` must appear exactly once in the original file. Edits must not ove
 
 ```json
 {"jsonrpc":"2.0", "id":"5", "method":"tools/call",
- "params":{"name":"run_in_terminal", "arguments":{"command":"bash"}}}
+ "params":{"name":"run_in_terminal", "arguments":{"command":"bash", "rows":50, "cols":220}}}
 ```
 
-Starts a PTY session running the given command. Returns `{ id, output, exited, exit_code }` — `id` is used by the other terminal tools.
+Starts a PTY session running the given command (`/bin/sh -c`, `/bin/sh` by default on Linux/macOS) at the requested window size — the size is applied to the PTY itself, so `stty size`, `tput`, pagers and full-screen programs see it. Returns `{ id, output, exited, exit_code, total_bytes }`; `id` is used by the other terminal tools. `rows`/`cols` only bound the *screen* snapshot: the raw log keeps the full output regardless.
+
+Optional wait arguments (shared by the read tools):
+
+| Argument | Meaning |
+|---|---|
+| `wait_ms` | How long to wait before returning (default 500, up to 600000) |
+| `wait_for` | `"output"` (default), `"exit"` (wait for the process to exit and return the complete raw stream), `"none"` (return at once) |
+
+With `wait_for:"exit"` a one-shot command behaves like `bash` — one call returns the complete output, the exit code and the duration — while keeping PTY semantics. Prefer `bash` for plain non-interactive commands: it separates stdout/stderr.
 
 #### `send_to_terminal` — Send input to a PTY session
 
 ```json
 {"jsonrpc":"2.0", "id":"6", "method":"tools/call",
- "params":{"name":"send_to_terminal", "arguments":{"id":"<session-id>", "command":"ls -la\n"}}}
+ "params":{"name":"send_to_terminal", "arguments":{"id":"<session-id>", "command":"ls -la\n",
+   "capture_status":true, "wait_ms":10000}}}
 ```
 
-Writes text to the session's stdin, waits up to 500 ms, and returns the updated screen snapshot with `{ output, exited, exit_code }`.
+Writes text to the session's stdin and returns the updated screen plus the raw byte delta. Text is written as-is: a trailing `\n` is what makes it a command line.
 
-#### `get_terminal_output` — Poll for new output
+With `capture_status: true` the text is submitted as a shell command line and boxsh appends a self-erasing status probe, so the result also carries `command_exit_code` — the exit code of *that command* (a persistent shell session can then be driven like a command runner). The probe is input, so use it on shell sessions only, never on a REPL or a pager. Both the probe and its echoed command line are removed from the text and the raw stream that boxsh returns.
+
+#### `get_terminal_output` — Read output without waiting for a command
 
 ```json
 {"jsonrpc":"2.0", "id":"7", "method":"tools/call",
- "params":{"name":"get_terminal_output", "arguments":{"id":"<session-id>"}}}
+ "params":{"name":"get_terminal_output", "arguments":{"id":"<session-id>", "cursor":0}}}
 ```
 
-Waits up to 500 ms for new output, then returns the current screen snapshot. Use this to poll long-running commands until `exited` is `true`.
+Without `cursor` this returns the current screen (a view of the last `rows` lines). With `cursor` it returns the raw byte stream instead — only the bytes that arrived after that position, decoded from the lossless log, with `first_cursor`/`next_cursor`/`truncated_before` describing the window. Passing `cursor: 0` reads everything still retained, which is how to collect output that has scrolled off the screen; polling with the returned `next_cursor` returns zero bytes while nothing new arrives. `wait_for:"exit"` waits for the process to finish and returns the whole stream in one call.
+
+The raw log keeps 1 MiB per session by default (`--session-log-limit`); when it wraps, the result says so through `truncated_before` and `dropped_bytes` — output is never dropped silently.
 
 #### `kill_terminal` — Terminate a PTY session
 
@@ -250,16 +267,16 @@ Waits up to 500 ms for new output, then returns the current screen snapshot. Use
  "params":{"name":"kill_terminal", "arguments":{"id":"<session-id>"}}}
 ```
 
-Sends SIGHUP and escalates to SIGKILL if the child is still alive after a second (a shell that ignores SIGHUP would otherwise keep the session — and the server — waiting), then frees resources and returns the final screen snapshot.
+Signals the session's whole process group with SIGHUP and escalates to SIGKILL if something is still alive after a second (an interactive shell ignores SIGHUP and would otherwise keep the session — and the server — waiting), then frees resources and returns the final screen plus the complete raw output (`{ killed, exit_code, output, stream, next_cursor }`). `killed` is `false` when the process had already exited on its own.
 
-#### `list_terminals` — List active sessions
+#### `list_terminals` — List sessions
 
 ```json
 {"jsonrpc":"2.0", "id":"9", "method":"tools/call",
- "params":{"name":"list_terminals", "arguments":{}}}
+ "params":{"name":"list_terminals", "arguments":{"include_exited":true}}}
 ```
 
-Returns metadata for all live and recently-exited sessions.
+Lists live sessions with `{ id, command, alive, cols, rows, total_bytes, age_ms, idle_ms }`. Sessions whose process has exited stay addressable (so their output can still be read) but are hidden unless `include_exited: true` is passed; they are reaped after `--session-ttl` (default 600 s), and at most `--max-sessions` (default 32) live sessions may exist at once — one more is rejected with `E_TOO_MANY_SESSIONS` rather than queued.
 
 ### Error model
 
@@ -271,7 +288,7 @@ boxsh distinguishes two kinds of errors per the MCP spec:
 | **Tool error** | `{"result": {"content": [{"type":"text","text":"E_...: ..."}], "structuredContent": {"code": "E_...", "message": "..."}, "isError": true}}` | File not found, not an image, unsupported format, bad base64 |
 | **Command failure** | `isError: true` with the normal command `structuredContent` (no `code`) | Non-zero exit code, timeout (`timed_out: true`) |
 
-Stable tool error codes: `E_INVALID_ARGUMENT`, `E_NOT_FOUND`, `E_NOT_TEXT`, `E_NOT_IMAGE`, `E_UNSUPPORTED_FORMAT`, `E_TOO_LARGE`, `E_TIMEOUT`, `E_SANDBOX`, `E_INTERNAL`. Descriptions and examples are in the per-tool sections above; the contract is enforced by `tests/tool-contract.test.mjs` and `tests/file-tools-robustness.test.mjs`.
+Stable tool error codes: `E_INVALID_ARGUMENT`, `E_NOT_FOUND`, `E_NOT_TEXT`, `E_NOT_IMAGE`, `E_UNSUPPORTED_FORMAT`, `E_TOO_LARGE`, `E_TIMEOUT`, `E_SANDBOX`, `E_INTERNAL`, `E_TOO_MANY_SESSIONS`. Descriptions and examples are in the per-tool sections above; the contract is enforced by `tests/tool-contract.test.mjs` and `tests/file-tools-robustness.test.mjs`.
 
 Every tool error sets `isError: true` and carries `structuredContent.{code, message, detail?}`; the readable `content[0].text` always starts with `"<CODE>: "` (e.g. `E_NOT_FOUND: read: ...`), so a client that only forwards text can still detect failures by that prefix. `detail` disambiguates the cases where the code alone is not enough:
 
@@ -417,6 +434,14 @@ RPC options:
   --command-timeout N  Seconds a command may run before it is killed, applied to
                        requests that carry no positive "timeout" themselves
                        (default: 60; 0 disables the safety net).
+  --session-log-limit N
+                       Raw output bytes retained per terminal session (default:
+                       1048576). Older bytes are dropped from the front, and the
+                       result says so (truncated_before / dropped_bytes).
+  --max-sessions N     Maximum number of live terminal sessions (default: 32).
+                       Starting one more fails with E_TOO_MANY_SESSIONS.
+  --session-ttl N      Seconds an exited terminal session stays addressable
+                       before its resources are reaped (default: 600; 0 keeps them).
 
 Sandbox options (applied in both shell mode and RPC mode):
   --sandbox            Enable the sandbox.
@@ -559,6 +584,7 @@ node --test tests/index.test.mjs
 | `worker-pool.test.mjs` | Pool sizing, crash recovery, sequential and batch dispatch |
 | `timeout.test.mjs` | Timeout triggering, post-timeout worker recovery and reuse |
 | `command-timeout.test.mjs` | Server-side default timeout (`--command-timeout`) precedence and `timeout_source`, shutdown cleanup (SIGTERM/SIGKILL/EOF leave no orphaned commands or PTY sessions) |
+| `terminal-stream.test.mjs` | Terminal session output model: raw log + cursors (no loss above the viewport), `wait_for`/`wait_ms`, `capture_status` exit codes, PTY window size, session reaping and `E_TOO_MANY_SESSIONS` |
 | `concurrent.test.mjs` | Concurrent correctness, out-of-order responses, isolation, stress |
 | `overlay.test.mjs` | COW bind mounts, copy-on-write, delete/whiteout |
 | `tools.test.mjs` | Built-in tools: read (offset/limit), write, edit (uniqueness checks) |
