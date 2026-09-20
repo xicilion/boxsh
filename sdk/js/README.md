@@ -33,7 +33,11 @@ await client.close();
 
 ## Running shell commands
 
-`exec(cmd, cwd?, timeout?)` runs a shell command in a boxsh worker, returning the exit code, stdout, and stderr.
+`exec(cmd, cwd?, timeout?)` runs a shell command in a boxsh worker, returning
+`{ exitCode, stdout, stderr, timedOut, truncated }`. A command killed by its
+timeout has `exitCode: -1` and `timedOut: true` (the MCP result underneath is
+`isError: true`) and still carries whatever it printed before the kill —
+`stderr` ends with the `timeout` marker.
 
 ```js
 // Specify a working directory

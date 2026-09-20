@@ -4,6 +4,12 @@ Python SDK for [boxsh](../../README.md) - a sandboxed POSIX shell with OS-native
 
 `boxsh-py` lets you drive a long-lived `boxsh` RPC process from Python: execute shell commands, read and write files, perform search-and-replace edits, and manage persistent terminal sessions.
 
+`client.exec(...)` returns an `ExecResult` with `exit_code`, `stdout`, `stderr`,
+`timed_out` and `truncated`: a command killed by its timeout comes back with
+`exit_code == -1` and `timed_out == True` (the MCP result underneath is
+`isError: true`) and keeps whatever it had already printed, with `timeout`
+appended to stderr.
+
 The API is intentionally Python-first: it accepts `pathlib.Path` anywhere a path is expected, uses snake_case names, and returns small dataclasses rather than raw dictionaries.
 
 Requirements: Python >= 3.9, Linux or macOS, and a `boxsh` binary on `PATH` or in the `BOXSH` environment variable.

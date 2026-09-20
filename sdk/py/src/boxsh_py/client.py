@@ -67,6 +67,11 @@ class ExecResult:
     exit_code: Optional[int]
     stdout: str
     stderr: str
+    #: The command was killed by a timeout (its stderr ends with ``timeout``
+    #: and the MCP result carries ``isError: true``).
+    timed_out: bool = False
+    #: A stream lost bytes: the 10 MiB cap or the ``--max-result-bytes`` budget.
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -422,6 +427,10 @@ class BoxshClient:
             exit_code=exit_code if isinstance(exit_code, int) else None,
             stdout=str(structured.get("stdout", "")),
             stderr=str(structured.get("stderr", "")),
+            timed_out=structured.get("timed_out") is True,
+            truncated=(structured.get("stdout_truncated") is True
+                       or structured.get("stderr_truncated") is True
+                       or structured.get("result_truncated") is True),
         )
 
     def read(self, file_path: PathLike, offset: Optional[int] = None, limit: Optional[int] = None) -> ReadResult:

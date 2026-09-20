@@ -28,6 +28,14 @@ class BoxshClientToolTests(unittest.TestCase):
         result = self.client.exec("exit 42")
         self.assertEqual(result.exit_code, 42)
 
+    def test_exec_flags_a_timeout_and_keeps_partial_output(self) -> None:
+        result = self.client.exec("echo PRE; sleep 30", timeout=1)
+        self.assertEqual(result.exit_code, -1)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.stdout, "PRE\n")
+        self.assertTrue(result.stderr.endswith("timeout"))
+        self.assertFalse(result.truncated)
+
     def test_exec_returns_stderr_on_failure(self) -> None:
         result = self.client.exec("cat /nonexistent/boxsh-test-file")
         self.assertEqual(result.exit_code, 1)

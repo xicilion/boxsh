@@ -171,6 +171,16 @@ describe('BoxshClient — tool error handling', () => {
     });
 
     it('exec() returns stderr on failure', async () => {
+
+    it('exec() flags a timeout and keeps what the command printed first', async () => {
+        const result = await client.exec('echo PRE; sleep 30', undefined, 1);
+        assert.equal(result.exitCode, -1);
+        assert.equal(result.timedOut, true, 'a timeout is no longer just exitCode -1');
+        assert.equal(result.stdout, 'PRE\n', 'partial output survives the kill');
+        assert.ok(result.stderr.endsWith('timeout'));
+        assert.equal(result.truncated, false);
+    });
+
         const result = await client.exec('cat /nonexistent/boxsh-test-file');
         assert.equal(result.exitCode, 1);
         assert.ok(result.stderr.length > 0);

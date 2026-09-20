@@ -228,6 +228,12 @@ export class BoxshClient {
             exitCode: typeof sc.exit_code === 'number' ? sc.exit_code : null,
             stdout:   typeof sc.stdout    === 'string' ? sc.stdout    : '',
             stderr:   typeof sc.stderr    === 'string' ? sc.stderr    : '',
+            // A timed-out command exits with -1 and a `timeout` marker in
+            // stderr; these flags say so outright instead of leaving the caller
+            // to parse the streams (the MCP result also carries isError:true).
+            timedOut: sc.timed_out === true,
+            truncated: sc.stdout_truncated === true || sc.stderr_truncated === true
+                       || sc.result_truncated === true,
         };
     }
 
