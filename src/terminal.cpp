@@ -542,9 +542,13 @@ void advance_read_cursor(TerminalSession &s, const TerminalOutputResult &r) {
 // "output" is also settled: the very first bytes after a write are the tty's
 // echo of the command line, while the command's own output is still in flight.
 // Returning on them hands a caller a result that looks truncated; waiting for a
-// short quiet gap instead makes a quick command complete in one call, at the
-// cost of a few tens of milliseconds.
-constexpr int kOutputSettleMs = 40;
+// short quiet gap instead makes a quick command complete in one call.  The gap
+// is deliberately generous: a busy machine (a CI runner, a loaded laptop) can
+// pause for tens of milliseconds between the echo and the command's first line,
+// and the cost of waiting is only paid when output has already stopped arriving.
+// Anything longer than this belongs to the caller: `capture_status` waits for
+// the command's real exit, and a cursor poll collects the rest.
+constexpr int kOutputSettleMs = 100;
 
 void wait_for_read(std::unique_lock<std::mutex> &lk, TerminalSession &s,
                    const TerminalReadOptions &opts, uint64_t gen0,

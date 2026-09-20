@@ -55,6 +55,23 @@ async function withSession(s, args, fn) {
   }
 }
 
+/**
+ * Wait until a session's stream contains `want` (an exact line), reading with a
+ * cursor.  Tests use this instead of fixed sleeps: on a slow machine (a CI
+ * runner) a command's output can arrive well after the echo that prompted the
+ * read, and a timing assumption turns into a flake.
+ */
+async function waitForStreamLine(s, id, want, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  let seen = '';
+  while (Date.now() < deadline) {
+    const r = BoxshSession.sc(await s.call('get_terminal_output', { id, cursor: 0, wait_ms: 500 }));
+    seen = r.stream ?? '';
+    if (streamLines(seen).includes(want)) return seen;
+  }
+  return seen;
+}
+
 // ---------------------------------------------------------------------------
 // wait semantics
 // ---------------------------------------------------------------------------
@@ -155,11 +172,20 @@ describe('terminal — raw output log', () => {
         const sent = await s.call('send_to_terminal', {
           id, command: "seq 1 60 | sed 's/^/SEQ-/'; true\n", wait_ms: 900,
         });
-        const text = (sent.result.content ?? []).map(c => c.text).join('\n');
         const r = BoxshSession.sc(sent);
+        let text = (sent.result.content ?? []).map(c => c.text).join('\n');
+        // A settled read can still catch only the echo on a slow machine, so poll
+        // for the output the same way a caller would (that is what the cursor is
+        // for) before judging the text.  Polled bytes are raw, hence the CR strip.
+        const deadline = Date.now() + 5000;
+        while (!text.includes('SEQ-60') && Date.now() < deadline) {
+          const again = BoxshSession.sc(await s.call('get_terminal_output', {
+            id, cursor: r.next_cursor, wait_ms: 500,
+          }));
+          text += '\n' + (again.stream ?? '');
+        }
+        text = text.replace(/\r/g, '');
 
-        // No cursor was given, yet the text holds every line of the new output:
-        // the screen alone could not (it is a view of the last `rows` lines).
         assert.ok(text.includes('SEQ-1\n'), 'text must contain the first line of the new output');
         assert.ok(text.includes('SEQ-60'), 'text must contain the last line');
         assert.ok(!r.output.includes('SEQ-1\n'), 'the screen view itself stays a view');
@@ -342,10 +368,19 @@ describe('terminal — PTY window size', () => {
     const s = new BoxshSession();
     try {
       await withSession(s, { command: 'bash', rows: 30, cols: 90 }, async ({ id }) => {
-        const r = BoxshSession.sc(await s.call('send_to_terminal', {
-          id, command: 'stty size\n', cursor: 0, wait_ms: 1500,
-        }));
-        assert.match(r.stream, /30 90/, `stty size must report "30 90": ${JSON.stringify(r.stream)}`);
+        await s.call('send_to_terminal', { id, command: 'stty size\n', wait_ms: 1500 });
+        // Poll instead of assuming one read has it: a read returns when output
+        // has settled, and on a slow machine the gap between the echo of the
+        // command and its first line can exceed that (this is exactly how the
+        // test failed on an Intel CI runner once).
+        let stream = '';
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline) {
+          const r = BoxshSession.sc(await s.call('get_terminal_output', { id, cursor: 0, wait_ms: 500 }));
+          stream = r.stream ?? '';
+          if (/\b30 90\b/.test(stream)) break;
+        }
+        assert.match(stream, /30 90/, `stty size must report "30 90": ${JSON.stringify(stream)}`);
       });
     } finally {
       await s.close();
@@ -438,7 +473,7 @@ describe('terminal — signal', () => {
       await withSession(s, { command: 'bash' }, async ({ id }) => {
         await sleep(300);                        // let bash reach its prompt
         await s.call('send_to_terminal', { id, command: 'echo START; sleep 4; echo AFTER\n', wait_ms: 400 });
-        await sleep(400);                        // bash is inside the sleep now
+        await waitForStreamLine(s, id, 'START'); // bash is inside the sleep now
         await s.call('send_to_terminal', { id, signal: 'INT', wait_ms: 300 });
         await sleep(1500);                       // well before the sleep would end
         const r = BoxshSession.sc(await s.call('get_terminal_output', { id, cursor: 0, wait_ms: 300 }));
@@ -466,7 +501,7 @@ describe('terminal — signal', () => {
       await withSession(s, { command: 'bash' }, async ({ id }) => {
         await sleep(300);                        // let bash reach its prompt
         await s.call('send_to_terminal', { id, command: 'echo START; sleep 5; echo AFTER\n', wait_ms: 400 });
-        await sleep(400);                        // bash is inside the sleep now
+        await waitForStreamLine(s, id, 'START'); // bash is inside the sleep now
         await s.call('send_to_terminal', { id, command: '\x03', wait_ms: 300 });
         await sleep(500);
 

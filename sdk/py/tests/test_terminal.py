@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+from typing import List, Optional
+
 import unittest
 import uuid
 
@@ -7,6 +10,19 @@ from boxsh_py import BoxshClientError, TerminalReadOptions
 
 from .common import UUID_RE, make_client
 
+
+_ANSI_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def stream_lines(raw: Optional[str]) -> List[str]:
+    """Split a raw PTY stream into lines the way a reader would see them.
+
+    The tty writes CRLF and wraps output in escape sequences (bash on Linux
+    brackets prompts and output with ESC[?2004h/l), which would otherwise glue
+    themselves onto the text and break exact line comparisons.
+    """
+    text = _ANSI_RE.sub("", raw or "")
+    return [line.replace("\r", "") for line in text.split("\n")]
 
 class BoxshTerminalTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -136,8 +152,7 @@ class BoxshTerminalOutputModelTests(unittest.TestCase):
         try:
             self.assertTrue(result.exited)
             self.assertEqual(result.exit_code, 0)
-            lines = [line for line in (result.stream or "").split("\n")
-                     if line.rstrip("\r").startswith("N-")]
+            lines = [line for line in stream_lines(result.stream) if line.startswith("N-")]
             self.assertEqual(len(lines), 100)
             self.assertFalse(result.truncated_before)
         finally:
@@ -210,11 +225,18 @@ class BoxshTerminalSignalTests(unittest.TestCase):
         try:
             time.sleep(0.3)                     # let bash reach its prompt
             self.client.send_to_terminal(session.id, "echo START; sleep 2; echo AFTER\n")
-            time.sleep(0.5)                     # inside the sleep
+            # Wait until the command is really running instead of sleeping a
+            # fixed amount: a signal sent before the shell gets there would be a
+            # no-op on a slow machine.
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                seen = self.client.get_terminal_output(session.id, TerminalReadOptions(cursor=0, wait_ms=400))
+                if "START" in stream_lines(seen.stream):
+                    break
             self.client.send_to_terminal(session.id, signal="INT")
             time.sleep(2.5)                     # past the sleep
             result = self.client.get_terminal_output(session.id, TerminalReadOptions(cursor=0))
-            lines = [line.rstrip("\r") for line in (result.stream or "").split("\n")]
+            lines = stream_lines(result.stream)
             self.assertIn("START", lines)
             self.assertNotIn("AFTER", lines)
             self.assertFalse(result.exited)

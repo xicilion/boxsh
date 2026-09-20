@@ -114,6 +114,7 @@ describe('MCP cancellation', () => {
 
   test('cancelling a terminal command interrupts it but keeps the session', async () => {
     const s = new RawServer();
+    const started = tempFile();
     try {
       s.call('run_in_terminal', { command: 'bash' }, 'run');
       assert.ok(await s.waitFor(() => s.response('run'), 10000));
@@ -121,12 +122,14 @@ describe('MCP cancellation', () => {
 
       // capture_status makes this call "run this command line", so cancelling it
       // is expected to stop that command.
+      // The command records that it really started, so the cancel cannot arrive
+      // before it (a cancel that matches nothing is a no-op by design, which
+      // would make the rest of the test meaningless on a slow machine).
       s.call('send_to_terminal',
-        { id: session, command: 'sleep 20; echo NEVER\n', capture_status: true, wait_ms: 300000 }, 'send');
-      // Give the call time to be dispatched *and* the shell time to start the
-      // command: a cancel that arrives first matches nothing (and is a no-op by
-      // design), which would make the rest of this test meaningless.
-      await new Promise(r => setTimeout(r, 700));
+        { id: session, command: `echo started > ${started}; sleep 20; echo NEVER\n`,
+          capture_status: true, wait_ms: 300000 }, 'send');
+      assert.ok(await s.waitFor(() => fs.existsSync(started), 10000),
+        'the command should have started');
       s.notify('notifications/cancelled', { requestId: 'send', reason: 'cancelled' });
       await new Promise(r => setTimeout(r, 1000));
       assert.equal(s.response('send'), undefined, 'no reply for the cancelled call');
@@ -148,6 +151,7 @@ describe('MCP cancellation', () => {
       await s.waitFor(() => s.response('kill'), 5000);
     } finally {
       s.close();
+      try { fs.unlinkSync(started); } catch { /* gone */ }
     }
   });
 

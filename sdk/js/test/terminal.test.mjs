@@ -184,7 +184,7 @@ describe('BoxshClient — terminal output model', () => {
             { waitFor: 'exit', waitMs: 20000 });
         assert.equal(r.exited, true);
         assert.equal(r.exitCode, 0);
-        const lines = r.stream.split('\n').map(l => l.replace(/\r$/, '')).filter(l => /^N-\d+$/.test(l));
+        const lines = streamLines(r.stream).filter(l => /^N-\d+$/.test(l));
         assert.equal(lines.length, 100, `expected 100 lines, got ${lines.length}`);
         assert.equal(r.truncatedBefore, false);
         await client.killTerminal(r.id);
@@ -235,6 +235,19 @@ describe('BoxshClient — terminal output model', () => {
     });
 });
 
+/**
+ * Split a raw PTY stream into lines a reader would recognise.  The tty does not
+ * hand over plain text: it writes CRLF and wraps output in escape sequences
+ * (bash on Linux brackets every prompt and output with ESC[?2004h/l), either of
+ * which would glue itself onto a line and break exact comparisons - which is
+ * how this test passed on macOS and failed on Linux CI.
+ */
+const streamLines = (s) => (s ?? '')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')   // OSC
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')             // CSI
+    .split('\n')
+    .map(l => l.replace(/\r/g, ''));
+
 describe('BoxshClient — terminal signals', () => {
     /** @type {BoxshClient} */
     let client;
@@ -252,12 +265,20 @@ describe('BoxshClient — terminal signals', () => {
         try {
             await new Promise(res => setTimeout(res, 300));   // let bash reach its prompt
             await client.sendToTerminal(id, 'echo START; sleep 2; echo AFTER\n', { waitMs: 400 });
-            await new Promise(res => setTimeout(res, 400));   // inside the sleep
+            // Wait until the command is really running instead of sleeping a
+            // fixed amount: on a slow machine a signal sent before the shell
+            // gets there is a no-op (and the test would "pass" for the wrong
+            // reason, or fail on the START assertion).
+            const running = Date.now() + 8000;
+            while (Date.now() < running) {
+                const seen = await client.getTerminalOutput(id, { cursor: 0, waitMs: 400 });
+                if (streamLines(seen.stream).includes('START')) break;
+            }
             await client.sendToTerminal(id, undefined, { signal: 'INT', waitMs: 300 });
             await new Promise(res => setTimeout(res, 2500));  // past the sleep
 
             const r = await client.getTerminalOutput(id, { cursor: 0, waitMs: 200 });
-            const lines = r.stream.split('\n').map(l => l.replace(/\r$/, ''));
+            const lines = streamLines(r.stream);
             assert.ok(lines.includes('START'), 'the command ran');
             assert.ok(!lines.includes('AFTER'), 'the rest of the command line must be abandoned');
             assert.equal(r.exited, false, 'the session survives');
