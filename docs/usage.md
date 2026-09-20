@@ -1354,6 +1354,10 @@ The `boxsh.js` SDK provides a high-level client for Node.js applications.
 npm install boxsh.js
 ```
 
+The Node.js and Python SDKs are released together with the server and share one
+version number (`boxsh.js` and `boxsh-py`, both 3.3.0 here, speaking the protocol
+of boxsh 5.4.0); the server keeps its own version (`boxsh --version`).
+
 #### Quick start
 
 ```js
