@@ -370,11 +370,14 @@ export class BoxshClient {
     }
 
     /**
-     * Send text to a terminal session's PTY stdin.
+     * Send text to a terminal session's PTY stdin, and/or signal it.
      *
      * @param {string} id        Session id
-     * @param {string} command   Text to write (append \n for execution)
+     * @param {string} [command] Text to write (append \n for execution); omit to signal only
      * @param {object} [opts]
+     * @param {string} [opts.signal]          Signal for the session's process group:
+     *   "INT" aborts the running command and the rest of its command line,
+     *   "KILL" ends the session (an interactive shell ignores TERM/QUIT by POSIX)
      * @param {boolean} [opts.captureStatus]  Submit the text as a shell command line and report its exit code
      * @param {number} [opts.waitMs]          How long to wait (default 500; 60000 with captureStatus)
      * @param {string} [opts.waitFor]         "output" (default), "exit" or "none"
@@ -382,8 +385,10 @@ export class BoxshClient {
      * @returns {Promise<{ output: string, exited: boolean, exitCode: number|null }>}
      */
     async sendToTerminal(id, command, opts = {}) {
-        const args = { id, command };
-        if (opts.captureStatus) args.capture_status = true;
+        const args = { id };
+        if (command)                  args.command        = command;
+        if (opts.signal)              args.signal         = opts.signal;
+        if (opts.captureStatus)       args.capture_status = true;
         applyTerminalReadOptions(args, opts);
         const result = await this.#send({
             method: 'tools/call',

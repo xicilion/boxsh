@@ -98,6 +98,18 @@ export interface TerminalReadOptions {
     waitFor?: 'output' | 'exit' | 'none';
 }
 
+/** Options for sendToTerminal. */
+export interface SendToTerminalOptions extends TerminalReadOptions {
+    /**
+     * Signal for the session.  Delivered to the foreground job and to the shell's
+     * own process group: `INT` aborts what is running, `KILL` ends the session.
+     * A raw ETX byte (0x03) only reaches the foreground job, like a physical Ctrl-C.
+     */
+    signal?: 'INT' | 'TERM' | 'KILL' | 'HUP' | 'QUIT' | 'USR1' | 'USR2' | 'STOP' | 'CONT';
+    /** Submit the text as a shell command line and report its exit code. */
+    captureStatus?: boolean;
+}
+
 export interface TerminalOutputResult {
     output: string;
     exited: boolean;

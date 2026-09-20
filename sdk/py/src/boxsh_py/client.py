@@ -513,19 +513,30 @@ class BoxshClient:
     def send_to_terminal(
         self,
         terminal_id: str,
-        command: str,
+        command: str = "",
         opts: Optional[TerminalReadOptions] = None,
         capture_status: bool = False,
+        signal: Optional[str] = None,
     ) -> TerminalOutputResult:
-        """Write to a session's stdin and read the result.
+        """Write to a session's stdin (and/or signal it) and read the result.
 
         With ``capture_status=True`` the text is submitted as a shell command
         line and the result carries ``command_exit_code`` — the exit code of
         that command (shell sessions only).
+
+        ``signal`` is delivered to the session's foreground job and to the
+        shell's own process group: ``"INT"`` aborts what is running, while a
+        raw ETX byte (0x03) only reaches the foreground job, like a physical
+        Ctrl-C.  ``"KILL"`` ends the session (an interactive shell ignores
+        SIGTERM/SIGQUIT by POSIX).
         """
-        arguments: Dict[str, Any] = {"id": terminal_id, "command": command}
+        arguments: Dict[str, Any] = {"id": terminal_id}
+        if command:
+            arguments["command"] = command
         if capture_status:
             arguments["capture_status"] = True
+        if signal:
+            arguments["signal"] = signal
         (opts or TerminalReadOptions()).apply(arguments)
         structured = self._tool_result(
             self._send("tools/call", {"name": "send_to_terminal", "arguments": arguments})

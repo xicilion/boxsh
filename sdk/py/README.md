@@ -81,6 +81,9 @@ with BoxshClient() as client:
     build = client.send_to_terminal(session.id, "make -j8\n", capture_status=True, opts=None)
     print(build.command_exit_code)
 
+    # Stop what it is running, and the rest of that command line
+    client.send_to_terminal(session.id, signal="INT")
+
     # Collect output that scrolled off the screen: cursor reads return deltas
     cursor = 0
     while True:
@@ -93,7 +96,6 @@ with BoxshClient() as client:
     # One-shot command: one call, complete output, exit code
     one = client.run_in_terminal("seq 1 100", RunInTerminalOptions(wait_for="exit", wait_ms=20000))
     print(one.exited, one.exit_code, one.stream)
-
     # Exited sessions are hidden from list_terminals unless asked for
     sessions = client.list_terminals(include_exited=True)
 

@@ -234,3 +234,45 @@ describe('BoxshClient — terminal output model', () => {
         await client.killTerminal(r.id);
     });
 });
+
+describe('BoxshClient — terminal signals', () => {
+    /** @type {BoxshClient} */
+    let client;
+
+    before(() => {
+        client = new BoxshClient({ boxshPath: BOXSH, workers: 1 });
+    });
+
+    after(async () => {
+        await client.close();
+    });
+
+    it('signal:"INT" aborts the running command and the rest of its command line', async () => {
+        const { id } = await client.runInTerminal('bash');
+        try {
+            await new Promise(res => setTimeout(res, 300));   // let bash reach its prompt
+            await client.sendToTerminal(id, 'echo START; sleep 2; echo AFTER\n', { waitMs: 400 });
+            await new Promise(res => setTimeout(res, 400));   // inside the sleep
+            await client.sendToTerminal(id, undefined, { signal: 'INT', waitMs: 300 });
+            await new Promise(res => setTimeout(res, 2500));  // past the sleep
+
+            const r = await client.getTerminalOutput(id, { cursor: 0, waitMs: 200 });
+            const lines = r.stream.split('\n').map(l => l.replace(/\r$/, ''));
+            assert.ok(lines.includes('START'), 'the command ran');
+            assert.ok(!lines.includes('AFTER'), 'the rest of the command line must be abandoned');
+            assert.equal(r.exited, false, 'the session survives');
+        } finally {
+            await client.killTerminal(id);
+        }
+    });
+
+    it('an unknown signal is a tool error', async () => {
+        const { id } = await client.runInTerminal('bash');
+        try {
+            await assert.rejects(() => client.sendToTerminal(id, undefined, { signal: 'NOPE' }),
+                err => err.code === 'E_INVALID_ARGUMENT');
+        } finally {
+            await client.killTerminal(id);
+        }
+    });
+});

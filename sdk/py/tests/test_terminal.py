@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 import uuid
 
-from boxsh_py import BoxshClientError
+from boxsh_py import BoxshClientError, TerminalReadOptions
 
 from .common import UUID_RE, make_client
 
@@ -192,3 +192,39 @@ class BoxshTerminalOutputModelTests(unittest.TestCase):
         self.assertTrue(found.exited)
         self.assertEqual(found.exit_code, 0)
         self.client.kill_terminal(session.id)
+
+
+class BoxshTerminalSignalTests(unittest.TestCase):
+    """Signals as a first-class primitive (no control bytes needed)."""
+
+    def setUp(self) -> None:
+        self.client = make_client()
+
+    def tearDown(self) -> None:
+        self.client.close()
+
+    def test_signal_int_abandons_the_command_line(self) -> None:
+        import time
+
+        session = self.client.run_in_terminal("bash")
+        try:
+            time.sleep(0.3)                     # let bash reach its prompt
+            self.client.send_to_terminal(session.id, "echo START; sleep 2; echo AFTER\n")
+            time.sleep(0.5)                     # inside the sleep
+            self.client.send_to_terminal(session.id, signal="INT")
+            time.sleep(2.5)                     # past the sleep
+            result = self.client.get_terminal_output(session.id, TerminalReadOptions(cursor=0))
+            lines = [line.rstrip("\r") for line in (result.stream or "").split("\n")]
+            self.assertIn("START", lines)
+            self.assertNotIn("AFTER", lines)
+            self.assertFalse(result.exited)
+        finally:
+            self.client.kill_terminal(session.id)
+
+    def test_unknown_signal_is_rejected(self) -> None:
+        session = self.client.run_in_terminal("bash")
+        try:
+            with self.assertRaises(BoxshClientError):
+                self.client.send_to_terminal(session.id, signal="NOPE")
+        finally:
+            self.client.kill_terminal(session.id)

@@ -133,6 +133,9 @@ while (true) {
     if (chunk.exited) break;
 }
 
+// Stop what the session is running (and the rest of that command line)
+await client.sendToTerminal(id, undefined, { signal: 'INT' });
+
 // One-shot command: one call, complete output, exit code
 const one = await client.runInTerminal('seq 1 100', { waitFor: 'exit', waitMs: 20000 });
 console.log(one.exited, one.exitCode, one.stream);
@@ -145,7 +148,7 @@ const sessions = await client.listTerminals();
 // [{ id, command, alive, cols, rows, total_bytes, ... }, ...]
 ```
 
-Cursor reads are cheap and safe to poll: an idle session returns zero bytes, and if the log wrapped the result says so through `truncatedBefore` / `droppedBytes` (the log keeps 1 MiB per session by default).
+Cursor reads are cheap and safe to poll: without a cursor the session continues where the previous read stopped (an idle session returns zero bytes), every result also carries the rendered screen, and if the log wrapped the result says so through `truncatedBefore` / `droppedBytes` (the log keeps 1 MiB per session by default).
 
 ---
 
