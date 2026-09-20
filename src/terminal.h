@@ -47,10 +47,11 @@ struct TerminalInfo {
 // Read options
 // ---------------------------------------------------------------------------
 
-// What a read waits for before returning.
+// What a read waits for before returning.  There is no "return at once" member:
+// `wait_ms: 0` says that in one number, and a third mode only made the two
+// spellings of it look like different things.
 enum class TerminalWait {
-    None,   // return immediately
-    Output, // new output or process exit (historical behaviour, default)
+    Output, // new output or process exit (default)
     Exit    // wait for the session's process to exit
 };
 
@@ -153,8 +154,7 @@ struct TerminalKillResult {
     bool        truncated    = false;
     uint64_t    dropped_bytes = 0;
 };
-TerminalKillResult terminal_kill(const std::string &id,
-                                 const std::optional<uint64_t> &cursor = {});
+TerminalKillResult terminal_kill(const std::string &id);
 
 // Interrupt what a session is running: SIGINT to its foreground process group
 // (the job a physical Ctrl-C would reach).  The session itself, its shell and

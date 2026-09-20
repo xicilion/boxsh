@@ -350,18 +350,14 @@ export class BoxshClient {
      *
      * @param {string} command   Command to run (e.g. "bash")
      * @param {object} [opts]
-     * @param {string} [opts.explanation]  Why this terminal is needed
-     * @param {string} [opts.goal]         What you intend to accomplish
      * @param {number} [opts.cols]         Terminal columns (default: 220)
      * @param {number} [opts.rows]         Terminal rows (default: 50)
      * @param {number} [opts.waitMs]       How long to wait before returning (default: 500)
-     * @param {string} [opts.waitFor]      "output" (default), "exit" or "none"
+     * @param {string} [opts.waitFor]      "output" (default) or "exit"
      * @returns {Promise<{ id: string, output: string, exited: boolean, exitCode: number|null }>}
      */
     async runInTerminal(command, opts = {}) {
         const args = { command };
-        if (opts.explanation) args.explanation = opts.explanation;
-        if (opts.goal)        args.goal        = opts.goal;
         if (opts.cols)        args.cols         = opts.cols;
         if (opts.rows)        args.rows         = opts.rows;
         applyTerminalReadOptions(args, opts);
@@ -386,7 +382,7 @@ export class BoxshClient {
      *   "KILL" ends the session (an interactive shell ignores TERM/QUIT by POSIX)
      * @param {boolean} [opts.captureStatus]  Submit the text as a shell command line and report its exit code
      * @param {number} [opts.waitMs]          How long to wait (default 500; 60000 with captureStatus)
-     * @param {string} [opts.waitFor]         "output" (default), "exit" or "none"
+     * @param {string} [opts.waitFor]         "output" (default) or "exit"
      * @param {number} [opts.cursor]          Return the raw stream from this cursor
      * @returns {Promise<{ output: string, exited: boolean, exitCode: number|null }>}
      */
@@ -415,7 +411,7 @@ export class BoxshClient {
      * @param {object} [opts]
      * @param {number} [opts.cursor]  Raw-log cursor (from a previous result's nextCursor)
      * @param {number} [opts.waitMs]  How long to wait before returning
-     * @param {string} [opts.waitFor] "output" (default), "exit" or "none"
+     * @param {string} [opts.waitFor] "output" (default) or "exit"
      * @returns {Promise<{ output: string, exited: boolean, exitCode: number|null }>}
      */
     async getTerminalOutput(id, opts = {}) {

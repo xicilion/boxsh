@@ -1066,7 +1066,7 @@ echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"run_in_t
 # → structuredContent: { exited: true, exit_code: 0, stream: "N-1\r\nN-2\r\n…N-100\r\n", next_cursor: 810, truncated_before: false }
 ```
 
-> A session that starts a shell prints that shell's own startup output — on macOS, bash prints its "the default interactive shell is now zsh" notice. boxsh does not filter program output, so it appears in the stream like any other text; use `wait_for:"none"` or ignore it.
+> A session that starts a shell prints that shell's own startup output — on macOS, bash prints its "the default interactive shell is now zsh" notice. boxsh does not filter program output, so it appears in the stream like any other text; use `wait_ms: 0` or ignore it.
 
 **`send_to_terminal`** — Write to stdin and read back. A trailing `\n` is what turns text into a command line; `wait_ms` controls how long to wait (default 500 ms).
 
@@ -1355,8 +1355,8 @@ npm install boxsh.js
 ```
 
 The Node.js and Python SDKs are released together with the server and share one
-version number (`boxsh.js` and `boxsh-py`, both 3.3.0 here, speaking the protocol
-of boxsh 5.4.0); the server keeps its own version (`boxsh --version`).
+version number (`boxsh.js` and `boxsh-py`, both 4.0.0 here, speaking the protocol
+of boxsh 5.5.0); the server keeps its own version (`boxsh --version`).
 
 #### Quick start
 

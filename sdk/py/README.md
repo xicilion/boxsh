@@ -14,7 +14,7 @@ The API is intentionally Python-first: it accepts `pathlib.Path` anywhere a path
 
 Requirements: Python >= 3.9, Linux or macOS, and a `boxsh` binary on `PATH` or in the `BOXSH` environment variable.
 
-The Python and Node.js SDKs are released together from this repository and share one version number (`boxsh-py` 3.3.0 == `boxsh.js` 3.3.0, both speaking the protocol of boxsh 5.4.0).
+The Python and Node.js SDKs are released together from this repository and share one version number (`boxsh-py` 4.0.0 == `boxsh.js` 4.0.0, both speaking the protocol of boxsh 5.5.0).
 
 ## Install
 

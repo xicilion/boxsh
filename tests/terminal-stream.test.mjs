@@ -111,16 +111,20 @@ describe('terminal — wait_for / wait_ms', () => {
     }
   });
 
-  test('wait_for:"none" does not wait', async () => {
+  test('a read can return at once — wait_ms:0, not a wait_for mode', async () => {
     const s = new BoxshSession();
     try {
       const t0 = Date.now();
       const r = BoxshSession.sc(await s.call('run_in_terminal', {
-        command: 'sleep 30', wait_for: 'none',
+        command: 'sleep 30', wait_ms: 0,
       }));
       const elapsed = Date.now() - t0;
       assert.equal(r.exited, false);
-      assert.ok(elapsed < 1000, `wait_for:"none" took ${elapsed}ms`);
+      assert.ok(elapsed < 1000, `wait_ms:0 took ${elapsed}ms`);
+      // "none" said exactly this and was removed on 2026-09-21: one spelling.
+      assertToolError(await s.call('run_in_terminal', {
+        command: 'sleep 1', wait_for: 'none',
+      }), 'E_INVALID_ARGUMENT');
       await s.call('kill_terminal', { id: r.id });
     } finally {
       await s.close();

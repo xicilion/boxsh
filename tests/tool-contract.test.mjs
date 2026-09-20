@@ -122,6 +122,25 @@ describe('tool contract — descriptors', () => {
     assert.deepEqual(toolByName('edit').inputSchema.required, ['path', 'edits']);
   });
 
+  test('optional arguments earn their place', () => {
+    // Every property is read by the model on every request, so an argument that
+    // duplicates another one, or that no code path reads, is not free.  These
+    // were measured against the agent-app chat history (2419 messages, of which
+    // 144 were terminal calls) on 2026-09-21:
+    //   explanation / goal     21/21 calls filled them, boxsh read neither
+    //   kill_terminal.cursor   0/14 — the session's read position covers it
+    //   wait_for:"none"        0/144, and identical to wait_ms:0
+    const run = Object.keys(toolByName('run_in_terminal').inputSchema.properties);
+    assert.ok(!run.includes('explanation'), 'explanation is not read by any code path');
+    assert.ok(!run.includes('goal'), 'goal is not read by any code path');
+    assert.deepEqual(Object.keys(toolByName('kill_terminal').inputSchema.properties),
+      ['id'], 'kill_terminal takes an id and nothing else');
+    for (const name of ['run_in_terminal', 'send_to_terminal', 'get_terminal_output']) {
+      assert.deepEqual(toolByName(name).inputSchema.properties.wait_for.enum, ['output', 'exit'],
+        `${name}: wait_for is a two-way choice; wait_ms:0 is how a caller says "do not wait"`);
+    }
+  });
+
   test('descriptions stay terse', () => {
     // Every tools/list response is sent to the model on every request, so a
     // description earns its bytes: the facts that are not already in the tool

@@ -254,8 +254,8 @@ Optional arguments (shared by the read tools):
 
 | Argument | Meaning |
 |---|---|
-| `wait_ms` | How long to wait before returning (default 500, up to 600000) |
-| `wait_for` | `"output"` (default: wait for output and for it to settle, so a quick command's result is not just the echo of its own command line), `"exit"` (wait for the process to exit and return the complete raw stream), `"none"` (return at once) |
+| `wait_ms` | How long to wait before returning (default 500, up to 600000; `0` returns as soon as there is something to report, i.e. does not wait at all) |
+| `wait_for` | `"output"` (default: wait for output and for it to settle, so a quick command's result is not just the echo of its own command line), `"exit"` (wait for the process to exit and return the complete raw stream) |
 | `cursor` | Read from this absolute raw-log position instead of the session's read position |
 
 Every read returns both views: `output` is the rendered screen (the last `rows` lines — what an interactive program is showing) and `stream` is the raw bytes received since the previous read, with `next_cursor` for the position after them. The model-facing text shows whichever is complete, so new output taller than the screen is never mistaken for lost output, and polling is cheap (an idle session returns zero bytes).

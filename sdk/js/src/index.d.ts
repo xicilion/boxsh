@@ -78,14 +78,12 @@ export interface ViewImageResult {
 }
 
 export interface RunInTerminalOptions {
-    explanation?: string;
-    goal?: string;
     cols?: number;
     rows?: number;
     /** How long to wait before returning, in ms (default 500; 60000 with waitFor "exit"). */
     waitMs?: number;
-    /** "output" (default), "exit" (wait for the process to finish) or "none". */
-    waitFor?: 'output' | 'exit' | 'none';
+    /** "output" (default) or "exit" (wait for the process to finish). */
+    waitFor?: 'output' | 'exit';
 }
 
 /** Options shared by the terminal read calls (getTerminalOutput). */
@@ -95,7 +93,7 @@ export interface TerminalReadOptions {
     /** How long to wait before returning, in ms. */
     waitMs?: number;
     /** What to wait for before returning. */
-    waitFor?: 'output' | 'exit' | 'none';
+    waitFor?: 'output' | 'exit';
 }
 
 /** Options for sendToTerminal. */

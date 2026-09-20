@@ -102,7 +102,7 @@ struct RpcRequest {
     int         terminal_rows = 50;
     // Shared terminal read options (see src/terminal.h).
     int                    terminal_wait_ms  = -1;   // -1 = not given
-    std::string            terminal_wait_for;         // "" | output | exit | none
+    std::string            terminal_wait_for;         // "" | output | exit
     std::optional<uint64_t> terminal_cursor;          // raw-log cursor
     bool                   terminal_capture_status = false;
     bool                   terminal_include_exited = false;

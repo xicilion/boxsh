@@ -559,12 +559,8 @@ void wait_for_read(std::unique_lock<std::mutex> &lk, TerminalSession &s,
     auto ready = [&]() -> bool {
         if (s.exited) return true;
         if (want_status) return s.status_done_seq >= status_seq;
-        switch (opts.wait_for) {
-            case TerminalWait::None: return true;
-            case TerminalWait::Exit: return false;   // s.exited is checked above
-            case TerminalWait::Output:
-            default:                 return s.generation != gen0;
-        }
+        if (opts.wait_for == TerminalWait::Exit) return false;   // s.exited checked above
+        return s.generation != gen0;                             // Output
     };
 
     if (!ready())
@@ -958,8 +954,7 @@ TerminalOutputResult terminal_read(const std::string &id,
 // Kill
 // ---------------------------------------------------------------------------
 
-TerminalKillResult terminal_kill(const std::string &id,
-                                 const std::optional<uint64_t> &cursor) {
+TerminalKillResult terminal_kill(const std::string &id) {
     auto s = require_session(id);
 
     bool need_signal = false;
@@ -988,8 +983,8 @@ TerminalKillResult terminal_kill(const std::string &id,
         r.output        = screen_snapshot(s->screen, s->rows, s->cols);
         if (s->probe_used) r.output = strip_probe_echo_lines(r.output);
         // A kill is the last chance to read the session, so it returns
-        // everything still retained unless the caller pinned a cursor.
-        slice           = log_slice(*s, cursor.value_or(0));
+        // everything still retained.
+        slice           = log_slice(*s, 0);
         r.exit_code     = s->exited ? s->exit_code : -1;
         r.stream        = strip_status_noise(slice.data);
         r.first_cursor  = slice.begin;

@@ -539,8 +539,9 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
         //
         // Shared optional arguments (all of them also accepted by
         // send_to_terminal / get_terminal_output):
-        //   wait_ms N      how long to wait before returning (default 500)
-        //   wait_for S     "output" (default) | "exit" | "none"
+        //   wait_ms N      how long to wait before returning (default 500;
+        //                  0 = return as soon as there is something to return)
+        //   wait_for S     "output" (default) | "exit"
         auto parse_terminal_read_opts = [&](std::string &what) -> bool {
             if (args.contains("wait_ms")) {
                 if (!args["wait_ms"].is_number_integer() && !args["wait_ms"].is_number_unsigned()) {
@@ -560,8 +561,8 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
                     return false;
                 }
                 std::string w = args["wait_for"].get<std::string>();
-                if (w != "output" && w != "exit" && w != "none") {
-                    what = "wait_for must be \"output\", \"exit\" or \"none\"";
+                if (w != "output" && w != "exit") {
+                    what = "wait_for must be \"output\" or \"exit\"";
                     return false;
                 }
                 req.terminal_wait_for = w;
@@ -676,18 +677,6 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
                 return true;
             }
             req.session_id = args["id"].get<std::string>();
-            if (args.contains("cursor")) {
-                if (!args["cursor"].is_number_unsigned() && !args["cursor"].is_number_integer()) {
-                    req.arg_error = "kill_terminal: cursor must be a non-negative integer";
-                    return true;
-                }
-                long long v = args["cursor"].get<long long>();
-                if (v < 0) {
-                    req.arg_error = "kill_terminal: cursor must be a non-negative integer";
-                    return true;
-                }
-                req.terminal_cursor = (uint64_t)v;
-            }
             return true;
         }
         if (tool_name == "list_terminals") {
@@ -1193,9 +1182,9 @@ static std::string mcp_tools_list_response(const json &id,
     // Options every terminal read accepts.
     auto terminal_read_args = [](json props) {
         props["wait_ms"]  = {{"type", "number"},
-            {"description", "Max wait in ms (default 500, or 60000 with wait_for=\"exit\" / capture_status)"}};
-        props["wait_for"] = {{"type", "string"}, {"enum", json::array({"output", "exit", "none"})},
-            {"description", "\"output\" (default) returns once output has settled, \"exit\" waits for the process, \"none\" returns at once"}};
+            {"description", "Max wait in ms (default 500, or 60000 with wait_for=\"exit\"/capture_status); 0 returns at once"}};
+        props["wait_for"] = {{"type", "string"}, {"enum", json::array({"output", "exit"})},
+            {"description", "\"output\" (default) returns once output has settled, \"exit\" waits for the process"}};
         return props;
     };
 
@@ -1421,8 +1410,6 @@ static std::string mcp_tools_list_response(const json &id,
             {"type", "object"},
             {"properties", terminal_read_args(json{
                 {"command",     {{"type", "string"}, {"description", "Command to run in the PTY (e.g. bash)"}}},
-                {"explanation", {{"type", "string"}}},
-                {"goal",        {{"type", "string"}}},
                 {"cols",        {{"type", "number"}, {"description", "Columns, 20-1000 (default 220), set on the PTY itself"}}},
                 {"rows",        {{"type", "number"}, {"description", "Rows, 1-1000 (default 50); only the screen snapshot is this tall"}}}
             })},
@@ -1511,8 +1498,7 @@ static std::string mcp_tools_list_response(const json &id,
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"id",     {{"type", "string"}}},
-                {"cursor", {{"type", "number"}, {"description", "Return the raw stream from here (0 = oldest retained byte)"}}}
+                {"id",     {{"type", "string"}}}
             }},
             {"required", json::array({"id"})}
         }},
@@ -1705,7 +1691,6 @@ static int terminal_wait_ms_for(const RpcRequest &req, bool run_to_completion) {
 
 static TerminalWait terminal_wait_kind(const RpcRequest &req) {
     if (req.terminal_wait_for == "exit") return TerminalWait::Exit;
-    if (req.terminal_wait_for == "none") return TerminalWait::None;
     return TerminalWait::Output;
 }
 
@@ -1885,7 +1870,7 @@ static TerminalOutputResult terminal_out_from_kill(const TerminalKillResult &k) 
 
 static ToolResult tool_terminal_kill(const RpcRequest &req) {
     try {
-        auto r   = terminal_kill(req.session_id, req.terminal_cursor);
+        auto r   = terminal_kill(req.session_id);
         auto out = terminal_out_from_kill(r);
 
         // The kill text keeps its historical shape ("terminal <id> killed"),

@@ -133,7 +133,7 @@ class TerminalReadOptions:
     cursor: Optional[int] = None
     #: How long to wait before returning, in milliseconds.
     wait_ms: Optional[int] = None
-    #: "output" (default), "exit" (wait for the process to finish) or "none".
+    #: "output" (default) or "exit" (wait for the process to finish).
     wait_for: Optional[str] = None
 
     def apply(self, arguments: Dict[str, Any]) -> None:
@@ -147,8 +147,6 @@ class TerminalReadOptions:
 
 @dataclass(frozen=True)
 class RunInTerminalOptions(TerminalReadOptions):
-    explanation: Optional[str] = None
-    goal: Optional[str] = None
     cols: Optional[int] = None
     rows: Optional[int] = None
 
@@ -504,10 +502,6 @@ class BoxshClient:
     def run_in_terminal(self, command: str, opts: Optional[RunInTerminalOptions] = None) -> RunInTerminalResult:
         opts = opts or RunInTerminalOptions()
         arguments: Dict[str, Any] = {"command": command}
-        if opts.explanation:
-            arguments["explanation"] = opts.explanation
-        if opts.goal:
-            arguments["goal"] = opts.goal
         if opts.cols is not None:
             arguments["cols"] = opts.cols
         if opts.rows is not None:
