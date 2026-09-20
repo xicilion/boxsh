@@ -1169,22 +1169,22 @@ static std::string mcp_tools_list_response(const json &id,
         return json{
             {"type", "object"},
             {"properties", {
-                {"id",        {{"type", "string"},  {"description", "Terminal session id"}}},
-                {"output",    {{"type", "string"},  {"description", "Rendered screen snapshot (a view of the last `rows` lines)"}}},
-                {"exited",    {{"type", "boolean"}, {"description", "Whether the process has exited"}}},
+                {"id",        {{"type", "string"}}},
+                {"output",    {{"type", "string"},  {"description", "Rendered screen (the last `rows` lines)"}}},
+                {"exited",    {{"type", "boolean"}}},
                 {"exit_code", {{"type", json::array({"integer", "null"})},
-                               {"description", "Exit code when exited, null while it is still running"}}},
-                {"total_bytes", {{"type", "integer"}, {"description", "Raw bytes received from the PTY since the session started"}}},
-                {"screen_partial", {{"type", "boolean"}, {"description", "The session produced more lines than the screen shows, so `output` is a partial view — read the stream for everything"}}},
-                {"stream",    {{"type", "string"},  {"description", "Raw output bytes (escape sequences included) received since the previous read or the given cursor"}}},
+                               {"description", "null while the process is still running"}}},
+                {"total_bytes", {{"type", "integer"}}},
+                {"screen_partial", {{"type", "boolean"}, {"description", "`output` is a partial view; the stream has everything"}}},
+                {"stream",    {{"type", "string"},  {"description", "Raw bytes (escape sequences included) since the previous read or the given cursor"}}},
                 {"first_cursor", {{"type", "integer"}, {"description", "Cursor the returned stream starts at"}}},
                 {"next_cursor",  {{"type", "integer"}, {"description", "Pass as `cursor` to read only what comes after this result"}}},
-                {"truncated_before", {{"type", "boolean"}, {"description", "Bytes before first_cursor were dropped from the log and cannot be recovered"}}},
-                {"dropped_bytes", {{"type", "integer"}, {"description", "Bytes dropped from the front of the raw log so far"}}},
-                {"result_truncated", {{"type", "boolean"}, {"description", "The payload was cut to fit the result budget (--max-result-bytes)"}}},
-                {"result_dropped_bytes", {{"type", "integer"}, {"description", "Raw bytes dropped to fit the result budget"}}},
-                {"result_budget_bytes", {{"type", "integer"}, {"description", "Budget that was in force when the payload was cut"}}},
-                {"command_exit_code", {{"type", "integer"}, {"description", "Exit code of the command just submitted (capture_status only)"}}}
+                {"truncated_before", {{"type", "boolean"}, {"description", "Earlier bytes were dropped and can no longer be read"}}},
+                {"dropped_bytes", {{"type", "integer"}}},
+                {"result_truncated", {{"type", "boolean"}, {"description", "Cut to fit the result budget (--max-result-bytes)"}}},
+                {"result_dropped_bytes", {{"type", "integer"}}},
+                {"result_budget_bytes", {{"type", "integer"}}},
+                {"command_exit_code", {{"type", "integer"}, {"description", "Exit code of the command just submitted"}}}
             }},
             {"required", json::array({"id", "output", "exited", "exit_code"})}
         };
@@ -1193,29 +1193,24 @@ static std::string mcp_tools_list_response(const json &id,
     // Options every terminal read accepts.
     auto terminal_read_args = [](json props) {
         props["wait_ms"]  = {{"type", "number"},
-            {"description", "How long to wait before returning, in ms (default 500; up to 600000). With wait_for=\"exit\" or capture_status the default is 60000."}};
+            {"description", "Max wait in ms (default 500, or 60000 with wait_for=\"exit\" / capture_status)"}};
         props["wait_for"] = {{"type", "string"}, {"enum", json::array({"output", "exit", "none"})},
-            {"description", "What to wait for: \"output\" (default; new output, then until it settles), \"exit\" (the process exits; also returns the complete raw stream), \"none\" (return immediately)."}};
+            {"description", "\"output\" (default) returns once output has settled, \"exit\" waits for the process, \"none\" returns at once"}};
         return props;
     };
 
     // bash tool
     std::string bash_desc =
-        "Execute a shell command in the sandbox. Returns the exit code plus the "
-        "command's stdout and stderr (each capped at 10 MiB). ";
+        "Run a shell command in the sandbox (no TTY). Returns the exit code with the "
+        "command's stdout and stderr. ";
     if (default_command_timeout > 0) {
         bash_desc += "Commands are killed after " +
                      std::to_string(default_command_timeout) +
-                     " seconds by default (server-side safety net); pass a larger "
-                     "`timeout` for commands that legitimately run longer "
-                     "(builds, test suites, downloads). `timeout: 0` means \"use "
-                     "the server default\". ";
+                     " seconds by default; pass `timeout` for one that runs longer. ";
     } else {
         bash_desc += "Pass `timeout` to kill the command after N seconds. ";
     }
-    bash_desc +=
-        "For large output, narrow the command (head/tail/grep/sed) instead of "
-        "relying on truncation.";
+    bash_desc += "Narrow large output with head/tail/grep.";
     tools.push_back({
         {"name", "bash"},
         {"title", "Bash"},
@@ -1223,29 +1218,29 @@ static std::string mcp_tools_list_response(const json &id,
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"command", {{"type", "string"}, {"description", "Bash command to execute"}}},
-                {"timeout", {{"type", "number"}, {"description", "Timeout in seconds (optional; overrides the server default, 0 = use the server default)"}}}
+                {"command", {{"type", "string"}, {"description", "Shell command to run"}}},
+                {"timeout", {{"type", "number"}, {"description", "Seconds before the command is killed (default: the server setting; 0 = use it)"}}}
             }},
             {"required", json::array({"command"})}
         }},
         {"outputSchema", {
             {"type", "object"},
             {"properties", {
-                {"exit_code", {{ "type", "integer"}, {"description", "Process exit code (0 = success; -1 when timed out or killed)"}}},
-                {"stdout",    {{ "type", "string"},  {"description", "Standard output (up to 10 MiB)"}}},
-                {"stderr",    {{ "type", "string"},  {"description", "Standard error (up to 10 MiB)"}}},
-                {"duration_ms", { {"type", "integer"}, {"description", "Wall-clock execution time in milliseconds"}}},
-                {"stdout_truncated", { {"type", "boolean"}, {"description", "stdout lost bytes: the 10 MiB stream cap or the result budget cut it, and the text says which"}}},
-                {"stderr_truncated", { {"type", "boolean"}, {"description", "stderr lost bytes: the 10 MiB stream cap or the result budget cut it"}}},
-                {"stdout_dropped_bytes", { {"type", "integer"}, {"description", "Raw stdout bytes dropped to fit the result budget"}}},
-                {"stderr_dropped_bytes", { {"type", "integer"}, {"description", "Raw stderr bytes dropped to fit the result budget"}}},
-                {"result_truncated", { {"type", "boolean"}, {"description", "The result was cut to fit the result budget (--max-result-bytes)"}}},
-                {"result_dropped_bytes", { {"type", "integer"}, {"description", "Raw bytes dropped to fit the result budget"}}},
-                {"result_budget_bytes", { {"type", "integer"}, {"description", "Budget that was in force when the result was cut"}}},
-                {"timed_out", { {"type", "boolean"}, {"description", "The command was killed after its timeout expired"}}},
-                {"timeout_sec", { {"type", "integer"}, {"description", "Timeout that was in force when the command was killed (only with timed_out)"}}},
+                {"exit_code", {{ "type", "integer"}, {"description", "0 on success; -1 when killed (timeout or signal)"}}},
+                {"stdout",    {{ "type", "string"}}},
+                {"stderr",    {{ "type", "string"}}},
+                {"duration_ms", { {"type", "integer"}}},
+                {"stdout_truncated", { {"type", "boolean"}, {"description", "stdout lost bytes (stream cap or result budget)"}}},
+                {"stderr_truncated", { {"type", "boolean"}, {"description", "stderr lost bytes (stream cap or result budget)"}}},
+                {"stdout_dropped_bytes", { {"type", "integer"}}},
+                {"stderr_dropped_bytes", { {"type", "integer"}}},
+                {"result_truncated", { {"type", "boolean"}, {"description", "Cut to fit the result budget (--max-result-bytes)"}}},
+                {"result_dropped_bytes", { {"type", "integer"}}},
+                {"result_budget_bytes", { {"type", "integer"}}},
+                {"timed_out", { {"type", "boolean"}, {"description", "Killed because the timeout expired"}}},
+                {"timeout_sec", { {"type", "integer"}}},
                 {"timeout_source", { {"type", "string"}, {"enum", json::array({"request", "server_default"})},
-                                     {"description", "Whether that timeout came from the request or from the server default (only with timed_out)"}}}
+                                     {"description", "Where that timeout came from"}}}
             }},
             {"required", json::array({"exit_code", "stdout", "stderr", "duration_ms"})}
         }},
@@ -1261,33 +1256,29 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "read"},
         {"title", "Read File"},
         {"description",
-         "Read a text file. Returns the file's text, capped at 2000 lines or 50 KiB "
-         "per call; use offset/limit to page through larger files. Binary files "
-         "(including images) cannot be read as text and return an error — use "
-         "view_image for images and bash (file/xxd/strings) for other binaries. "
-         "Targets must be regular files: FIFOs and sockets are rejected. An empty "
-         "result explains itself through empty_reason."},
+         "Read a text file, up to 2000 lines or 50 KiB per call (page with "
+         "offset/limit). Binary content is rejected: use view_image for images and "
+         "bash for other binaries. Targets must be regular files."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "Path to the file to read (relative or absolute)"}}},
-                {"offset", {{"type", "number"}, {"description", "Line number to start reading from (1-indexed, default 1)"}}},
-                {"limit", {{"type", "number"}, {"description", "Maximum number of lines to read (default 2000)"}}}
+                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "File to read"}}},
+                {"offset", {{"type", "number"}, {"description", "First line (1-indexed, default 1)"}}},
+                {"limit", {{"type", "number"}, {"description", "Max lines (default 2000)"}}}
             }},
             {"required", json::array({"path"})}
         }},
         {"outputSchema", {
             {"type", "object"},
             {"properties", {
-                {"encoding",  {{"type", "string"}, {"enum", json::array({"text"})}, {"description", "Always \"text\" — read only serves text output"}}},
-                {"mime_type", {{"type", "string"}, {"description", "Detected MIME type of the text file (e.g. text/plain)"}}},
-                {"line_count", {{ "type", "integer"}, {"description", "Number of lines returned"}}},
-                {"truncated", {{"type", "boolean"}, {"description", "Whether the output was truncated"}}},
-                {"file_size", {{ "type", "integer"}, {"description", "Size of the file in bytes (always present)"}}},
-                {"total_lines", {{"type", "integer"}, {"description", "Total lines in the file (only when truncated, or when offset is past the end)"}}},
-                {"next_offset", {{"type", "integer"}, {"description", "Offset to pass to continue reading (only when a further line exists)"}}},
-                {"empty_reason", {{"type", "string"}, {"enum", json::array({"empty_file", "offset_beyond_eof"})},
-                                   {"description", "Why the body is empty (only when line_count is 0)"}}}
+                {"encoding",  {{"type", "string"}, {"enum", json::array({"text"})}}},
+                {"mime_type", {{"type", "string"}}},
+                {"line_count", {{ "type", "integer"}}},
+                {"truncated", {{"type", "boolean"}}},
+                {"file_size", {{ "type", "integer"}, {"description", "Size of the file in bytes"}}},
+                {"total_lines", {{"type", "integer"}, {"description", "Present when truncated or when offset is past the end"}}},
+                {"next_offset", {{"type", "integer"}, {"description", "Pass as offset to continue reading"}}},
+                {"empty_reason", {{"type", "string"}, {"enum", json::array({"empty_file", "offset_beyond_eof"})}}}
             }},
             {"required", json::array({"encoding", "mime_type", "line_count", "truncated", "file_size"})}
         }},
@@ -1303,21 +1294,16 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "view_image"},
         {"title", "View Image"},
         {"description",
-         std::string("View an image file (") + supported_image_formats() +
-         "). Returns the image itself plus its metadata; oversized images are "
-         "downscaled to a 2000px longest edge. Use detail=\"low\" for a 512px "
-         "preview. Animated sources return their first frame only. Formats "
-         "outside the model-native set (jpeg/png/gif/webp) are converted to "
-         "PNG/JPEG, so the payload is always something a multimodal model can "
-         "ingest. Other image formats (avif, heic, jxl, psd, \xe2\x80\xa6) are "
-         "reported as unsupported. The target must be a regular image file; "
-         "files above 100 MP are rejected without being decoded."},
+         std::string("View an image (") + supported_image_formats() +
+         "), downscaled to a 2000px longest edge (detail=\"low\": 512px). Animated "
+         "sources return their first frame; other formats (avif, heic, jxl, psd, "
+         "\xe2\x80\xa6) are reported as unsupported."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "Path to the image file (relative or absolute)"}}},
+                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "Image file to view"}}},
                 {"detail", {{"type", "string"}, {"enum", json::array({"auto", "low"})},
-                            {"description", "\"auto\" (default, up to 2000px) or \"low\" (up to 512px, fewer tokens)"}}}
+                            {"description", "\"auto\" (default) or \"low\" (512px, fewer tokens)"}}}
             }},
             {"required", json::array({"path"})}
         }},
@@ -1325,15 +1311,15 @@ static std::string mcp_tools_list_response(const json &id,
             {"type", "object"},
             {"properties", {
                 {"encoding",  {{"type", "string"}, {"enum", json::array({"image"})}}},
-                {"mime_type", {{"type", "string"}, {"description", "MIME type of the returned image (may differ from the file after re-encoding)"}}},
-                {"width",     {{"type", "integer"}, {"description", "Width of the returned image"}}},
-                {"height",    {{"type", "integer"}, {"description", "Height of the returned image"}}},
-                {"original_width",  {{"type", "integer"}, {"description", "Width of the file's image before resizing"}}},
-                {"original_height", {{"type", "integer"}, {"description", "Height of the file's image before resizing"}}},
-                {"was_resized", {{"type", "boolean"}, {"description", "Whether the image was downscaled"}}},
-                {"size", {{"type", "integer"}, {"description", "Size of the original file in bytes"}}},
-                {"animated", {{"type", "boolean"}, {"description", "Animated source — only the first frame is returned"}}},
-                {"converted", {{"type", "boolean"}, {"description", "Source format was outside the model-native set (jpeg/png/gif/webp) and was re-encoded to PNG/JPEG"}}}
+                {"mime_type", {{"type", "string"}, {"description", "May differ from the file after re-encoding"}}},
+                {"width",     {{"type", "integer"}}},
+                {"height",    {{"type", "integer"}}},
+                {"original_width",  {{"type", "integer"}, {"description", "Before resizing"}}},
+                {"original_height", {{"type", "integer"}, {"description", "Before resizing"}}},
+                {"was_resized", {{"type", "boolean"}}},
+                {"size", {{"type", "integer"}, {"description", "Size of the file in bytes"}}},
+                {"animated", {{"type", "boolean"}, {"description", "Only the first frame is returned"}}},
+                {"converted", {{"type", "boolean"}, {"description", "Re-encoded to PNG/JPEG for the model"}}}
             }},
             {"required", json::array({"encoding", "mime_type", "width", "height",
                                      "original_width", "original_height", "was_resized", "size"})}
@@ -1350,27 +1336,24 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "write"},
         {"title", "Write File"},
         {"description",
-         "Create or overwrite a file with the given content. "
-         "Parent directories are created automatically if needed. "
-         "Use encoding=base64 for binary content. "
-         "The write is in place: existing permissions, hard links and symlinks "
-         "are preserved. Targets must not be directories, FIFOs or sockets."},
+         "Write a file, creating parent directories as needed. The write is in "
+         "place, so permissions, hard links and symlinks survive. Use "
+         "encoding=\"base64\" for binary content."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "Path to the file to write (relative or absolute)"}}},
-                {"content", {{"type", "string"}, {"description", "Content to write to the file. When encoding is base64, this is the base64-encoded binary data."}}},
-                {"encoding", {{"type", "string"}, {"enum", json::array({"text", "base64"})},
-                             {"description", "Content encoding: \"text\" (default) or \"base64\""}}}
+                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "File to write"}}},
+                {"content", {{"type", "string"}, {"description", "File content (base64-encoded when encoding is base64)"}}},
+                {"encoding", {{"type", "string"}, {"enum", json::array({"text", "base64"})}}}
             }},
             {"required", json::array({"path", "content"})}
         }},
         {"outputSchema", {
             {"type", "object"},
             {"properties", {
-                {"path",  {{"type", "string"},  {"description", "Path written"}}},
-                {"bytes", {{"type", "integer"}, {"description", "Number of bytes written"}}},
-                {"created", {{"type", "boolean"}, {"description", "True when the file did not exist before"}}}
+                {"path",  {{"type", "string"}}},
+                {"bytes", {{"type", "integer"}}},
+                {"created", {{"type", "boolean"}, {"description", "The file did not exist before"}}}
             }},
             {"required", json::array({"path", "bytes", "created"})}
         }},
@@ -1386,25 +1369,23 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "edit"},
         {"title", "Edit File"},
         {"description",
-         "Edit a file using exact text replacement. "
-         "Every edits[].oldText must match a unique, non-overlapping region of the original file. "
-         "The file is rewritten in place only when the bytes actually change (a no-op "
-         "edit leaves the file untouched); targets above 16 MiB are rejected."},
+         "Replace exact text in a file: every edits[].oldText must match a unique, "
+         "non-overlapping region. A no-op edit leaves the file untouched."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "Path to the file to edit (relative or absolute)"}}},
+                {"path", {{"type", "string"}, {"minLength", 1}, {"description", "File to edit"}}},
                 {"edits", {
                     {"type", "array"},
                     {"items", {
                         {"type", "object"},
                         {"properties", {
                             {"oldText", {{"type", "string"}, {"description", "Exact text to find (must be unique)"}}},
-                            {"newText", {{"type", "string"}, {"description", "Replacement text"}}}
+                            {"newText", {{"type", "string"}}}
                         }},
                         {"required", json::array({"oldText", "newText"})}
                     }},
-                    {"description", "One or more targeted replacements"}
+                    {"description", "Replacements to apply"}
                 }}
             }},
             {"required", json::array({"path", "edits"})}
@@ -1412,10 +1393,10 @@ static std::string mcp_tools_list_response(const json &id,
         {"outputSchema", {
             {"type", "object"},
             {"properties", {
-                {"path", {{"type", "string"}, {"description", "Path edited"}}},
-                {"lines_added", {{"type", "integer"}, {"description", "Lines added"}}},
-                {"lines_removed", {{"type", "integer"}, {"description", "Lines removed"}}},
-                {"first_changed_line", {{"type", "integer"}, {"description", "1-indexed line of the first change"}}}
+                {"path", {{"type", "string"}}},
+                {"lines_added", {{"type", "integer"}}},
+                {"lines_removed", {{"type", "integer"}}},
+                {"first_changed_line", {{"type", "integer"}, {"description", "1-indexed"}}}
             }},
             {"required", json::array({"path", "lines_added", "lines_removed", "first_changed_line"})}
         }},
@@ -1431,24 +1412,19 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "run_in_terminal"},
         {"title", "Run in Terminal"},
         {"description",
-         "Start a persistent PTY session running the given command (e.g. \"bash\"). "
-         "The command runs on a real terminal: it can be interactive (prompts, REPLs, "
-         "pagers) and keeps state (cwd, environment) across calls. "
-         "Returns the session id, the rendered screen, the raw output received so far "
-         "(with `next_cursor` for the position after it) and the amount of bytes received. "
-         "For a command whose output must be complete pass wait_for:\"exit\" (with a "
-         "`wait_ms` budget): one call then returns everything plus the exit code. "
-         "Use send_to_terminal to type into the session and kill_terminal to end it. "
-         "For a plain non-interactive command prefer the bash tool: it returns separate "
-         "stdout/stderr and no terminal rendering."},
+         "Start a persistent PTY session (a real terminal: interactive programs work and "
+         "state such as the cwd persists) and return the id of the session. "
+         "Use wait_for:\"exit\" when one call has to return a command's complete output "
+         "and exit code. For a plain non-interactive command the bash tool is cheaper: "
+         "it returns stdout and stderr separately, without terminal rendering."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", terminal_read_args(json{
                 {"command",     {{"type", "string"}, {"description", "Command to run in the PTY (e.g. bash)"}}},
-                {"explanation", {{"type", "string"}, {"description", "Why this terminal is needed"}}},
-                {"goal",        {{"type", "string"}, {"description", "What you intend to accomplish"}}},
-                {"cols",        {{"type", "number"}, {"description", "Terminal columns, 20-1000 (default 220). Set on the PTY itself, so programs see the real size."}}},
-                {"rows",        {{"type", "number"}, {"description", "Terminal rows, 1-1000 (default 50). Only the screen snapshot is this tall; the raw log is not limited by it."}}}
+                {"explanation", {{"type", "string"}}},
+                {"goal",        {{"type", "string"}}},
+                {"cols",        {{"type", "number"}, {"description", "Columns, 20-1000 (default 220), set on the PTY itself"}}},
+                {"rows",        {{"type", "number"}, {"description", "Rows, 1-1000 (default 50); only the screen snapshot is this tall"}}}
             })},
             {"required", json::array({"command"})}
         }},
@@ -1465,31 +1441,26 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "send_to_terminal"},
         {"title", "Send to Terminal"},
         {"description",
-         "Write text to a session's PTY stdin and return what came back. Append \\n to "
-         "run it as a shell command line (text without a trailing newline only reaches the "
-         "program as keystrokes). The result holds the output produced since the previous "
-         "read; a read returns once output has settled (a short quiet gap), so for a "
-         "command's complete output use capture_status:true or poll with the returned "
-         "cursor. "
-         "With capture_status:true the text is submitted as a shell command line and the "
-         "result carries command_exit_code, so a persistent shell session can be driven "
-         "like a command runner (shell sessions only — the probe line is input, so do not "
-         "use it on a REPL or a pager). "
-         "With signal the session's process group is signalled instead of (or after) the "
-         "write: it goes to the foreground job *and* to the shell itself, which is how you "
-         "ask a session to stop what it is doing (a raw ETX byte, 0x03, only reaches the "
-         "foreground job). \"KILL\" ends the session; interactive shells ignore "
-         "SIGTERM/SIGQUIT by POSIX, so use kill_terminal to end one of those."},
+         "Write to a session's stdin and return what came back. Ending the text with \\n "
+         "submits it as a command line; bytes without a newline reach the program as "
+         "keystrokes. "
+         "capture_status:true returns the command line's exit code in "
+         "command_exit_code — shell sessions only, since it types a probe line into the "
+         "session, so never onto a REPL or a pager. "
+         "signal signals the session's process group instead of (or after) the write: the "
+         "foreground job *and* the shell itself, which is how a session is asked to stop "
+         "what it is doing. Interactive shells ignore SIGTERM/SIGQUIT, so ending one "
+         "takes signal:\"KILL\" or kill_terminal."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", terminal_read_args(json{
-                {"id",      {{"type", "string"}, {"description", "Terminal session id"}}},
+                {"id",      {{"type", "string"}}},
                 {"command", {{"type", "string"}, {"description", "Text to write to the PTY stdin (optional when signal is given)"}}},
                 {"signal",  {{"type", "string"},
                              {"enum", json::array({"INT", "TERM", "KILL", "HUP", "QUIT", "USR1", "USR2", "STOP", "CONT"})},
-                             {"description", "Signal to deliver to the session's process group"}}},
+                             {"description", "Signal sent to the session's process group"}}},
                 {"capture_status", {{"type", "boolean"},
-                    {"description", "Submit `command` as a shell command line and report its exit code (default false)"}}}
+                    {"description", "Return the submitted command line's exit code (default false)"}}}
             })},
             {"required", json::array({"id"})}
         }},
@@ -1506,20 +1477,18 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "get_terminal_output"},
         {"title", "Get Terminal Output"},
         {"description",
-         "Wait for output from a session and return it. The result always carries both "
-         "views: `output` is the rendered screen (the last `rows` lines — what an "
-         "interactive program is showing) and `stream` is the raw bytes received since "
-         "the previous read, the position after which is `next_cursor`; the text shows "
-         "whichever is complete, so nothing repeats and nothing is lost. "
-         "Pass `cursor` to read from an explicit position instead (0 = everything still "
-         "retained) and wait_for:\"exit\" to wait for the process to finish and collect "
-         "the complete output in one call. When the log wrapped, truncated_before and "
-         "dropped_bytes say which bytes are gone."},
+         "Wait for a session's output and return it: the rendered screen plus the raw "
+         "stream received since the previous read, so consecutive reads return only what "
+         "is new. The raw log is capped, and truncated_before marks bytes that were "
+         "dropped before anyone read them. "
+         "Pass `cursor` to read from an explicit position (0 = from the start of what is "
+         "still retained) or wait_for:\"exit\" to collect a finished process's complete "
+         "output and exit code."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", terminal_read_args(json{
-                {"id",     {{"type", "string"}, {"description", "Terminal session id"}}},
-                {"cursor", {{"type", "number"}, {"description", "Absolute byte cursor: read from here instead of the session's read position (0 = oldest retained byte)"}}}
+                {"id",     {{"type", "string"}}},
+                {"cursor", {{"type", "number"}, {"description", "Read from here instead of the session's read position (0 = oldest retained byte)"}}}
             })},
             {"required", json::array({"id"})}
         }},
@@ -1536,27 +1505,26 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "kill_terminal"},
         {"title", "Kill Terminal"},
         {"description",
-         "Kill a terminal session and free its resources. Signals the session's whole "
-         "process group (SIGHUP, escalating to SIGKILL) and returns the final screen plus "
-         "the complete raw output still retained (from `cursor` when given), so nothing "
-         "printed before the kill is lost."},
+         "Kill a session and free it. SIGHUP goes to the whole process group, escalating "
+         "to SIGKILL, and the result still carries the final screen and the raw output "
+         "retained (from `cursor` when given), so nothing printed before the kill is lost."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
-                {"id",     {{"type", "string"}, {"description", "Terminal session id"}}},
-                {"cursor", {{"type", "number"}, {"description", "Absolute byte cursor: return the raw stream from here (0 = oldest retained byte)"}}}
+                {"id",     {{"type", "string"}}},
+                {"cursor", {{"type", "number"}, {"description", "Return the raw stream from here (0 = oldest retained byte)"}}}
             }},
             {"required", json::array({"id"})}
         }},
         {"outputSchema", {
             {"type", "object"},
             {"properties", {
-                {"id",       {{"type", "string"},  {"description", "Terminal session id"}}},
-                {"killed",   {{"type", "boolean"}, {"description", "True when the session was still running and had to be signalled (false when it had already exited)"}}},
+                {"id",       {{"type", "string"}}},
+                {"killed",   {{"type", "boolean"}, {"description", "The session was still running and had to be signalled"}}},
                 {"exit_code", {{"type", json::array({"integer", "null"})},
-                               {"description", "Exit code of the session's process (-1 when it was signalled)"}}},
-                {"output",   {{"type", "string"},  {"description", "Final screen snapshot"}}},
-                {"stream",   {{"type", "string"},  {"description", "Raw output bytes in [first_cursor, next_cursor)"}}},
+                               {"description", "-1 when it was signalled"}}},
+                {"output",   {{"type", "string"},  {"description", "Final screen"}}},
+                {"stream",   {{"type", "string"},  {"description", "Raw bytes in [first_cursor, next_cursor)"}}},
                 {"first_cursor", {{"type", "integer"}}},
                 {"next_cursor",  {{"type", "integer"}}},
                 {"total_bytes",  {{"type", "integer"}}},
@@ -1577,14 +1545,13 @@ static std::string mcp_tools_list_response(const json &id,
         {"name", "list_terminals"},
         {"title", "List Terminals"},
         {"description",
-         "List the terminal sessions this server owns. Exited sessions are hidden by "
-         "default (they stay addressable until they are reaped); pass include_exited:true "
-         "to see them too, and kill_terminal to release one."},
+         "List the terminal sessions this server owns. Sessions whose process has exited "
+         "are hidden unless include_exited is true, and they stay usable until killed."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
                 {"include_exited", {{"type", "boolean"},
-                    {"description", "Also list sessions whose process has exited (default false)"}}}
+                    {"description", "Include sessions whose process has exited (default false)"}}}
             }},
             {"required", json::array()}
         }},
@@ -1596,18 +1563,18 @@ static std::string mcp_tools_list_response(const json &id,
                     {"items", {
                         {"type", "object"},
                         {"properties", {
-                            {"id",      {{"type", "string"},  {"description", "Terminal session id"}}},
-                            {"command", {{"type", "string"},  {"description", "Command the session runs"}}},
-                            {"alive",   {{"type", "boolean"}, {"description", "Whether the session is still alive"}}},
-                            {"exited",  {{"type", "boolean"}, {"description", "Whether the process has exited"}}},
+                            {"id",      {{"type", "string"}}},
+                            {"command", {{"type", "string"}}},
+                            {"alive",   {{"type", "boolean"}}},
+                            {"exited",  {{"type", "boolean"}}},
                             {"exit_code", {{"type", json::array({"integer", "null"})}}},
                             {"cols",    {{"type", "integer"}}},
                             {"rows",    {{"type", "integer"}}},
-                            {"total_bytes", {{"type", "integer"}, {"description", "Raw bytes received so far"}}},
-                            {"retained_bytes", {{"type", "integer"}, {"description", "Bytes still readable from the raw log"}}},
-                            {"truncated", {{"type", "boolean"}, {"description", "Some output was dropped from the raw log"}}},
-                            {"age_ms",  {{"type", "integer"}, {"description", "Age of the session in milliseconds"}}},
-                            {"idle_ms", {{"type", "integer"}, {"description", "Time since the last output (or the exit)"}}}
+                            {"total_bytes", {{"type", "integer"}}},
+                            {"retained_bytes", {{"type", "integer"}, {"description", "Still readable from the raw log"}}},
+                            {"truncated", {{"type", "boolean"}, {"description", "Output was dropped from the log"}}},
+                            {"age_ms",  {{"type", "integer"}}},
+                            {"idle_ms", {{"type", "integer"}, {"description", "Since the last output (or the exit)"}}}
                         }},
                         {"required", json::array({"id", "command", "alive", "exited", "exit_code"})}
                     }}

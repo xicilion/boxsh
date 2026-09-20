@@ -122,6 +122,26 @@ describe('tool contract — descriptors', () => {
     assert.deepEqual(toolByName('edit').inputSchema.required, ['path', 'edits']);
   });
 
+  test('descriptions stay terse', () => {
+    // Every tools/list response is sent to the model on every request, so a
+    // description earns its bytes: the facts that are not already in the tool
+    // name, the schemas or the argument descriptions do. Field-name
+    // restatements ("Terminal session id") and prose walkthroughs of what the
+    // outputSchema documents were cut on 2026-09-21 (4799 B → ~2770 B total).
+    const MAX_PER_TOOL = 800;
+    const MAX_TOTAL = 3500;
+    let total = 0;
+    for (const t of toolsList()) {
+      const size = Buffer.byteLength(t.description, 'utf8');
+      total += size;
+      assert.ok(size <= MAX_PER_TOOL,
+        `${t.name}: description is ${size} bytes (budget ${MAX_PER_TOOL}) — ` +
+        'move details the schemas already carry out of the description');
+    }
+    assert.ok(total <= MAX_TOTAL,
+      `tool descriptions total ${total} bytes (budget ${MAX_TOTAL})`);
+  });
+
   test('descriptions carry no stale wording', () => {
     for (const t of toolsList()) {
       assert.ok(!/binary files are returned as base64/i.test(t.description),
