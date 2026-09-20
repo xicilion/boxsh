@@ -107,7 +107,7 @@ await client.edit('/workspace/output.txt', [
 
 ## Terminal sessions
 
-The terminal tools manage persistent PTY sessions. Commands start an interactive process; you can send input and poll for output asynchronously.
+The terminal tools manage persistent PTY sessions: an interactive process you can type into, with a lossless raw output log next to the rendered screen.
 
 ```js
 // Start a bash session
@@ -118,21 +118,34 @@ console.log(output); // initial screen snapshot
 const result = await client.sendToTerminal(id, 'ls -la\n');
 console.log(result.output);
 
-// Poll until a long-running command finishes
-let out;
-do {
-    out = await client.getTerminalOutput(id);
-    process.stdout.write(out.output);
-} while (!out.exited);
-console.log('exit code:', out.exitCode);
+// Run a command line and get its exit code (persistent shell session)
+const build = await client.sendToTerminal(id, 'make -j8\n', {
+    captureStatus: true,   // → build.commandExitCode
+    waitMs: 300000,
+});
 
-// Terminate the session and free resources
+// Collect output that scrolled off the screen: cursor reads return deltas only
+let cursor = 0;
+while (true) {
+    const chunk = await client.getTerminalOutput(id, { cursor, waitMs: 1000 });
+    process.stdout.write(chunk.stream ?? '');   // raw bytes since `cursor`
+    cursor = chunk.nextCursor;
+    if (chunk.exited) break;
+}
+
+// One-shot command: one call, complete output, exit code
+const one = await client.runInTerminal('seq 1 100', { waitFor: 'exit', waitMs: 20000 });
+console.log(one.exited, one.exitCode, one.stream);
+
+// Terminate the session and free resources (returns the final screen)
 const finalOutput = await client.killTerminal(id);
 
-// List all active sessions
+// List sessions (exited ones are hidden unless includeExited is set)
 const sessions = await client.listTerminals();
-// [{ id, command, alive, cols, rows }, ...]
+// [{ id, command, alive, cols, rows, total_bytes, ... }, ...]
 ```
+
+Cursor reads are cheap and safe to poll: an idle session returns zero bytes, and if the log wrapped the result says so through `truncatedBefore` / `droppedBytes` (the log keeps 1 MiB per session by default).
 
 ---
 

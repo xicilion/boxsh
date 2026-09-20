@@ -82,12 +82,42 @@ export interface RunInTerminalOptions {
     goal?: string;
     cols?: number;
     rows?: number;
+    /** How long to wait before returning, in ms (default 500; 60000 with waitFor "exit"). */
+    waitMs?: number;
+    /** "output" (default), "exit" (wait for the process to finish) or "none". */
+    waitFor?: 'output' | 'exit' | 'none';
+}
+
+/** Options shared by the terminal read calls (getTerminalOutput). */
+export interface TerminalReadOptions {
+    /** Raw-log cursor from a previous result's nextCursor (0 = everything still retained). */
+    cursor?: number;
+    /** How long to wait before returning, in ms. */
+    waitMs?: number;
+    /** What to wait for before returning. */
+    waitFor?: 'output' | 'exit' | 'none';
 }
 
 export interface TerminalOutputResult {
     output: string;
     exited: boolean;
     exitCode: number | null;
+    /** Bytes received from the PTY since the session started. */
+    totalBytes?: number;
+    /** Raw output bytes (present when a cursor was passed or waitFor is "exit"). */
+    stream?: string;
+    /** Cursor the stream starts at. */
+    firstCursor?: number;
+    /** Pass as `cursor` to read only what comes after this result. */
+    nextCursor?: number;
+    /** The requested cursor had already scrolled out of the raw log. */
+    truncatedBefore?: boolean;
+    /** Bytes dropped from the front of the raw log so far. */
+    droppedBytes?: number;
+    /** `output` is only a partial view: the session produced more lines than the screen shows. */
+    screenPartial?: boolean;
+    /** Exit code of the command just submitted (sendToTerminal with captureStatus). */
+    commandExitCode?: number;
 }
 
 export interface RunInTerminalResult extends TerminalOutputResult {

@@ -119,7 +119,29 @@ class ViewImageResult:
 
 
 @dataclass(frozen=True)
-class RunInTerminalOptions:
+class TerminalReadOptions:
+    """How a terminal call should wait and where it should read from."""
+
+    #: Raw-log cursor from a previous result's ``next_cursor`` (0 = everything
+    #: still retained).  Passing one switches the call to the lossless stream
+    #: channel instead of the rendered screen.
+    cursor: Optional[int] = None
+    #: How long to wait before returning, in milliseconds.
+    wait_ms: Optional[int] = None
+    #: "output" (default), "exit" (wait for the process to finish) or "none".
+    wait_for: Optional[str] = None
+
+    def apply(self, arguments: Dict[str, Any]) -> None:
+        if self.cursor is not None:
+            arguments["cursor"] = self.cursor
+        if self.wait_ms is not None:
+            arguments["wait_ms"] = self.wait_ms
+        if self.wait_for is not None:
+            arguments["wait_for"] = self.wait_for
+
+
+@dataclass(frozen=True)
+class RunInTerminalOptions(TerminalReadOptions):
     explanation: Optional[str] = None
     goal: Optional[str] = None
     cols: Optional[int] = None
@@ -131,11 +153,25 @@ class TerminalOutputResult:
     output: str
     exited: bool
     exit_code: Optional[int]
+    # Raw-stream channel (present when the call asked for it): bytes in
+    # [first_cursor, next_cursor), with truncated_before/dropped_bytes telling
+    # the caller when earlier output is no longer retained.
+    total_bytes: Optional[int] = None
+    stream: Optional[str] = None
+    first_cursor: Optional[int] = None
+    next_cursor: Optional[int] = None
+    truncated_before: Optional[bool] = None
+    dropped_bytes: Optional[int] = None
+    # True when the session produced more lines than the screen can show.
+    screen_partial: Optional[bool] = None
+    # Exit code of the command just submitted (send_to_terminal with capture_status).
+    command_exit_code: Optional[int] = None
 
 
 @dataclass(frozen=True)
 class RunInTerminalResult(TerminalOutputResult):
-    id: str
+    #: Session id (the client always fills this in).
+    id: str = ""
 
 
 @dataclass(frozen=True)
@@ -147,6 +183,11 @@ class TerminalSession:
     rows: int
     exited: bool = False
     exit_code: Optional[int] = None
+    total_bytes: Optional[int] = None
+    retained_bytes: Optional[int] = None
+    truncated: Optional[bool] = None
+    age_ms: Optional[int] = None
+    idle_ms: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +200,29 @@ class BashExecOptions:
 class BashOperations(Protocol):
     def exec(self, command: str, cwd: PathLike, options: Optional[BashExecOptions] = None) -> ExecResult:
         ...
+
+
+def _terminal_result(structured: Mapping[str, Any]) -> Dict[str, Any]:
+    """Map a terminal tool payload onto the TerminalOutputResult fields."""
+    exit_code = structured.get("exit_code")
+    mapped: Dict[str, Any] = {
+        "output": str(structured.get("output", "")),
+        "exited": bool(structured.get("exited", False)),
+        "exit_code": exit_code if isinstance(exit_code, int) else None,
+    }
+    for wire, field in (
+        ("total_bytes", "total_bytes"),
+        ("stream", "stream"),
+        ("first_cursor", "first_cursor"),
+        ("next_cursor", "next_cursor"),
+        ("truncated_before", "truncated_before"),
+        ("dropped_bytes", "dropped_bytes"),
+        ("screen_partial", "screen_partial"),
+        ("command_exit_code", "command_exit_code"),
+    ):
+        if wire in structured:
+            mapped[field] = structured[wire]
+    return mapped
 
 
 class _PendingResponse:
@@ -439,42 +503,50 @@ class BoxshClient:
             arguments["cols"] = opts.cols
         if opts.rows is not None:
             arguments["rows"] = opts.rows
+        opts.apply(arguments)
 
         structured = self._tool_result(
             self._send("tools/call", {"name": "run_in_terminal", "arguments": arguments})
         )
-        exit_code = structured.get("exit_code")
-        return RunInTerminalResult(
-            id=str(structured.get("id", "")),
-            output=str(structured.get("output", "")),
-            exited=bool(structured.get("exited", False)),
-            exit_code=exit_code if isinstance(exit_code, int) else None,
-        )
+        return RunInTerminalResult(id=str(structured.get("id", "")), **_terminal_result(structured))
 
-    def send_to_terminal(self, terminal_id: str, command: str) -> TerminalOutputResult:
-        structured = self._tool_result(
-            self._send(
-                "tools/call",
-                {"name": "send_to_terminal", "arguments": {"id": terminal_id, "command": command}},
-            )
-        )
-        exit_code = structured.get("exit_code")
-        return TerminalOutputResult(
-            output=str(structured.get("output", "")),
-            exited=bool(structured.get("exited", False)),
-            exit_code=exit_code if isinstance(exit_code, int) else None,
-        )
+    def send_to_terminal(
+        self,
+        terminal_id: str,
+        command: str,
+        opts: Optional[TerminalReadOptions] = None,
+        capture_status: bool = False,
+    ) -> TerminalOutputResult:
+        """Write to a session's stdin and read the result.
 
-    def get_terminal_output(self, terminal_id: str) -> TerminalOutputResult:
+        With ``capture_status=True`` the text is submitted as a shell command
+        line and the result carries ``command_exit_code`` — the exit code of
+        that command (shell sessions only).
+        """
+        arguments: Dict[str, Any] = {"id": terminal_id, "command": command}
+        if capture_status:
+            arguments["capture_status"] = True
+        (opts or TerminalReadOptions()).apply(arguments)
         structured = self._tool_result(
-            self._send("tools/call", {"name": "get_terminal_output", "arguments": {"id": terminal_id}})
+            self._send("tools/call", {"name": "send_to_terminal", "arguments": arguments})
         )
-        exit_code = structured.get("exit_code")
-        return TerminalOutputResult(
-            output=str(structured.get("output", "")),
-            exited=bool(structured.get("exited", False)),
-            exit_code=exit_code if isinstance(exit_code, int) else None,
+        return TerminalOutputResult(**_terminal_result(structured))
+
+    def get_terminal_output(
+        self, terminal_id: str, opts: Optional[TerminalReadOptions] = None
+    ) -> TerminalOutputResult:
+        """Read from a session.
+
+        Without a cursor this returns the rendered screen; with one it returns
+        the raw byte delta from that position (``cursor=0`` = everything still
+        retained), which is how output that scrolled off the screen is recovered.
+        """
+        arguments: Dict[str, Any] = {"id": terminal_id}
+        (opts or TerminalReadOptions()).apply(arguments)
+        structured = self._tool_result(
+            self._send("tools/call", {"name": "get_terminal_output", "arguments": arguments})
         )
+        return TerminalOutputResult(**_terminal_result(structured))
 
     def iter_terminal_output(self, terminal_id: str):
         while True:
@@ -489,8 +561,13 @@ class BoxshClient:
         )
         return str(structured.get("output", ""))
 
-    def list_terminals(self) -> List[TerminalSession]:
-        structured = self._tool_result(self._send("tools/call", {"name": "list_terminals", "arguments": {}}))
+    def list_terminals(self, include_exited: bool = False) -> List[TerminalSession]:
+        arguments: Dict[str, Any] = {}
+        if include_exited:
+            arguments["include_exited"] = True
+        structured = self._tool_result(
+            self._send("tools/call", {"name": "list_terminals", "arguments": arguments})
+        )
         sessions = structured.get("sessions")
         if not isinstance(sessions, list):
             return []
@@ -506,6 +583,13 @@ class BoxshClient:
                     alive=bool(session.get("alive", False)),
                     cols=int(session.get("cols", 0)),
                     rows=int(session.get("rows", 0)),
+                    exited=bool(session.get("exited", False)),
+                    exit_code=session.get("exit_code"),
+                    total_bytes=session.get("total_bytes"),
+                    retained_bytes=session.get("retained_bytes"),
+                    truncated=session.get("truncated"),
+                    age_ms=session.get("age_ms"),
+                    idle_ms=session.get("idle_ms"),
                 )
             )
         return output

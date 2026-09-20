@@ -116,3 +116,79 @@ class BoxshTerminalTests(unittest.TestCase):
         finally:
             self.client.kill_terminal(session.id)
         self.assertNotRegex(output, "\\x1b\\[")
+
+class BoxshTerminalOutputModelTests(unittest.TestCase):
+    """The lossless stream channel and the wait/exit-code options."""
+
+    def setUp(self) -> None:
+        self.client = make_client()
+
+    def tearDown(self) -> None:
+        self.client.close()
+
+    def test_wait_for_exit_returns_the_complete_output(self) -> None:
+        from boxsh_py import RunInTerminalOptions
+
+        result = self.client.run_in_terminal(
+            'seq 1 100 | sed "s/^/N-/"',
+            RunInTerminalOptions(wait_for="exit", wait_ms=20000),
+        )
+        try:
+            self.assertTrue(result.exited)
+            self.assertEqual(result.exit_code, 0)
+            lines = [line for line in (result.stream or "").split("\n")
+                     if line.rstrip("\r").startswith("N-")]
+            self.assertEqual(len(lines), 100)
+            self.assertFalse(result.truncated_before)
+        finally:
+            self.client.kill_terminal(result.id)
+
+    def test_cursor_reads_are_deltas(self) -> None:
+        from boxsh_py import TerminalReadOptions
+
+        session = self.client.run_in_terminal("bash")
+        try:
+            first = self.client.send_to_terminal(
+                session.id, "echo FIRST\n", TerminalReadOptions(cursor=0, wait_ms=800)
+            )
+            self.assertIn("FIRST", first.stream or "")
+            self.assertIsNotNone(first.next_cursor)
+
+            idle = self.client.get_terminal_output(
+                session.id, TerminalReadOptions(cursor=first.next_cursor, wait_ms=200)
+            )
+            self.assertEqual(idle.stream, "")
+
+            second = self.client.send_to_terminal(
+                session.id, "echo SECOND\n",
+                TerminalReadOptions(cursor=first.next_cursor, wait_ms=800),
+            )
+            self.assertIn("SECOND", second.stream or "")
+            self.assertNotIn("FIRST", second.stream or "")
+        finally:
+            self.client.kill_terminal(session.id)
+
+    def test_capture_status_reports_the_command_exit_code(self) -> None:
+        session = self.client.run_in_terminal("bash")
+        try:
+            ok = self.client.send_to_terminal(session.id, "true\n", capture_status=True, opts=None)
+            self.assertEqual(ok.command_exit_code, 0)
+            bad = self.client.send_to_terminal(session.id, "false\n", capture_status=True)
+            self.assertEqual(bad.command_exit_code, 1)
+        finally:
+            self.client.kill_terminal(session.id)
+
+    def test_list_terminals_include_exited(self) -> None:
+        import time
+
+        session = self.client.run_in_terminal("true")
+        time.sleep(0.3)
+        visible_ids = [item.id for item in self.client.list_terminals()]
+        self.assertNotIn(session.id, visible_ids)
+        listed = self.client.list_terminals(include_exited=True)
+        found = next((item for item in listed if item.id == session.id), None)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertTrue(found.exited)
+        self.assertEqual(found.exit_code, 0)
+        self.client.kill_terminal(session.id)

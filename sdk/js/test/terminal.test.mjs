@@ -166,3 +166,71 @@ describe('BoxshClient — terminal tools', () => {
         }
     });
 });
+
+describe('BoxshClient — terminal output model', () => {
+    /** @type {BoxshClient} */
+    let client;
+
+    before(() => {
+        client = new BoxshClient({ boxshPath: BOXSH, workers: 1 });
+    });
+
+    after(async () => {
+        await client.close();
+    });
+
+    it('runInTerminal waitFor:"exit" returns the complete output in one call', async () => {
+        const r = await client.runInTerminal('seq 1 100 | sed "s/^/N-/"',
+            { waitFor: 'exit', waitMs: 20000 });
+        assert.equal(r.exited, true);
+        assert.equal(r.exitCode, 0);
+        const lines = r.stream.split('\n').map(l => l.replace(/\r$/, '')).filter(l => /^N-\d+$/.test(l));
+        assert.equal(lines.length, 100, `expected 100 lines, got ${lines.length}`);
+        assert.equal(r.truncatedBefore, false);
+        await client.killTerminal(r.id);
+    });
+
+    it('a cursor read returns only what is new and costs nothing when idle', async () => {
+        const { id } = await client.runInTerminal('bash');
+        try {
+            const first = await client.sendToTerminal(id, 'echo FIRST\n', { cursor: 0, waitMs: 800 });
+            assert.ok(first.stream.includes('FIRST'));
+            assert.equal(typeof first.nextCursor, 'number');
+
+            const idle = await client.getTerminalOutput(id, { cursor: first.nextCursor, waitMs: 200 });
+            assert.equal(idle.stream, '');
+            assert.equal(idle.nextCursor, first.nextCursor);
+
+            const second = await client.sendToTerminal(id, 'echo SECOND\n', { cursor: first.nextCursor, waitMs: 800 });
+            assert.ok(second.stream.includes('SECOND'));
+            assert.ok(!second.stream.includes('FIRST'), 'delta must not repeat old output');
+        } finally {
+            await client.killTerminal(id);
+        }
+    });
+
+    it('captureStatus reports the exit code of the command line', async () => {
+        const { id } = await client.runInTerminal('bash');
+        try {
+            const ok = await client.sendToTerminal(id, 'true\n', { captureStatus: true, waitMs: 10000 });
+            assert.equal(ok.commandExitCode, 0);
+            const bad = await client.sendToTerminal(id, 'false\n', { captureStatus: true, waitMs: 10000 });
+            assert.equal(bad.commandExitCode, 1);
+        } finally {
+            await client.killTerminal(id);
+        }
+    });
+
+    it('listTerminals hides exited sessions unless asked', async () => {
+        const r = await client.runInTerminal('true');
+        await new Promise(res => setTimeout(res, 200));
+        const visible = await client.listTerminals();
+        const all = await client.listTerminals({ includeExited: true });
+        assert.ok(!visible.some(s => s.id === r.id), 'exited session must be hidden by default');
+        const found = all.find(s => s.id === r.id);
+        assert.ok(found, 'includeExited must list it');
+        assert.equal(found.exited, true);
+        assert.equal(found.exit_code, 0);
+        await client.killTerminal(r.id);
+    });
+});

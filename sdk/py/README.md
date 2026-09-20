@@ -68,7 +68,7 @@ with BoxshClient() as client:
 ## Terminal sessions
 
 ```python
-from boxsh_py import BoxshClient
+from boxsh_py import BoxshClient, RunInTerminalOptions, TerminalReadOptions
 
 with BoxshClient() as client:
     session = client.run_in_terminal("bash")
@@ -77,10 +77,25 @@ with BoxshClient() as client:
     output = client.send_to_terminal(session.id, "echo hello\n")
     print(output.output)
 
-    for update in client.iter_terminal_output(session.id):
-        print(update.output, end="")
-        if update.exited:
-            print("exit:", update.exit_code)
+    # Run a command line and get its exit code (persistent shell session)
+    build = client.send_to_terminal(session.id, "make -j8\n", capture_status=True, opts=None)
+    print(build.command_exit_code)
+
+    # Collect output that scrolled off the screen: cursor reads return deltas
+    cursor = 0
+    while True:
+        chunk = client.get_terminal_output(session.id, TerminalReadOptions(cursor=cursor, wait_ms=1000))
+        print(chunk.stream or "", end="")
+        cursor = chunk.next_cursor
+        if chunk.exited:
+            break
+
+    # One-shot command: one call, complete output, exit code
+    one = client.run_in_terminal("seq 1 100", RunInTerminalOptions(wait_for="exit", wait_ms=20000))
+    print(one.exited, one.exit_code, one.stream)
+
+    # Exited sessions are hidden from list_terminals unless asked for
+    sessions = client.list_terminals(include_exited=True)
 
     client.kill_terminal(session.id)
 ```

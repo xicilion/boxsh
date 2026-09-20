@@ -50,6 +50,43 @@ function imagesOf(result) {
 }
 
 /**
+ * Add the terminal read options (`cursor` / `waitMs` / `waitFor`) to a tool
+ * argument object, using the wire names the server expects.
+ * @param {object} args  tool arguments (mutated)
+ * @param {{cursor?: number, waitMs?: number, waitFor?: string}} opts
+ */
+function applyTerminalReadOptions(args, opts) {
+    if (opts.cursor !== undefined)  args.cursor   = opts.cursor;
+    if (opts.waitMs !== undefined)  args.wait_ms  = opts.waitMs;
+    if (opts.waitFor !== undefined) args.wait_for = opts.waitFor;
+}
+
+/**
+ * Map a terminal tool's structuredContent onto the SDK result shape.  The four
+ * historical fields are always present; the raw-stream fields appear when the
+ * call asked for the stream (cursor / waitFor:"exit" / captureStatus).
+ * @param {object} sc  structuredContent
+ * @returns {object}
+ */
+function terminalResultFrom(sc) {
+    /** @type {Record<string, unknown>} */
+    const out = {
+        output:   sc.output ?? '',
+        exited:   sc.exited ?? false,
+        exitCode: sc.exit_code ?? null,
+    };
+    if (sc.total_bytes      !== undefined) out.totalBytes      = sc.total_bytes;
+    if (sc.stream           !== undefined) out.stream           = sc.stream;
+    if (sc.first_cursor     !== undefined) out.firstCursor      = sc.first_cursor;
+    if (sc.next_cursor      !== undefined) out.nextCursor       = sc.next_cursor;
+    if (sc.truncated_before !== undefined) out.truncatedBefore  = sc.truncated_before;
+    if (sc.dropped_bytes    !== undefined) out.droppedBytes     = sc.dropped_bytes;
+    if (sc.screen_partial   !== undefined) out.screenPartial    = sc.screen_partial;
+    if (sc.command_exit_code !== undefined) out.commandExitCode = sc.command_exit_code;
+    return out;
+}
+
+/**
  * POSIX single-quote escaping.
  * @param {string} s
  * @returns {string}
@@ -311,6 +348,8 @@ export class BoxshClient {
      * @param {string} [opts.goal]         What you intend to accomplish
      * @param {number} [opts.cols]         Terminal columns (default: 220)
      * @param {number} [opts.rows]         Terminal rows (default: 50)
+     * @param {number} [opts.waitMs]       How long to wait before returning (default: 500)
+     * @param {string} [opts.waitFor]      "output" (default), "exit" or "none"
      * @returns {Promise<{ id: string, output: string, exited: boolean, exitCode: number|null }>}
      */
     async runInTerminal(command, opts = {}) {
@@ -319,6 +358,7 @@ export class BoxshClient {
         if (opts.goal)        args.goal        = opts.goal;
         if (opts.cols)        args.cols         = opts.cols;
         if (opts.rows)        args.rows         = opts.rows;
+        applyTerminalReadOptions(args, opts);
 
         const result = await this.#send({
             method: 'tools/call',
@@ -326,54 +366,56 @@ export class BoxshClient {
         });
         this.#checkToolError(result);
         const sc = result.structuredContent ?? {};
-        return {
-            id:       sc.id ?? '',
-            output:   sc.output ?? '',
-            exited:   sc.exited ?? false,
-            exitCode: sc.exit_code ?? null,
-        };
+        return { id: sc.id ?? '', ...terminalResultFrom(sc) };
     }
 
     /**
-     * Send text to a terminal session's PTY stdin, then wait up to 500ms for
-     * new output.
+     * Send text to a terminal session's PTY stdin.
      *
      * @param {string} id        Session id
      * @param {string} command   Text to write (append \n for execution)
+     * @param {object} [opts]
+     * @param {boolean} [opts.captureStatus]  Submit the text as a shell command line and report its exit code
+     * @param {number} [opts.waitMs]          How long to wait (default 500; 60000 with captureStatus)
+     * @param {string} [opts.waitFor]         "output" (default), "exit" or "none"
+     * @param {number} [opts.cursor]          Return the raw stream from this cursor
      * @returns {Promise<{ output: string, exited: boolean, exitCode: number|null }>}
      */
-    async sendToTerminal(id, command) {
+    async sendToTerminal(id, command, opts = {}) {
+        const args = { id, command };
+        if (opts.captureStatus) args.capture_status = true;
+        applyTerminalReadOptions(args, opts);
         const result = await this.#send({
             method: 'tools/call',
-            params: { name: 'send_to_terminal', arguments: { id, command } },
+            params: { name: 'send_to_terminal', arguments: args },
         });
         this.#checkToolError(result);
-        const sc = result.structuredContent ?? {};
-        return {
-            output:   sc.output ?? '',
-            exited:   sc.exited ?? false,
-            exitCode: sc.exit_code ?? null,
-        };
+        return terminalResultFrom(result.structuredContent ?? {});
     }
 
     /**
-     * Wait up to 500ms for new output from a terminal session.
+     * Read from a terminal session without writing to it.
+     *
+     * Without `cursor` this returns the rendered screen; with one it returns the
+     * raw byte delta from that position (0 = everything still retained), which is
+     * how output that scrolled off the screen is recovered.
      *
      * @param {string} id   Session id
+     * @param {object} [opts]
+     * @param {number} [opts.cursor]  Raw-log cursor (from a previous result's nextCursor)
+     * @param {number} [opts.waitMs]  How long to wait before returning
+     * @param {string} [opts.waitFor] "output" (default), "exit" or "none"
      * @returns {Promise<{ output: string, exited: boolean, exitCode: number|null }>}
      */
-    async getTerminalOutput(id) {
+    async getTerminalOutput(id, opts = {}) {
+        const args = { id };
+        applyTerminalReadOptions(args, opts);
         const result = await this.#send({
             method: 'tools/call',
-            params: { name: 'get_terminal_output', arguments: { id } },
+            params: { name: 'get_terminal_output', arguments: args },
         });
         this.#checkToolError(result);
-        const sc = result.structuredContent ?? {};
-        return {
-            output:   sc.output ?? '',
-            exited:   sc.exited ?? false,
-            exitCode: sc.exit_code ?? null,
-        };
+        return terminalResultFrom(result.structuredContent ?? {});
     }
 
     /**
@@ -393,14 +435,18 @@ export class BoxshClient {
     }
 
     /**
-     * List all terminal sessions.
+     * List terminal sessions.
      *
+     * @param {object} [opts]
+     * @param {boolean} [opts.includeExited]  Also list sessions whose process exited
      * @returns {Promise<Array<{ id: string, command: string, alive: boolean, cols: number, rows: number }>>}
      */
-    async listTerminals() {
+    async listTerminals(opts = {}) {
+        const args = {};
+        if (opts.includeExited) args.include_exited = true;
         const result = await this.#send({
             method: 'tools/call',
-            params: { name: 'list_terminals', arguments: {} },
+            params: { name: 'list_terminals', arguments: args },
         });
         this.#checkToolError(result);
         const sc = result.structuredContent ?? {};
