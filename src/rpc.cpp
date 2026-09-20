@@ -173,10 +173,15 @@ static std::string bash_result_text(int exit_code, const std::string &out,
     if (timed_out) {
         // Distinguish the server's safety-net timeout from a timeout the
         // caller asked for: only the former is worth retrying with `timeout`.
+        // Both say what happened and how long it ran, so the two cases read the
+        // same way instead of one being a bare marker.
         if (timeout_sec > 0 && timeout_from_default)
             body += "[timeout: killed after the server default of " +
                     std::to_string(timeout_sec) +
                     "s \xe2\x80\x94 pass `timeout` to allow a longer command]\n";
+        else if (timeout_sec > 0)
+            body += "[timeout: killed after " + std::to_string(timeout_sec) +
+                    "s (the `timeout` this request passed)]\n";
         else
             body += "[timeout]\n";
     }
@@ -1230,8 +1235,8 @@ static std::string mcp_tools_list_response(const json &id,
                 {"stdout",    {{ "type", "string"},  {"description", "Standard output (up to 10 MiB)"}}},
                 {"stderr",    {{ "type", "string"},  {"description", "Standard error (up to 10 MiB)"}}},
                 {"duration_ms", { {"type", "integer"}, {"description", "Wall-clock execution time in milliseconds"}}},
-                {"stdout_truncated", { {"type", "boolean"}, {"description", "stdout hit the 10 MiB cap"}}},
-                {"stderr_truncated", { {"type", "boolean"}, {"description", "stderr hit the 10 MiB cap"}}},
+                {"stdout_truncated", { {"type", "boolean"}, {"description", "stdout lost bytes: the 10 MiB stream cap or the result budget cut it, and the text says which"}}},
+                {"stderr_truncated", { {"type", "boolean"}, {"description", "stderr lost bytes: the 10 MiB stream cap or the result budget cut it"}}},
                 {"stdout_dropped_bytes", { {"type", "integer"}, {"description", "Raw stdout bytes dropped to fit the result budget"}}},
                 {"stderr_dropped_bytes", { {"type", "integer"}, {"description", "Raw stderr bytes dropped to fit the result budget"}}},
                 {"result_truncated", { {"type", "boolean"}, {"description", "The result was cut to fit the result budget (--max-result-bytes)"}}},
@@ -1806,8 +1811,16 @@ static std::string terminal_result_text(const std::string &id,
     std::string line = terminal_state_line(id, command, r.exited, r.exit_code);
     if (has_status) line += ", command exit code " + std::to_string(status);
     if (!suffix_state.empty()) line += suffix_state;
-    line += ", " + std::to_string(r.stream.size()) + " bytes, cursor \xe2\x86\x92 " +
-            std::to_string(r.next_cursor);
+    // The byte count is the width of the cursor span (next_cursor - first_cursor),
+    // which is what the cursor arithmetic means; `stream` can be a little shorter
+    // because boxsh's own capture_status probe bytes are removed from it.
+    const size_t span = r.next_cursor >= r.first_cursor
+                            ? (size_t)(r.next_cursor - r.first_cursor) : 0;
+    line += ", " + std::to_string(span) + " bytes";
+    if (span > r.stream.size())
+        line += " (" + std::to_string(r.stream.size()) +
+                " after removing boxsh's status probe)";
+    line += ", cursor \xe2\x86\x92 " + std::to_string(r.next_cursor);
     std::string text = line + "\n\n" + terminal_body(r, use_delta, cleaned_delta);
     if (!use_delta) text += terminal_stream_hint(r);
     return text;

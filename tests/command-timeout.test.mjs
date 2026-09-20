@@ -173,7 +173,22 @@ describe('command-timeout — server default', () => {
     assert.equal(scx.timed_out, true);
     assert.equal(scx.timeout_sec, 1);
     assert.equal(scx.timeout_source, 'request');
-    assert.equal(text(resp), '[stderr]\ntimeout\n[timeout]\n[exit code: -1]\n');
+    // Both timeout texts say what happened and how long it ran; this one names
+    // the timeout the request itself passed.
+    assert.equal(text(resp),
+      '[stderr]\ntimeout\n[timeout: killed after 1s (the `timeout` this request passed)]\n[exit code: -1]\n');
+    await s.proc.kill();
+    await s.waitClose();
+  });
+
+  test('output printed before the timeout is returned, not thrown away', async () => {
+    const s = startServer(['--command-timeout', '2']);
+    const resp = await s.call('bash', { command: 'echo PRE; echo PRE-ERR 1>&2; sleep 30' });
+    const scx = sc(resp);
+    assert.equal(scx.timed_out, true);
+    assert.equal(scx.stdout, 'PRE\n', 'the progress the command already printed survives');
+    assert.equal(scx.stderr, 'PRE-ERR\ntimeout', 'its stderr survives too, with the marker appended');
+    assert.match(text(resp), /\[stdout\]\nPRE\n\[stderr\]\nPRE-ERR\ntimeout\n\[timeout:/);
     await s.proc.kill();
     await s.waitClose();
   });

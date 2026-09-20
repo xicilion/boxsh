@@ -591,7 +591,7 @@ Two layers, because a caller that gives up never says so:
 printf '%s\n' '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 60","timeout":5}}}' | boxsh --rpc
 ```
 
-1. **Per-request** — a `timeout` argument kills the command after that many seconds (`exit_code: -1`, `stderr: "timeout"`, `timed_out: true`). The worker itself remains alive and immediately accepts the next request — no respawn is needed.
+1. **Per-request** — a `timeout` argument kills the command after that many seconds (`exit_code: -1`, `timed_out: true`). Whatever the command had already printed is returned: stdout as is, stderr with a `timeout` marker appended (so `stderr == "timeout"` exactly when the command itself had written nothing), and the text says how long it ran and whose timeout fired. The worker stays alive and immediately accepts the next request — no respawn is needed.
 2. **Server default** — `--command-timeout N` (default **60 s**) is used for every request that carries no positive `timeout`, including `timeout: 0`. Clients that never pass a timeout would otherwise leave a runaway command behind after they stop waiting for it. `--command-timeout 0` restores unlimited execution.
 
 An explicit `timeout` always wins over the default (it is a fallback, not a ceiling), so long builds and test suites keep working:
@@ -601,7 +601,7 @@ An explicit `timeout` always wins over the default (it is a fallback, not a ceil
 printf '%s\n' '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"make -j8","timeout":300}}}' | boxsh --rpc --command-timeout 1
 ```
 
-When the server default is what fired, the result says so instead of a bare `[timeout]`:
+Both timeout texts name the timeout and the reason; only the source differs (`the \`timeout\` this request passed` vs `the server default of Ns`):
 
 ```json
 {"jsonrpc":"2.0","id":"t","result":{

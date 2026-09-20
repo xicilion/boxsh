@@ -1129,7 +1129,7 @@ has no way to tell the server it gave up:
 ```sh
 # Killed after 2s by the explicit timeout
 echo '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 60","timeout":2}}}' | boxsh --rpc
-# {"jsonrpc":"2.0","id":"t","result":{"content":[{"type":"text","text":"[stderr]\ntimeout\n[timeout]\n[exit code: -1]\n"}],"structuredContent":{"exit_code":-1,"stdout":"","stderr":"timeout","duration_ms":2001,"timed_out":true,"timeout_sec":2,"timeout_source":"request"},"isError":true}}
+# {"jsonrpc":"2.0","id":"t","result":{"content":[{"type":"text","text":"[stderr]\ntimeout\n[timeout: killed after 2s (the `timeout` this request passed)]\n[exit code: -1]\n"}],"structuredContent":{"exit_code":-1,"stdout":"","stderr":"timeout","duration_ms":2001,"timed_out":true,"timeout_sec":2,"timeout_source":"request"},"isError":true}}
 
 # No timeout given: the server default (here 2s) applies
 echo '{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"bash","arguments":{"command":"sleep 60"}}}' | boxsh --rpc --command-timeout 2
@@ -1172,12 +1172,23 @@ known or unknown. Answering them is what used to make clients log schema errors
 (`{"id":null}` is not a valid response id) while the command kept running.
 
 In both cases the command's whole process group is killed and the worker stays
-alive — it accepts the next request immediately, nothing is respawned. The
-result distinguishes the two cases through `timeout_source`
-(`"request"` | `"server_default"`) and the text marker: a bare `[timeout]` for
-a caller-supplied timeout, and
-`[timeout: killed after the server default of 60s — pass \`timeout\` to allow a longer command]`
-when the safety net fired.
+alive — it accepts the next request immediately, nothing is respawned. Whatever
+the command had already printed comes back with the result (stdout as is, stderr
+with a `timeout` marker appended), and the text names both the timeout and its
+source:
+
+```
+[stderr]
+timeout
+[timeout: killed after 2s (the `timeout` this request passed)]
+[exit code: -1]
+```
+```
+[stderr]
+timeout
+[timeout: killed after the server default of 60s — pass `timeout` to allow a longer command]
+[exit code: -1]
+```
 
 #### Shutdown
 
@@ -1422,7 +1433,7 @@ await client.close();
 
 | Method | Returns | Description |
 |---|---|---|
-| `exec(cmd, cwd?, timeout?)` | `{ exitCode, stdout, stderr }` | Run a shell command |
+| `exec(cmd, cwd?, timeout?)` | `{ exitCode, stdout, stderr, timedOut, truncated }` | Run a shell command; `timedOut` marks a kill by the timeout, `truncated` a stream that lost bytes |
 | `read(path, offset?, limit?)` | `ReadResult` | Read a text file (body + paging metadata) |
 | `viewImage(path, detail?)` | `ViewImageResult` | View an image (base64 + metadata) |
 | `write(path, content)` | `void` | Create or overwrite a file |

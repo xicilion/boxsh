@@ -194,21 +194,6 @@ static void run_shell_command(const std::string &shell_path,
         deadline.tv_sec += timeout_sec;
     }
 
-    // Helper: kill the child and set the timeout response fields.
-    // Kill the entire process group (negative pgid) so that any sub-children
-    // the shell spawned (e.g. both sides of a pipeline) are also killed.
-    // This ensures every process holding the pipe write-end is gone before we
-    // return, so the parent's drain loop would see EOF — but we skip the drain
-    // entirely on timeout and close the fds here.
-    auto handle_timeout = [&]() {
-        kill(-child, SIGKILL);  // kill the whole process group
-        exit_code  = -1;
-        stderr_out = "timeout";
-        timed_out  = true;
-        close(pfd_out[0]); close(pfd_err[0]);
-        waitpid(child, nullptr, 0);
-    };
-
     // Read stdout and stderr with poll to avoid deadlock.
     // Cap each stream to MAX_OUTPUT_BYTES to prevent OOM and slow serialization.
     // Data beyond the limit is still drained from the pipe so the child process
@@ -216,6 +201,65 @@ static void run_shell_command(const std::string &shell_path,
     static constexpr size_t MAX_OUTPUT_BYTES = 10u * 1024u * 1024u; // 10 MiB
     std::string out_buf, err_buf;
     bool out_done = false, err_done = false;
+
+    // Helper: kill the child and set the timeout response fields.
+    // Kill the entire process group (negative pgid) so that any sub-children
+    // the shell spawned (e.g. both sides of a pipeline) are also killed.
+    // This ensures every process holding the pipe write-end is gone before we
+    // return, so the parent's drain loop would see EOF — but we skip the drain
+    // entirely on timeout and close the fds here.
+    //
+    // What the command had already written is still collected first: a long
+    // command that printed progress before being killed used to come back with
+    // empty streams, which threw away the most interesting part of its output.
+    // After SIGKILL the write ends are gone, so a bounded drain reads what is
+    // left in the pipes and stops at EOF.
+    auto drain_after_kill = [&]() {
+        // The process group is gone, so the write ends are gone too: read what
+        // is left.  poll() with a short deadline guards against a grandchild
+        // that escaped the group (a daemonised process) still holding a write
+        // end - the drain must never block the worker.
+        std::string *bufs[2]  = {&out_buf, &err_buf};
+        bool        *truncs[2] = {&stdout_truncated, &stderr_truncated};
+        int          fds[2]   = {pfd_out[0], pfd_err[0]};
+        bool         open_fd[2] = {true, true};
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(200);
+        for (int i = 0; i < 2; ++i) {
+            while (open_fd[i] && std::chrono::steady_clock::now() < deadline) {
+                struct pollfd p = {fds[i], POLLIN, 0};
+                int r = poll(&p, 1, 50);
+                if (r <= 0) break;                       // drained (or gone)
+                char tmp[4096];
+                ssize_t n = read(fds[i], tmp, sizeof(tmp));
+                if (n > 0) {
+                    if (bufs[i]->size() < MAX_OUTPUT_BYTES) bufs[i]->append(tmp, (size_t)n);
+                    else                                    *truncs[i] = true;
+                } else if (n == 0) {
+                    open_fd[i] = false;                  // EOF: writer gone
+                } else if (errno != EINTR) {
+                    open_fd[i] = false;
+                }
+            }
+        }
+        for (int i = 0; i < 2; ++i)
+            if (open_fd[i]) close(fds[i]);
+    };
+
+    auto handle_timeout = [&]() {
+        kill(-child, SIGKILL);  // kill the whole process group
+        waitpid(child, nullptr, 0);
+        drain_after_kill();     // everything the command managed to print first
+        exit_code  = -1;
+        stdout_out = std::move(out_buf);
+        // stderr keeps the command's own last words and the marker, so a caller
+        // can still tell "killed by the timeout" from a normal failure.  The
+        // machine-readable signal stays `timed_out`.
+        if (!err_buf.empty() && err_buf.back() != '\n') err_buf += '\n';
+        err_buf += "timeout";
+        stderr_out = std::move(err_buf);
+        timed_out  = true;
+    };
 
     while (!out_done || !err_done) {
         int poll_ms = -1; // infinite when there is no timeout

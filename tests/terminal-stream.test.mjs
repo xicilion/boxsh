@@ -272,6 +272,31 @@ describe('terminal — capture_status', () => {
     }
   });
 
+  test('the header byte count matches the cursor span, probe bytes included', async () => {
+    const s = new BoxshSession();
+    try {
+      await withSession(s, { command: 'bash' }, async ({ id }) => {
+        await sleep(300);
+        const resp = await s.call('send_to_terminal', {
+          id, command: 'echo SPAN-CHECK\n', capture_status: true, wait_ms: 4000,
+        });
+        const r = BoxshSession.sc(resp);
+        const text = (resp.result.content ?? []).map(c => c.text).join('\n');
+        // The span (next - first) is the raw byte count the cursor arithmetic
+        // works with; `stream` is exactly that minus boxsh's own probe bytes.
+        assert.ok(r.next_cursor >= r.first_cursor);
+        assert.ok(r.stream.length <= r.next_cursor - r.first_cursor);
+        assert.match(text, new RegExp(` ${r.next_cursor - r.first_cursor} bytes`),
+          'the header reports the cursor span');
+        if (r.stream.length < r.next_cursor - r.first_cursor) {
+          assert.match(text, /after removing boxsh's status probe/);
+        }
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
   test('the probe leaves no trace in the text or in the stream', async () => {
     const s = new BoxshSession();
     try {
