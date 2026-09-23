@@ -158,21 +158,33 @@ describe('sandbox scratch directory', () => {
   });
 
   test('--sandbox keeps $HOME hidden while the scratch works', () => {
+    // The mount point of a bind needs its parent chain inside the sandbox
+    // root, and boxsh materialises it as empty directories - $HOME itself
+    // among them whenever the bind lives below it.  So $HOME cannot be
+    // *absent* here, and "hidden" means the thing that matters: no entry of
+    // the host home directory is reachable.  The probe is a real file of the
+    // host's $HOME; neither its name nor its content may show up inside.
+    const probeName = `.boxsh-scratch-home-probe-${process.pid}`;
+    const probePath = path.join(HOME, probeName);
     const proj = mkTmp('boxsh-scratch-proj-');
     try {
+      fs.writeFileSync(probePath, 'host home content\n');
+
       const r = boxsh([
         '--sandbox', '--bind', `wr:${proj}`,
         '-c',
         'touch "$TMPDIR/p" && echo scratch-writable; ' +
-        'ls "$HOME" > /dev/null 2>&1 || echo home-hidden',
+        `ls -A "$HOME" 2>/dev/null | grep -qx '${probeName}' && echo home-exposed || echo home-hidden; ` +
+        `cat "$HOME/${probeName}" 2>&1 || true`,
       ], { env: { HOME } });
 
       assert.equal(r.status, 0, `boxsh failed: ${r.stderr}`);
       assert.match(r.stdout, /scratch-writable/, `scratch not writable: ${r.stdout}`);
-      if (HOME !== TEMPDIR) {
-        assert.match(r.stdout, /home-hidden/, `$HOME became readable: ${r.stdout}`);
-      }
+      assert.match(r.stdout, /home-hidden/, `$HOME became readable: ${r.stdout}`);
+      assert.doesNotMatch(r.stdout, /host home content/,
+        `$HOME content leaked into the sandbox: ${r.stdout}`);
     } finally {
+      fs.rmSync(probePath, { force: true });
       spawnSync('rm', ['-rf', proj]);
     }
   });
