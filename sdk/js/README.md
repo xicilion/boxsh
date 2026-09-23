@@ -6,7 +6,7 @@ boxsh.js lets you drive a long-lived boxsh instance from Node.js: execute shell 
 
 **Requirements:** Node.js ≥ 18, Linux or macOS, `boxsh` binary on `$PATH` (or set `BOXSH` env var).
 
-The Node.js and Python SDKs are released together from this repository and share one version number (`boxsh.js` 4.0.0 == `boxsh-py` 4.0.0, both speaking the protocol of boxsh 5.5.0).
+The Node.js and Python SDKs are released together from this repository and share one version number (`boxsh.js` 4.0.0 == `boxsh-py` 4.0.0, both speaking the protocol of boxsh 5.6.0).
 
 ## Install
 

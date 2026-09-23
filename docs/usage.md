@@ -1441,7 +1441,7 @@ npm install boxsh.js
 
 The Node.js and Python SDKs are released together with the server and share one
 version number (`boxsh.js` and `boxsh-py`, both 4.0.0 here, speaking the protocol
-of boxsh 5.5.0); the server keeps its own version (`boxsh --version`).
+of boxsh 5.6.0); the server keeps its own version (`boxsh --version`).
 
 #### Quick start
 
