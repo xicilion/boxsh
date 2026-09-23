@@ -1556,6 +1556,22 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
 #undef BOXSH_AUDIT_ARCH
     }
 
+    // --- 13. Scratch directory ---
+    // A program that cannot write a temporary file cannot run: it lives in
+    // the sandbox's own /tmp tmpfs (the only mount every sandbox owns), so it
+    // disappears with the session and never touches the host filesystem.
+    // Created here — after pivot_root, so "/tmp" is the sandbox's tmpfs and
+    // not the host's.
+    {
+        SandboxResult sr = sandbox_scratch_setup("/tmp/.boxsh-scratch", cfg);
+        if (!sr.ok) {
+            std::fprintf(stderr,
+                "boxsh: sandbox scratch directory unavailable (%s); "
+                "commands that need a writable temp directory will fail\n",
+                sr.error.c_str());
+        }
+    }
+
     res.ok = true;
     return res;
 }

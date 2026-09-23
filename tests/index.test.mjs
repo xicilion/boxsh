@@ -18,6 +18,8 @@ import './mcp.test.mjs';
 import './protocol-regression.test.mjs';
 import './sandbox-escape.test.mjs';
 import './sandbox-security.test.mjs';
+import './sandbox-scratch.test.mjs';
+import './sandbox-browser.test.mjs';
 import './power-sandbox.test.mjs';
 import './terminal.test.mjs';
 import './terminal-stream.test.mjs';

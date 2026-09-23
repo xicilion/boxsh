@@ -33,6 +33,7 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 | **Stateful PTY sessions** | Five terminal tools over real PTY sessions: interactive programs, persistent cwd/env, and an addressable raw output log (cursor-based, no loss above the visible screen). Bounded by `--max-sessions` (32), `--session-log-limit` (1 MiB) and `--session-ttl` (600 s) |
 | **Shutdown cleanup** | On SIGTERM/SIGINT/SIGHUP (or a killed coordinator) every running command and PTY session is killed at its process group — no orphans |
 | **Bind mounts** | Selectively expose host paths (read-write or read-only) inside the sandbox |
+| **Scratch directory** | Every sandbox gets a private writable temp directory: `TMPDIR` points at it, so programs that need one run normally without writing to your real temp dirs. Caches that tools keep under `$HOME` are pointed at it by the caller (`npm_config_cache=$TMPDIR/.cache/npm`) |
 | **Drop-in `/bin/sh`** | Shell mode delegates to embedded dash 0.5.12 — any script or flag that works with POSIX sh works here |
 | **Single static binary** | dash, nlohmann/json, and libedit are vendored; no runtime dependencies beyond the OS kernel |
 
@@ -523,7 +524,7 @@ boxsh --sandbox --bind wr:/data -c 'ls /'
 
 | Flag | Effect |
 |---|---|
-| `--sandbox` | Isolated environment; reads are limited to system-maintained directories (`/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/Applications`, `/opt`, `/dev`, `/private` and its `/var`, `/tmp`, `/etc` aliases) while **writes are only possible through `--bind`**; current UID mapped as root inside (Linux) |
+| `--sandbox` | Isolated environment; reads are limited to system-maintained directories (`/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/Applications`, `/opt`, `/dev`, `/private` and its `/var`, `/tmp`, `/etc` aliases) while **writes are only possible through `--bind`** and the sandbox's own scratch directory; current UID mapped as root inside (Linux) |
 | `--new-net-ns` | Loopback-only; outbound network blocked |
 | `--bind ro:PATH` | Expose a host path read-only inside the sandbox |
 | `--bind wr:PATH` | Expose a host path read-write inside the sandbox |
@@ -538,6 +539,10 @@ boxsh --sandbox --bind wr:/data -c 'ls /'
 | Linux (Docker) | Same as Linux (requires `--user`) | fuse-overlayfs |
 
 No external tools such as `bwrap` or `newuidmap` are required on any platform.
+
+Every sandbox also gets a private scratch directory, because a program that cannot write a temp file cannot run at all (a browser will not even start without a profile directory). `TMPDIR` points at it; boxsh sets nothing else, so a cache a tool keeps under `$HOME` is pointed at the scratch by the caller — `npm_config_cache=$TMPDIR/.cache/npm`, `XDG_CACHE_HOME=$TMPDIR/.cache`, `CARGO_HOME=$TMPDIR/cargo` — or at a directory you bind. Your own settings are never overridden. See [Scratch Directory and Tool Caches](docs/usage.md#scratch-directory-and-tool-caches).
+
+Chromium-family browsers (Playwright, Puppeteer) run under the sandbox too, with one caveat: their own Seatbelt sandbox has to be off (`--no-sandbox`, since Seatbelt profiles cannot nest — boxsh's sandbox is the isolation boundary). Playwright's `page.pdf()` is the single call that reaches outside, because it reads the PDF back through the *OS* user temp dir rather than `$TMPDIR`; bind that directory once (`--bind "wr:$(getconf DARWIN_USER_TEMP_DIR)"`) if you use it. See [Browsers in the Sandbox](docs/usage.md#browsers-in-the-sandbox).
 
 ### Docker support
 

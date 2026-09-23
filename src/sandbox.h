@@ -45,6 +45,32 @@ struct SandboxResult {
 // handle a request.
 SandboxResult sandbox_apply(const SandboxConfig &cfg);
 
+// True when the sandbox grants write access to 'path': it lies inside an RW
+// bind or inside a COW destination (where writes are captured).  Everything
+// else - including paths exposed read-only - is not writable inside the
+// sandbox.  Shared by both backends; see sandbox_env.cpp.
+bool sandbox_path_writable(const SandboxConfig &cfg, const std::string &path);
+
+// Create the sandbox scratch directory layout (root and .cache).
+// On macOS this must run *before* sandbox_init(): creating a directory needs
+// write access to its parent, which the profile grants only for the scratch
+// subtree itself.  Returns an error when the layout cannot be created; the
+// caller then runs the sandbox without a scratch directory.
+SandboxResult sandbox_scratch_prepare(const std::string &root);
+
+// Point the sandboxed process at an existing scratch directory: TMPDIR only,
+// and only when the caller has not already pointed TMPDIR at a location the
+// sandbox can write to.  Performs no filesystem changes, so it is safe to call
+// after the process is confined.  See sandbox_env.cpp.
+SandboxResult sandbox_scratch_export_env(const std::string &root,
+                                         const SandboxConfig &cfg);
+
+// Prepare and export in one step, for backends that build the sandbox
+// filesystem before confining the process (Linux, where the scratch lives in
+// the sandbox's own tmpfs).
+SandboxResult sandbox_scratch_setup(const std::string &root,
+                                    const SandboxConfig &cfg);
+
 // Process-wide marker set by main() once sandbox_apply() has succeeded (the
 // restrictions are inherited by forked workers and shared by tool threads).
 // File tools use it when reporting EACCES/EPERM so that a caller can tell a

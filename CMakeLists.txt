@@ -283,6 +283,8 @@ add_executable(boxsh
     src/image_resize.cpp
     src/terminal.cpp
     src/worker_pool.cpp
+    # Scratch directory + environment shared by both sandbox backends.
+    src/sandbox_env.cpp
 )
 
 # Platform-specific sandbox implementation.
@@ -295,6 +297,12 @@ endif()
 if(APPLE)
     add_executable(power_probe_darwin
         tests/power_probe_darwin.c
+    )
+
+    # Registers a Mach bootstrap service, to test that the profile's
+    # mach-register grant is scoped to the browser name prefixes.
+    add_executable(bootstrap_probe_darwin
+        tests/bootstrap_probe_darwin.c
     )
 endif()
 

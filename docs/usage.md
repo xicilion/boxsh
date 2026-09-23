@@ -1345,6 +1345,91 @@ Formats:
 - `--bind ro:PATH` — read-only
 - `--bind wr:PATH` — read-write
 
+#### Scratch Directory and Tool Caches
+
+A sandbox only owns the directories you give it, and a program that cannot write a temporary file cannot run at all — a browser will not start without a profile directory, a compiler spills to disk, an installer unpacks to a temp path. Every sandbox therefore comes with a private **scratch directory** of its own, and `TMPDIR` points at it.
+
+```sh
+boxsh --try -c 'echo "$TMPDIR"'
+# /Users/me/.boxsh-try-abc123/.boxsh/work.scratch
+
+boxsh --try -c 'fibjs --install @markdown-viewer/documd'
+# install cli: /private/tmp/.boxsh-try-abc123/work/node_modules/.bin/documd
+```
+
+**`TMPDIR` is the only variable boxsh sets.** Caches are the caller's business, on purpose: a sandboxed process cannot write to `$HOME`, so a tool that keeps a cache there needs to be pointed at the scratch (or at a directory you bind). That keeps boxsh out of per-tool policy and leaves your own settings alone — a variable you export like `CARGO_HOME=/data/cargo` is passed through untouched, and `boxsh` never overrides it.
+
+```sh
+# The pattern for any tool that keeps its cache under $HOME:
+boxsh --try -c 'npm_config_cache="$TMPDIR/.cache/npm" npm install'
+boxsh --try -c 'XDG_CACHE_HOME="$TMPDIR/.cache" pip install requests'
+boxsh --try -c 'CARGO_HOME="$TMPDIR/cargo" cargo build'
+```
+
+Examples elsewhere in this guide that run `npm install` inside the sandbox need the same setting — without it npm keeps its cache in `$HOME`, which the sandbox does not expose, and fails on the first write.
+
+| What the scratch gives you | Details |
+|---|---|
+| `TMPDIR` | the scratch directory; a `TMPDIR` you already set is kept when the sandbox can write to it (e.g. inside a bind) |
+| `<scratch>/.cache` | a conventional cache location for the examples above |
+| lifetime | discarded with the session; with a COW workspace it sits in `<DST parent>/.boxsh/<DST name>.scratch`, so it lives exactly as long as the workspace |
+
+A few more things worth knowing:
+
+- **The scratch directory never touches your home directory.** Without a COW workspace, boxsh creates a private `boxsh-scratch-<pid>-<rand>` directory under the system temp dir and removes it on exit.
+- **On Linux the scratch directory is `/tmp/.boxsh-scratch` inside the sandbox's own `/tmp` tmpfs** — it never appears on the host filesystem at all. That tmpfs is memory-backed, so keep large caches in the workspace or in a bound directory instead (`--bind wr:/data`, then `npm_config_cache=/data/npm`).
+- **Caches that live in the COW workspace persist with it** — a package installed into `dst/` is still there when the session resumes.
+
+To see exactly what the sandbox allows, dump the generated macOS profile:
+
+```sh
+BOXSH_SBPL_DUMP=/tmp/boxsh.sbpl boxsh --sandbox --bind cow:"$project:$dst" -c true
+```
+
+#### Browsers in the Sandbox
+
+Chromium-family browsers — Playwright, Puppeteer, and everything built on them — run inside the sandbox. Two properties of a Seatbelt sandbox shape how they have to be launched, and each has a matching knob:
+
+| Browser limitation | What to do |
+|---|---|
+| Chromium applies its own Seatbelt profile to helper processes, and Seatbelt profiles cannot nest | Launch with `--no-sandbox` (`chromiumSandbox: false` in Playwright); the boxsh sandbox is the isolation boundary |
+| The GUI build (`/Applications/Google Chrome.app`) registers with the window server while starting | Use a headless Chromium build (e.g. Playwright's browsers); boxsh does not grant GUI access |
+
+Everything else works with no extra flags: navigation, screenshots, `page.content()`, page JavaScript, and PDF exports all ran under the sandbox while writing this guide.
+
+With Playwright's own API the knob is a launch option:
+
+```js
+const browser = await chromium.launch({ chromiumSandbox: false }); // = --no-sandbox
+const page = await browser.newPage();
+await page.goto('https://example.com');        // fine
+await page.screenshot({ path: 'shot.png' });   // fine
+```
+
+Printing has one caveat on macOS. Playwright's `page.pdf()` reads its PDF back through Chromium's CDP `IO.read` stream, which is backed by a file in the *OS* user temp dir — `NSTemporaryDirectory()`, which ignores `$TMPDIR` — so that one call needs the directory bound explicitly:
+
+```sh
+boxsh --try --bind "wr:$(getconf DARWIN_USER_TEMP_DIR)" -c 'node print.mjs'
+```
+
+Tools that print through CDP themselves, with `printToPDF` and `transferMode: "ReturnAsBase64"` (documd does), never touch that file and need nothing.
+
+Tools that do not let you pass Chrome flags can be pointed at a wrapper with their browser-path option (`--chrome`, `executablePath`, `DOCUMD_CHROME_PATH`, …):
+
+```sh
+cat > chrome-nosandbox.sh <<'EOF'
+#!/bin/sh
+# Chromium with its own sandbox off: boxsh's sandbox replaces it.
+BIN=$(find "$HOME/Library/Caches/ms-playwright" -name chrome-headless-shell \
+        -type f -perm -u+x 2>/dev/null | sort | tail -1)
+[ -n "$BIN" ] || { echo "no Playwright Chromium found" >&2; exit 127; }
+exec "$BIN" --no-sandbox "$@"
+EOF
+chmod +x chrome-nosandbox.sh
+```
+
+Chromium's helper processes find their browser through Mach rendezvous services the profile whitelists by name prefix (`org.chromium`, `com.google.Chrome`). Nothing else becomes reachable: those grants only allow publishing and looking up the browser's own per-process services, and every `com.apple.*` name stays denied.
+
 
 ### Node.js SDK
 
