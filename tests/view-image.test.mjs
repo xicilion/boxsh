@@ -14,8 +14,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { rpc, rpcRaw, makePng } from './helpers.mjs';
+import { rpc, rpcRaw, makePng, makePngPixels } from './helpers.mjs';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const fixture = (name) => path.join(__dir, 'fixture', name);
@@ -169,6 +170,142 @@ describe('view_image — positive', () => {
       assert.ok(sc.width <= 512 && sc.height <= 512,
         `expected <= 512px, got ${sc.width}x${sc.height}`);
       assert.match(textOf(resp), /low detail/);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('a large transparent image is never re-encoded as JPEG', () => {
+    // Transparent black | opaque white.  JPEG drops the alpha channel and
+    // keeps the RGB under the transparent half — black — which is the
+    // reported "transparent background turns black" bug.
+    const W = 2400, H = 1600;
+    const px = Buffer.alloc(W * H * 4);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 4;
+        const v = x < W / 2 ? 0 : 255;
+        px[i] = px[i + 1] = px[i + 2] = px[i + 3] = v;
+      }
+    }
+    const p = tmpPng(makePngPixels(W, H, 4, px));
+    try {
+      const resp = viewImage({ path: p });
+      assert.ok(!isError(resp), `unexpected error: ${textOf(resp)}`);
+
+      const sc = scOf(resp);
+      assert.equal(sc.mime_type, 'image/png',
+        'transparent pixels must keep an alpha channel');
+      assert.equal(sc.original_width, W);
+      assert.equal(sc.was_resized, true);
+
+      const png = readPng(Buffer.from(imageOf(resp).data, 'base64'));
+      assert.equal(png.channels, 4);
+      assert.equal(png.pixels[3], 0, 'the transparent region must stay transparent');
+
+      // The downscaler must weight by alpha: the edge keeps RGB 255 and only
+      // the alpha ramps.  A naive RGB filter would average in the transparent
+      // black and produce a grey fringe over white.
+      const y = Math.floor(png.height / 2);
+      let partial = 0;
+      for (let x = Math.floor(png.width / 2) - 4;
+           x <= Math.floor(png.width / 2) + 4; x++) {
+        const i = (y * png.width + x) * 4;
+        const [r, g, b, a] = [png.pixels[i], png.pixels[i + 1],
+                              png.pixels[i + 2], png.pixels[i + 3]];
+        if (a > 0 && a < 255) partial++;
+        if (a > 0) {
+          assert.deepEqual([r, g, b], [255, 255, 255],
+            `transparent black bled into the edge at x=${x} (alpha ${a})`);
+        }
+      }
+      assert.ok(partial > 0, 'expected an alpha ramp at the transparent edge');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('grey+alpha images are downscaled with alpha weighting', () => {
+    // Colour type 4 decodes to 2 channels.  A channel count cast to a pixel
+    // layout would pick STBIR_2CHANNEL ("no alpha here") and bleed the
+    // transparent grey into the edge; STBIR_RA keeps it white.
+    const W = 2400, H = 1600;
+    const px = Buffer.alloc(W * H * 2);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 2;
+        const v = x < W / 2 ? 0 : 255;
+        px[i] = px[i + 1] = v;
+      }
+    }
+    const p = tmpPng(makePngPixels(W, H, 2, px));
+    try {
+      const resp = viewImage({ path: p });
+      assert.ok(!isError(resp), `unexpected error: ${textOf(resp)}`);
+
+      const sc = scOf(resp);
+      assert.equal(sc.mime_type, 'image/png');
+
+      const png = readPng(Buffer.from(imageOf(resp).data, 'base64'));
+      assert.equal(png.channels, 2);
+      assert.equal(png.pixels[1], 0, 'the transparent region must stay transparent');
+
+      const y = Math.floor(png.height / 2);
+      let partial = 0;
+      for (let x = Math.floor(png.width / 2) - 4;
+           x <= Math.floor(png.width / 2) + 4; x++) {
+        const i = (y * png.width + x) * 2;
+        const [grey, a] = [png.pixels[i], png.pixels[i + 1]];
+        if (a > 0 && a < 255) partial++;
+        if (a > 0) {
+          assert.equal(grey, 255,
+            `transparent grey bled into the edge at x=${x} (alpha ${a})`);
+        }
+      }
+      assert.ok(partial > 0, 'expected an alpha ramp at the transparent edge');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('a transparent PNG over the base64 budget shrinks instead of losing alpha', () => {
+    // Dimensions fit the 2000px cap, so only the 4.5 MB base64 budget forces
+    // a re-encode.  Incompressible RGB makes the PNG far too large while a
+    // JPEG would fit at full size — the old heuristic chose the JPEG.
+    const W = 1600, H = 1600;
+    const px = randomBytes(W * H * 4);
+    for (let i = 0; i < W * H; i++) {
+      if (i % W < W / 2) {
+        px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = px[i * 4 + 3] = 0;
+      } else {
+        px[i * 4 + 3] = 255;
+      }
+    }
+    const p = tmpPng(makePngPixels(W, H, 4, px));
+    try {
+      const resp = viewImage({ path: p }, { timeout_ms: 30000 });
+      assert.ok(!isError(resp), `unexpected error: ${textOf(resp)}`);
+
+      const sc = scOf(resp);
+      assert.equal(sc.mime_type, 'image/png');
+      assert.equal(sc.was_resized, true, 'the PNG must shrink to fit the budget');
+      assert.ok(sc.width < W, `expected a downscale, got ${sc.width}x${sc.height}`);
+      assert.ok(imageOf(resp).data.length <= MAX_IMAGE_BASE64_BYTES,
+        'base64 payload must stay within the inline budget');
+
+      const png = readPng(Buffer.from(imageOf(resp).data, 'base64'));
+      assert.equal(png.pixels[3], 0, 'transparency must survive the budget path');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('a fully opaque alpha channel may still use JPEG', () => {
+    // Dropping an all-255 alpha plane is lossless, so the smaller encoding is
+    // still allowed to win: PNG cannot fit the budget here, JPEG can.
+    const W = 1600, H = 1600;
+    const px = randomBytes(W * H * 4);
+    for (let i = 0; i < W * H; i++) px[i * 4 + 3] = 255;
+    const p = tmpPng(makePngPixels(W, H, 4, px));
+    try {
+      const resp = viewImage({ path: p }, { timeout_ms: 30000 });
+      assert.ok(!isError(resp), `unexpected error: ${textOf(resp)}`);
+
+      const sc = scOf(resp);
+      assert.equal(sc.mime_type, 'image/jpeg');
+      assert.equal(sc.was_resized, false);
     } finally { fs.rmSync(p, { force: true }); }
   });
 

@@ -269,6 +269,39 @@ export function makePng(width, height, { solid = false } = {}) {
 }
 
 /**
+ * Build a real (decodable) 8-bit PNG with an alpha channel from raw pixels.
+ * @param {number} width
+ * @param {number} height
+ * @param {2|4} channels  4 = RGBA (colour type 6), 2 = grey+alpha (type 4)
+ * @param {Buffer} pixels  width*height*channels interleaved bytes, row-major
+ * @returns {Buffer}
+ */
+export function makePngPixels(width, height, channels, pixels) {
+  assert.ok(channels === 2 || channels === 4, 'channels must be 2 or 4');
+  assert.equal(pixels.length, width * height * channels,
+    'pixel buffer must hold width*height*channels bytes');
+
+  const stride = width * channels + 1;
+  const raw = Buffer.alloc(stride * height);
+  for (let y = 0; y < height; y++) {
+    const row = y * stride;
+    raw[row] = 0; // filter type: none
+    pixels.copy(raw, row + 1, y * width * channels, (y + 1) * width * channels);
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;                          // bit depth
+  ihdr[9] = channels === 4 ? 6 : 4;     // colour type: RGBA / grey+alpha
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+/**
  * Build a PNG that *declares* large dimensions while carrying almost no image
  * data: the IHDR (with a valid CRC) says width×height, the IDAT is a tiny
  * deflate stream that cannot produce those scanlines.

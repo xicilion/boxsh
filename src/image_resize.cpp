@@ -1,5 +1,8 @@
 // Image resize using stb libraries (decode: stb + libwebp, encode: stb).
-// Decodes image, resizes if needed, re-encodes as JPEG or PNG.
+// Decodes image, resizes if needed, re-encodes as JPEG or PNG.  Pixels that
+// carry transparency are only ever re-encoded as PNG: JPEG has no alpha
+// channel and would flatten them onto whatever RGB the transparent pixels
+// hold (usually black), turning a transparent background opaque.
 
 #include "image_resize.h"
 
@@ -124,8 +127,10 @@ static bool decode_image(const std::string &raw, const std::string &mime,
     out.data      = pixels;
     out.width     = w;
     out.height    = h;
-    out.channels  = (channels > 4) ? 4 : channels;  // stb may report >4 for HDR
-    return true;
+    out.channels  = channels;
+    // Every consumer below assumes interleaved 1–4 channel pixels; anything
+    // else would silently misread the buffer, so reject it as undecodable.
+    return channels >= 1 && channels <= 4;
 }
 
 // Base64 encoding (duplicated here to keep image_resize self-contained).
@@ -147,40 +152,127 @@ static std::string b64_encode(const unsigned char *src, size_t len) {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Alpha policy
+// ---------------------------------------------------------------------------
+
+// What the decoded pixels say about transparency.  Every format decoded here
+// stores alpha in the last channel (PNG/TGA/TIFF/BMP/GIF from stb, WebP from
+// libwebp), and stb's JPEG decoder always reports 1 or 3 channels (CMYK is
+// converted to RGB), so a colour channel can never be mistaken for alpha.
+enum class AlphaMode {
+    None,         // no alpha channel (RGB, greyscale): JPEG is safe
+    Opaque,       // alpha channel present but every pixel is 255: JPEG is lossless
+    Transparent,  // some pixel is not fully opaque: JPEG would drop it
+};
+
+static AlphaMode classify_alpha(const unsigned char *pixels, int w, int h,
+                                int channels) {
+    if (channels != 2 && channels != 4) return AlphaMode::None;
+    const size_t step  = static_cast<size_t>(channels);
+    const size_t total = static_cast<size_t>(w) * static_cast<size_t>(h) * step;
+    for (size_t i = step - 1; i < total; i += step) {
+        if (pixels[i] != 255) return AlphaMode::Transparent;
+    }
+    return AlphaMode::Opaque;
+}
+
+// stb_image_resize2 pixel layout for a decoded channel count.  The count must
+// not be cast straight to stbir_pixel_layout: 2 would become STBIR_2CHANNEL,
+// which means "there is no alpha channel here", so a greyscale+alpha image
+// would be resized with the transparent pixels' grey bleeding into their
+// neighbours.  STBIR_RA and STBIR_RGBA point the resizer at alpha, so it
+// premultiplies, filters, un-premultiplies and keeps fully transparent pixels
+// from contaminating the edge.  PNG/WebP alpha is not premultiplied, so the
+// plain (_PM-less) layouts are the correct ones.
+static stbir_pixel_layout pixel_layout_for(int channels) {
+    switch (channels) {
+        case 1:  return STBIR_1CHANNEL;
+        case 2:  return STBIR_RA;
+        case 3:  return STBIR_RGB;
+        default: return STBIR_RGBA;
+    }
+}
+
 // stb_image_write callback: accumulate bytes into a std::string.
 static void write_callback(void *ctx, void *data, int size) {
     auto *out = static_cast<std::string *>(ctx);
     out->append(static_cast<const char *>(data), static_cast<size_t>(size));
 }
 
-// Encode pixels as JPEG, return base64.
-static std::string encode_jpeg(const unsigned char *pixels,
-                               int w, int h, int channels, int quality) {
-    std::string buf;
-    stbi_write_jpg_to_func(write_callback, &buf, w, h, channels, pixels, quality);
-    return b64_encode(reinterpret_cast<const unsigned char *>(buf.data()), buf.size());
+// Byte length of the base64 encoding of `raw_len` bytes — the unit used by
+// the max_bytes budget.
+static size_t b64_size(size_t raw_len) {
+    return ((raw_len + 2) / 3) * 4;
 }
 
-// Encode pixels as PNG, return base64.
-static std::string encode_png(const unsigned char *pixels,
-                              int w, int h, int channels) {
-    std::string buf;
-    stbi_write_png_to_func(write_callback, &buf, w, h, channels, pixels, w * channels);
-    return b64_encode(reinterpret_cast<const unsigned char *>(buf.data()), buf.size());
-}
-
-// Pick the smallest encoding from PNG and JPEG candidates.
+// One encoded still.  File bytes stay unencoded until a candidate is known to
+// fit, so the loser of a PNG/JPEG comparison never pays for base64.
 struct Candidate {
-    std::string data;
+    std::string bytes;
     std::string mime;
 };
 
-static Candidate best_encoding(const unsigned char *pixels,
-                               int w, int h, int channels,
-                               int jpeg_quality) {
-    Candidate png_c = {encode_png(pixels, w, h, channels), "image/png"};
-    Candidate jpg_c = {encode_jpeg(pixels, w, h, channels, jpeg_quality), "image/jpeg"};
-    return (png_c.data.size() <= jpg_c.data.size()) ? std::move(png_c) : std::move(jpg_c);
+// Encode pixels as PNG.  Returns false when the encoder fails.
+static bool encode_png(const unsigned char *pixels, int w, int h, int channels,
+                       Candidate &out) {
+    std::string buf;
+    if (!stbi_write_png_to_func(write_callback, &buf, w, h, channels, pixels,
+                                w * channels))
+        return false;
+    out.bytes = std::move(buf);
+    out.mime  = "image/png";
+    return true;
+}
+
+// Encode pixels as JPEG.  The encoder ignores alpha, so transparent pixels
+// must never reach this function (see AlphaMode).
+static bool encode_jpeg(const unsigned char *pixels, int w, int h, int channels,
+                        int quality, Candidate &out) {
+    std::string buf;
+    if (!stbi_write_jpg_to_func(write_callback, &buf, w, h, channels, pixels,
+                                quality))
+        return false;
+    out.bytes = std::move(buf);
+    out.mime  = "image/jpeg";
+    return true;
+}
+
+// Pick an encoding whose base64 payload fits max_bytes.
+//
+// Transparent pixels may only go to PNG: JPEG has no alpha channel, so a
+// transparent background would be flattened onto the RGB values stored under
+// it (usually black).  Without transparency the historical policy is kept —
+// PNG once, then the JPEG quality ladder, smallest fitting candidate wins.
+// PNG is encoded once per dimension attempt: its size does not depend on the
+// quality knob.
+static bool encode_fitting(const unsigned char *pixels, int w, int h,
+                           int channels, AlphaMode alpha, size_t max_bytes,
+                           Candidate &out) {
+    Candidate png;
+    if (!encode_png(pixels, w, h, channels, png))
+        return false;
+
+    if (alpha == AlphaMode::Transparent) {
+        if (b64_size(png.bytes.size()) > max_bytes)
+            return false;
+        out = std::move(png);
+        return true;
+    }
+
+    static const int jpeg_qualities[] = {80, 60, 40, 20};
+    for (int q : jpeg_qualities) {
+        Candidate jpg;
+        if (!encode_jpeg(pixels, w, h, channels, q, jpg))
+            continue;
+        const bool jpeg_wins = jpg.bytes.size() < png.bytes.size();
+        const size_t smallest = jpeg_wins ? jpg.bytes.size() : png.bytes.size();
+        if (b64_size(smallest) > max_bytes)
+            continue;  // lower JPEG qualities may still fit; PNG is fixed
+        out = jpeg_wins ? std::move(jpg) : std::move(png);
+        return true;
+    }
+    return false;
 }
 
 // Read the dimensions declared in the header *without* decoding any pixels.
@@ -261,25 +353,40 @@ ResizedImage resize_image(const std::string &raw, const std::string &mime,
         th = max_height;
     }
 
-    // Try encoding at target dimensions with decreasing JPEG quality.
-    static const int jpeg_qualities[] = {80, 60, 40, 20};
+    // Try encoding at target dimensions, halving the size whenever nothing
+    // fits the budget.  Transparent pixels force PNG; opaque images keep the
+    // JPEG quality ladder.  Sixteen halvings always reach 1×1, where every
+    // encoder fits.
+    const AlphaMode alpha = classify_alpha(pixels, w, h, channels);
+    const stbir_pixel_layout layout = pixel_layout_for(channels);
 
-    for (int attempt = 0; attempt < 8 && tw > 0 && th > 0; ++attempt) {
-        // Resize pixels.
-        std::vector<unsigned char> resized(tw * th * channels);
-        stbir_resize_uint8_linear(
-            pixels, w, h, w * channels,
-            resized.data(), tw, th, tw * channels,
-            static_cast<stbir_pixel_layout>(channels));
+    for (int attempt = 0; attempt < 16 && tw > 0 && th > 0; ++attempt) {
+        // Resize pixels.  A null return means the resizer could not allocate
+        // its working buffers; encoding the untouched (zero-filled) vector
+        // would produce a black image.
+        std::vector<unsigned char> resized(
+            static_cast<size_t>(tw) * static_cast<size_t>(th) *
+            static_cast<size_t>(channels));
+        if (!stbir_resize_uint8_linear(pixels, w, h, w * channels,
+                                       resized.data(), tw, th, tw * channels,
+                                       layout))
+            break;
 
-        // Try all JPEG qualities.
-        for (int q : jpeg_qualities) {
-            auto c = best_encoding(resized.data(), tw, th, channels, q);
-            if (c.data.size() <= max_bytes) {
-                return {std::move(c.data), std::move(c.mime),
-                        tw, th, orig_w, orig_h,
-                        tw != orig_w || th != orig_h, ImageResizeStatus::Ok};
-            }
+        Candidate chosen;
+        if (encode_fitting(resized.data(), tw, th, channels, alpha, max_bytes,
+                           chosen)) {
+            ResizedImage out;
+            out.data = b64_encode(
+                reinterpret_cast<const unsigned char *>(chosen.bytes.data()),
+                chosen.bytes.size());
+            out.mime_type      = std::move(chosen.mime);
+            out.width          = tw;
+            out.height         = th;
+            out.original_width = orig_w;
+            out.original_height = orig_h;
+            out.was_resized    = tw != orig_w || th != orig_h;
+            out.status         = ImageResizeStatus::Ok;
+            return out;
         }
 
         // Reduce dimensions by 50%.

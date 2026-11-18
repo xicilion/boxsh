@@ -44,8 +44,9 @@ struct ResizedImage {
 // Strategy (following pi's approach):
 //   1. If already within limits and !always_reencode → return base64 of original
 //   2. Resize to maxWidth×maxHeight
-//   3. Try both PNG and JPEG, pick smaller
-//   4. If still over maxBytes, reduce JPEG quality
+//   3. Transparent pixels → PNG only (JPEG has no alpha channel); otherwise
+//      try both PNG and JPEG, pick smaller
+//   4. If still over maxBytes, reduce JPEG quality (opaque images only)
 //   5. If still over, reduce dimensions progressively
 //
 // raw: raw file bytes (not base64)
